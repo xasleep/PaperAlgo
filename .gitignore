@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.py[cod]
+
+mineru_outputs/
+outputs/
+results/
+
+.env
+api.txt
