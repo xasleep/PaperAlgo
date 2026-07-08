@@ -1,10 +1,346 @@
 import json
 import re
 import os
+import sys
 from datetime import datetime
 
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+STATUS_PENDING_EVAL = "待测评"
+STATUS_EVAL_FAILED = "测评但未通过"
+STATUS_EVAL_PASSED = "测评且通过"
+MAX_REPAIR_ROUNDS = 3
+
+
+def repo_status_path(output_dir):
+    return os.path.join(output_dir, "repo_status.json")
+
+
+def eval_feedback_path(output_dir):
+    return os.path.join(output_dir, "eval_feedback.json")
+
+
+def load_json_file(path, default=None):
+    if not os.path.exists(path):
+        return default
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_json_file(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def write_repo_status(output_dir, status, **kwargs):
+    status_data = {
+        "status": status,
+        "updated_at": get_now_str(),
+        **kwargs,
+    }
+    save_json_file(repo_status_path(output_dir), status_data)
+    return status_data
+
+
+def parse_eval_rationale(rationale):
+    if isinstance(rationale, list):
+        return rationale
+    if isinstance(rationale, dict):
+        return [rationale]
+    if not isinstance(rationale, str):
+        return []
+
+    text = rationale.strip()
+    if not text:
+        return []
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, list):
+            return parsed
+        if isinstance(parsed, dict):
+            return [parsed]
+    except Exception:
+        pass
+
+    return [{"file_name": "repository", "severity_level": "unknown", "critique": text}]
+
+
+def normalize_severity(value):
+    return str(value or "").strip().lower()
+
+
+def summarize_eval_feedback(rationales):
+    findings = []
+    findings_by_file = {}
+    has_high_severity = False
+
+    for rationale in rationales:
+        for item in parse_eval_rationale(rationale):
+            file_name = str(item.get("file_name") or "repository")
+            func_name = str(item.get("func_name") or "")
+            severity = normalize_severity(item.get("severity_level"))
+            critique = str(item.get("critique") or "").strip()
+            if not critique:
+                continue
+
+            finding = {
+                "file_name": file_name,
+                "func_name": func_name,
+                "severity_level": severity or "unknown",
+                "critique": critique,
+            }
+            findings.append(finding)
+            findings_by_file.setdefault(file_name, []).append(finding)
+            if severity == "high":
+                has_high_severity = True
+
+    files_to_repair = []
+    for file_name in findings_by_file:
+        normalized = file_name.replace("\\", "/")
+        if normalized == "repository":
+            continue
+        file_matches = re.findall(
+            r"[\w.-]+\.(?:py|r|R|yaml|yml)",
+            normalized,
+        )
+        if file_matches:
+            files_to_repair.extend(file_matches)
+            continue
+        if "/" in normalized:
+            normalized = normalized.split("/")[-1]
+        if normalized.lower().endswith((".py", ".r", ".yaml", ".yml")):
+            files_to_repair.append(normalized)
+
+    files_to_repair = sorted(set(files_to_repair))
+
+    summary_lines = []
+    for file_name, items in findings_by_file.items():
+        severity_order = {"high": 0, "medium": 1, "low": 2, "unknown": 3}
+        sorted_items = sorted(
+            items,
+            key=lambda item: severity_order.get(item["severity_level"], 3),
+        )
+        for item in sorted_items:
+            func = f"::{item['func_name']}" if item.get("func_name") else ""
+            summary_lines.append(
+                f"[{item['severity_level']}] {file_name}{func}: {item['critique']}"
+            )
+
+    return {
+        "summary": "\n".join(summary_lines),
+        "findings": findings,
+        "findings_by_file": findings_by_file,
+        "files_to_repair": files_to_repair,
+        "has_high_severity": has_high_severity,
+    }
+
+def make_openai_client(model_name=None):
+    """Create an OpenAI-compatible client from environment variables."""
+    from openai import OpenAI
+
+    model_name = (model_name or os.environ.get("GPT_VERSION") or "").lower()
+
+    if model_name.startswith("claude-"):
+        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        base_url = os.environ.get("ANTHROPIC_BASE_URL") or "https://api.anthropic.com/v1"
+    elif model_name.startswith("kimi-"):
+        api_key = os.environ.get("MOONSHOT_API_KEY") or os.environ.get("KIMI_API_KEY")
+        base_url = (
+            os.environ.get("MOONSHOT_BASE_URL")
+            or os.environ.get("KIMI_BASE_URL")
+            or "https://api.moonshot.cn/v1"
+        )
+    elif model_name.startswith("deepseek-"):
+        api_key = os.environ.get("DEEPSEEK_API_KEY")
+        base_url = os.environ.get("DEEPSEEK_BASE_URL")
+    else:
+        api_key = (
+            os.environ.get("OPENAI_API_KEY")
+            or os.environ.get("DEEPSEEK_API_KEY")
+            or os.environ.get("MOONSHOT_API_KEY")
+            or os.environ.get("KIMI_API_KEY")
+            or os.environ.get("ANTHROPIC_API_KEY")
+        )
+        base_url = (
+            os.environ.get("OPENAI_BASE_URL")
+            or os.environ.get("DEEPSEEK_BASE_URL")
+            or os.environ.get("MOONSHOT_BASE_URL")
+            or os.environ.get("KIMI_BASE_URL")
+            or os.environ.get("ANTHROPIC_BASE_URL")
+        )
+        if (
+            base_url is None
+            and (os.environ.get("MOONSHOT_API_KEY") or os.environ.get("KIMI_API_KEY"))
+            and not (os.environ.get("OPENAI_API_KEY") or os.environ.get("DEEPSEEK_API_KEY"))
+        ):
+            base_url = "https://api.moonshot.cn/v1"
+        elif (
+            base_url is None
+            and os.environ.get("ANTHROPIC_API_KEY")
+            and not (
+                os.environ.get("OPENAI_API_KEY")
+                or os.environ.get("DEEPSEEK_API_KEY")
+                or os.environ.get("MOONSHOT_API_KEY")
+                or os.environ.get("KIMI_API_KEY")
+            )
+        ):
+            base_url = "https://api.anthropic.com/v1"
+
+    if not api_key:
+        raise RuntimeError(
+            "Set OPENAI_API_KEY, DEEPSEEK_API_KEY, MOONSHOT_API_KEY, "
+            "KIMI_API_KEY, or ANTHROPIC_API_KEY before running PaperAlgo."
+        )
+
+    kwargs = {"api_key": api_key}
+    if base_url:
+        kwargs["base_url"] = base_url.rstrip("/")
+
+    return OpenAI(**kwargs)
+
+
+def normalize_completion(completion, model_name):
+    """Convert provider responses to the dict shape used by PaperAlgo logs."""
+    if hasattr(completion, "model_dump_json"):
+        return json.loads(completion.model_dump_json())
+    if isinstance(completion, dict):
+        return completion
+    if isinstance(completion, str):
+        if completion.lstrip().lower().startswith(("<!doctype html", "<html")):
+            raise ValueError(
+                "The provider returned an HTML page instead of an API response. "
+                "Check that the base_url points to an OpenAI-compatible API endpoint, "
+                "not the provider website."
+            )
+        return {
+            "model": model_name,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": completion,
+                    },
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+            },
+        }
+    raise TypeError(f"Unsupported completion response type: {type(completion).__name__}")
+
+
+def get_completion_message(completion_json):
+    message = completion_json["choices"][0]["message"]
+    return {
+        "role": message.get("role", "assistant"),
+        "content": message.get("content", ""),
+    }
+
+
+def load_paper_content(paper_format, json_path=None, latex_path=None, markdown_path=None):
+    paper_format = paper_format.lower()
+
+    if paper_format == "json":
+        if not json_path:
+            raise ValueError("--pdf_json_path is required when --paper_format JSON")
+        with open(json_path, encoding="utf-8") as f:
+            return json.load(f)
+
+    if paper_format == "latex":
+        if not latex_path:
+            raise ValueError("--pdf_latex_path is required when --paper_format LaTeX")
+        with open(latex_path, encoding="utf-8") as f:
+            return f.read()
+
+    if paper_format == "markdown":
+        if not markdown_path:
+            raise ValueError("--pdf_markdown_path is required when --paper_format Markdown")
+        with open(markdown_path, encoding="utf-8") as f:
+            return f.read()
+
+    raise ValueError(
+        "Invalid paper format. Please select 'JSON', 'LaTeX', or 'Markdown'."
+    )
+
+
+DEEPSEEK_MODEL_COST = {
+    # Prices are CNY per 1M tokens from DeepSeek pricing docs.
+    "deepseek-v4-flash": {
+        "input": 1.00,
+        "cached_input": 0.02,
+        "output": 2.00,
+        "currency": "CNY",
+    },
+    "deepseek-v4-pro": {
+        "input": 3.00,
+        "cached_input": 0.025,
+        "output": 6.00,
+        "currency": "CNY",
+    },
+    # Deprecated compatibility model names map to DeepSeek-V4-Flash.
+    "deepseek-chat": {
+        "input": 1.00,
+        "cached_input": 0.02,
+        "output": 2.00,
+        "currency": "CNY",
+    },
+    "deepseek-reasoner": {
+        "input": 1.00,
+        "cached_input": 0.02,
+        "output": 2.00,
+        "currency": "CNY",
+    },
+}
+
+
+KIMI_MODEL_COST = {
+    # Prices are CNY per 1M tokens from Kimi pricing docs.
+    "kimi-k2.6": {
+        "input": 6.50,
+        "cached_input": 1.10,
+        "output": 27.00,
+        "currency": "CNY",
+    },
+    "kimi-k2.7-code": {
+        "input": 6.50,
+        "cached_input": 1.30,
+        "output": 27.00,
+        "currency": "CNY",
+    },
+    "kimi-k2.7-code-highspeed": {
+        "input": 13.00,
+        "cached_input": 2.60,
+        "output": 54.00,
+        "currency": "CNY",
+    },
+}
+
+
+CNY_MODEL_COST = {
+    **DEEPSEEK_MODEL_COST,
+    **KIMI_MODEL_COST,
+}
+
+
+def format_cost(cost, currency):
+    if cost is None:
+        return "unavailable"
+    if currency == "USD":
+        return f"${cost:.8f}"
+    return f"{currency} {cost:.8f}"
+
+
 def extract_planning(trajectories_json_file_path):
-    with open(trajectories_json_file_path) as f:
+    with open(trajectories_json_file_path, encoding="utf-8") as f:
         traj = json.load(f)
 
     context_lst = []
@@ -117,12 +453,29 @@ def content_to_json4(data):
     return result
 
 def extract_code_from_content(content):
-    pattern = r'^```(?:\w+)?\s*\n(.*?)(?=^```)```'
-    code = re.findall(pattern, content, re.DOTALL | re.MULTILINE)
-    if len(code) == 0:
+    """Extract source code from an LLM response and remove markdown wrappers."""
+    if not content:
         return ""
-    else:
-        return code[0]
+
+    text = content.strip()
+    pattern = r"```(?:[A-Za-z0-9_.+-]+)?\s*\n(.*?)\n?```"
+    code_blocks = re.findall(pattern, text, re.DOTALL)
+    if code_blocks:
+        text = code_blocks[0].strip()
+
+    text = re.sub(r"^\s*```[A-Za-z0-9_.+-]*\s*", "", text).strip()
+    text = re.sub(r"\s*```\s*$", "", text).strip()
+
+    lines = text.splitlines()
+    if lines:
+        header_pattern = (
+            r"^\s*(?:##|#|//)\s*(?:Code:|File name:)?\s*"
+            r"[\w./\\-]+\.(?:py|r|R|yaml|yml)\s*$"
+        )
+        if re.match(header_pattern, lines[0]):
+            lines = lines[1:]
+
+    return "\n".join(lines).strip()
     
 def extract_code_from_content2(content):
     pattern = r'```python\s*(.*?)```'
@@ -237,18 +590,63 @@ def cal_cost(response_json, model_name):
     }
 
     
-    prompt_tokens = response_json["usage"]["prompt_tokens"]
-    completion_tokens = response_json["usage"]["completion_tokens"]
-    cached_tokens = response_json["usage"]["prompt_tokens_details"].get("cached_tokens", 0)
+    usage = response_json["usage"]
+    prompt_tokens = usage["prompt_tokens"]
+    completion_tokens = usage["completion_tokens"]
+    prompt_token_details = usage.get("prompt_tokens_details") or {}
+    cached_tokens = usage.get(
+        "cached_tokens",
+        prompt_token_details.get("cached_tokens", 0),
+    )
 
     # input token = (prompt_tokens - cached_tokens)
     actual_input_tokens = prompt_tokens - cached_tokens
     output_tokens = completion_tokens
 
-    cost_info = model_cost[model_name]
+    cny_cost_info = CNY_MODEL_COST.get(model_name.lower())
+    if cny_cost_info is not None:
+        cache_hit_tokens = usage.get("prompt_cache_hit_tokens", cached_tokens)
+        cache_miss_tokens = usage.get(
+            "prompt_cache_miss_tokens",
+            max(prompt_tokens - cache_hit_tokens, 0),
+        )
+        input_cost = (cache_miss_tokens / 1_000_000) * cny_cost_info["input"]
+        cached_input_cost = (
+            cache_hit_tokens / 1_000_000
+        ) * cny_cost_info["cached_input"]
+        output_cost = (output_tokens / 1_000_000) * cny_cost_info["output"]
+        total_cost = input_cost + cached_input_cost + output_cost
+
+        return {
+            'model_name': model_name,
+            'actual_input_tokens': cache_miss_tokens,
+            'input_cost': input_cost,
+            'cached_tokens': cache_hit_tokens,
+            'cached_input_cost': cached_input_cost,
+            'output_tokens': output_tokens,
+            'output_cost': output_cost,
+            'total_cost': total_cost,
+            'currency': cny_cost_info["currency"],
+            'prompt_tokens': prompt_tokens,
+        }
+
+    cost_info = model_cost.get(model_name)
+    if cost_info is None:
+        return {
+            'model_name': model_name,
+            'actual_input_tokens': actual_input_tokens,
+            'input_cost': None,
+            'cached_tokens': cached_tokens,
+            'cached_input_cost': None,
+            'output_tokens': output_tokens,
+            'output_cost': None,
+            'total_cost': None,
+            'currency': None,
+            'prompt_tokens': prompt_tokens,
+        }
 
     input_cost = (actual_input_tokens / 1_000_000) * cost_info['input']
-    cached_input_cost = (cached_tokens / 1_000_000) * cost_info['cached_input']
+    cached_input_cost = 0 if cost_info['cached_input'] is None else (cached_tokens / 1_000_000) * cost_info['cached_input']
     output_cost = (output_tokens / 1_000_000) * cost_info['output']
 
     total_cost = input_cost + cached_input_cost + output_cost
@@ -262,6 +660,8 @@ def cal_cost(response_json, model_name):
         'output_tokens': output_tokens,
         'output_cost': output_cost,
         'total_cost': total_cost,
+        'currency': 'USD',
+        'prompt_tokens': prompt_tokens,
     }
 
 def load_accumulated_cost(accumulated_cost_file):
@@ -274,7 +674,7 @@ def load_accumulated_cost(accumulated_cost_file):
 
 def save_accumulated_cost(accumulated_cost_file, cost):
     with open(accumulated_cost_file, "w", encoding="utf-8") as f:
-        json.dump({"total_cost": cost}, f)
+        json.dump({"total_cost": cost}, f, ensure_ascii=False)
 
 def print_response(completion_json, is_llm=False):
     print("============================================")
@@ -284,20 +684,28 @@ def print_response(completion_json, is_llm=False):
         print(completion_json['choices'][0]['message']['content'])
     print("============================================\n")
 
-def print_log_cost(completion_json, gpt_version, current_stage, output_dir, total_accumulated_cost):
+def _legacy_print_log_cost(completion_json, gpt_version, current_stage, output_dir, total_accumulated_cost):
     usage_info = cal_cost(completion_json, gpt_version)
 
     current_cost = usage_info['total_cost']
-    total_accumulated_cost += current_cost
+    currency = usage_info.get('currency') or 'USD'
+    if current_cost is not None:
+        total_accumulated_cost += current_cost
 
     output_lines = []
     output_lines.append("🌟 Usage Summary 🌟")
     output_lines.append(f"{current_stage}")
     output_lines.append(f"🛠️ Model: {usage_info['model_name']}")
-    output_lines.append(f"📥 Input tokens: {usage_info['actual_input_tokens']} (Cost: ${usage_info['input_cost']:.8f})")
-    output_lines.append(f"📦 Cached input tokens: {usage_info['cached_tokens']} (Cost: ${usage_info['cached_input_cost']:.8f})")
-    output_lines.append(f"📤 Output tokens: {usage_info['output_tokens']} (Cost: ${usage_info['output_cost']:.8f})")
-    output_lines.append(f"💵 Current total cost: ${current_cost:.8f}")
+    if current_cost is None:
+        output_lines.append(f"📥 Input tokens: {usage_info['actual_input_tokens']} (Cost: unavailable)")
+        output_lines.append(f"📦 Cached input tokens: {usage_info['cached_tokens']} (Cost: unavailable)")
+        output_lines.append(f"📤 Output tokens: {usage_info['output_tokens']} (Cost: unavailable)")
+        output_lines.append("💵 Current total cost: unavailable for this model")
+    else:
+        output_lines.append(f"📥 Input tokens: {usage_info['actual_input_tokens']} (Cost: ${usage_info['input_cost']:.8f})")
+        output_lines.append(f"📦 Cached input tokens: {usage_info['cached_tokens']} (Cost: ${usage_info['cached_input_cost']:.8f})")
+        output_lines.append(f"📤 Output tokens: {usage_info['output_tokens']} (Cost: ${usage_info['output_cost']:.8f})")
+        output_lines.append(f"💵 Current total cost: ${current_cost:.8f}")
     output_lines.append(f"🪙 Accumulated total cost so far: ${total_accumulated_cost:.8f}")
     output_lines.append("============================================\n")
 
@@ -308,6 +716,49 @@ def print_log_cost(completion_json, gpt_version, current_stage, output_dir, tota
     with open(f"{output_dir}/cost_info.log", "a", encoding="utf-8") as f:
         f.write(output_text + "\n")
     
+    return total_accumulated_cost
+
+
+def print_log_cost(completion_json, gpt_version, current_stage, output_dir, total_accumulated_cost):
+    usage_info = cal_cost(completion_json, gpt_version)
+
+    current_cost = usage_info['total_cost']
+    currency = usage_info.get('currency') or 'USD'
+    if current_cost is not None:
+        total_accumulated_cost += current_cost
+
+    output_lines = [
+        "Usage Summary",
+        f"{current_stage}",
+        f"Model: {usage_info['model_name']}",
+    ]
+
+    if current_cost is None:
+        output_lines.extend([
+            f"Input cache miss tokens: {usage_info['actual_input_tokens']} (Cost: unavailable)",
+            f"Input cache hit tokens: {usage_info['cached_tokens']} (Cost: unavailable)",
+            f"Output tokens: {usage_info['output_tokens']} (Cost: unavailable)",
+            "Current total cost: unavailable for this model",
+        ])
+    else:
+        output_lines.extend([
+            f"Input cache miss tokens: {usage_info['actual_input_tokens']} (Cost: {format_cost(usage_info['input_cost'], currency)})",
+            f"Input cache hit tokens: {usage_info['cached_tokens']} (Cost: {format_cost(usage_info['cached_input_cost'], currency)})",
+            f"Output tokens: {usage_info['output_tokens']} (Cost: {format_cost(usage_info['output_cost'], currency)})",
+            f"Current total cost: {format_cost(current_cost, currency)}",
+        ])
+
+    output_lines.append(
+        f"Accumulated total cost so far: {format_cost(total_accumulated_cost, currency)}"
+    )
+    output_lines.append("============================================\n")
+
+    output_text = "\n".join(output_lines)
+    print(output_text)
+
+    with open(f"{output_dir}/cost_info.log", "a", encoding="utf-8") as f:
+        f.write(output_text + "\n")
+
     return total_accumulated_cost
 
 
@@ -399,8 +850,12 @@ def read_all_files(directory, allowed_ext, is_print=True):
                 if file_size > 204800: # > 200KB 
                     print(f"[BIG] {filepath} {file_size}")
 
-                with open(filepath, "r") as file: # encoding="utf-8"
-                    all_files_content[relative_path] = file.read()
+                try:
+                    with open(filepath, "r", encoding="utf-8") as file:
+                        all_files_content[relative_path] = file.read()
+                except UnicodeDecodeError:
+                    with open(filepath, "r", encoding="utf-8-sig") as file:
+                        all_files_content[relative_path] = file.read()
             except Exception as e:
                 print(e)
                 print(f"[SKIP] {os.path.join(root, filename)}")

@@ -18,9 +18,14 @@ with open(f'{output_dir}/planning_trajectories.json', encoding='utf8') as f:
     traj = json.load(f)
 
 yaml_raw_content = ""
-for turn_idx, turn in enumerate(traj):
-        if turn_idx == 8:
-            yaml_raw_content = turn['content']   
+for turn in reversed(traj):
+    if turn.get("role") != "assistant":
+        continue
+
+    content = turn.get("content", "")
+    if "```yaml" in content or "## config.yaml" in content:
+        yaml_raw_content = content
+        break
 
 if "</think>" in yaml_raw_content:
     yaml_raw_content = yaml_raw_content.split("</think>")[-1]

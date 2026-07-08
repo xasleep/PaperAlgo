@@ -1,6 +1,6 @@
 # export OPENAI_API_KEY=""
 
-GPT_VERSION="o3-mini"
+GPT_VERSION="${GPT_VERSION:-deepseek-v4-pro}"
 
 PAPER_NAME="Transformer"
 PDF_LATEX_CLEANED_PATH="../examples/Transformer_cleaned.tex" # _cleaned.tex

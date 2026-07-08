@@ -3,7 +3,7 @@ import json
 import sys
 import argparse
 
-from openai import OpenAI
+from utils import make_openai_client
 
 try:
     from huggingface_hub import HfApi
@@ -33,7 +33,7 @@ def parse_args() -> argparse.Namespace:
 
 
 args = parse_args()
-client = OpenAI(api_key = os.environ["OPENAI_API_KEY"])
+client = make_openai_client()
 
 planning_config_path = os.path.join(
     args.output_dir, f"planning_config.yaml"

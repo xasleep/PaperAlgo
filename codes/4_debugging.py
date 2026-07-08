@@ -4,8 +4,7 @@ import argparse
 import re
 import sys
 
-from openai import OpenAI
-from utils import read_python_files, content_to_json, extract_planning
+from utils import read_python_files, content_to_json, extract_planning, make_openai_client
 
 
 def parse_and_apply_changes(responses, debug_dir, save_num=1):
@@ -123,7 +122,7 @@ def parse_args() -> argparse.Namespace:
 
 
 args = parse_args()
-client = OpenAI(api_key = os.environ["OPENAI_API_KEY"])
+client = make_openai_client()
 
 if not os.path.exists(args.error_file_name):
     raise FileNotFoundError(f"Error file not found: {args.error_file_name}")

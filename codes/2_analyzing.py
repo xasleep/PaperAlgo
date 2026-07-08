@@ -1,9 +1,19 @@
-from openai import OpenAI
 import json
 import os
 from tqdm import tqdm
 import sys
-from utils import extract_planning, content_to_json, print_response, print_log_cost, load_accumulated_cost, save_accumulated_cost
+from utils import (
+    extract_planning,
+    content_to_json,
+    print_response,
+    print_log_cost,
+    load_accumulated_cost,
+    save_accumulated_cost,
+    make_openai_client,
+    normalize_completion,
+    get_completion_message,
+    load_paper_content,
+)
 import copy
 
 import argparse
@@ -12,41 +22,41 @@ parser = argparse.ArgumentParser()
 
 parser.add_argument('--paper_name',type=str)
 parser.add_argument('--gpt_version',type=str, default="o3-mini")
-parser.add_argument('--paper_format',type=str, default="JSON", choices=["JSON", "LaTeX"])
+parser.add_argument('--paper_format',type=str, default="JSON", choices=["JSON", "LaTeX", "Markdown"])
 parser.add_argument('--pdf_json_path', type=str) # json format
 parser.add_argument('--pdf_latex_path', type=str) # latex format
+parser.add_argument('--pdf_markdown_path', type=str) # markdown format
+parser.add_argument('--domain', type=str, default="general", choices=["general", "statistics"])
 parser.add_argument('--output_dir',type=str, default="")
 
 args    = parser.parse_args()
-
-client = OpenAI(api_key = os.environ["OPENAI_API_KEY"])
 
 paper_name = args.paper_name
 gpt_version = args.gpt_version
 paper_format = args.paper_format
 pdf_json_path = args.pdf_json_path
 pdf_latex_path = args.pdf_latex_path
+pdf_markdown_path = args.pdf_markdown_path
+domain = args.domain
 output_dir = args.output_dir
+client = make_openai_client(gpt_version)
     
-if paper_format == "JSON":
-    with open(f'{pdf_json_path}') as f:
-        paper_content = json.load(f)
-elif paper_format == "LaTeX":
-    with open(f'{pdf_latex_path}') as f:
-        paper_content = f.read()
-else:
-    print(f"[ERROR] Invalid paper format. Please select either 'JSON' or 'LaTeX.")
-    sys.exit(0)
+paper_content = load_paper_content(
+    paper_format,
+    json_path=pdf_json_path,
+    latex_path=pdf_latex_path,
+    markdown_path=pdf_markdown_path,
+)
 
 
-with open(f'{output_dir}/planning_config.yaml') as f: 
+with open(f'{output_dir}/planning_config.yaml', encoding="utf-8") as f:
     config_yaml = f.read()
 
 context_lst = extract_planning(f'{output_dir}/planning_trajectories.json')
 
 # 0: overview, 1: detailed, 2: PRD
 if os.path.exists(f'{output_dir}/task_list.json'):
-    with open(f'{output_dir}/task_list.json') as f:
+    with open(f'{output_dir}/task_list.json', encoding="utf-8") as f:
         task_list = json.load(f)
 else:
     task_list = content_to_json(context_lst[2])
@@ -90,6 +100,22 @@ This analysis must align precisely with the paper’s methodology, experimental 
 5. REFER TO CONFIGURATION: Always reference settings from the config.yaml file. Do not invent or assume any values—only use configurations explicitly provided.
      
 """}]
+
+if domain == "statistics":
+    analysis_msg.append({
+        "role": "system",
+        "content": """Statistics domain constraints:
+- Use R as the implementation language. Analyze the target file as an R source file when its name ends with .R.
+- Focus every logic analysis on statistical model equations, likelihood/objective functions, parameter estimation methods, simulation DGPs, Monte Carlo experiments, and reported accuracy metrics.
+- Do not introduce model.R, metrics.R, utils.R, trainer.py, dataset_loader.py, Python modules, neural-network training loops, epochs, batches, or deep-learning abstractions unless explicitly required by the paper and already present in the task list.
+- Preserve estimator-specific details from the paper: initialization, constraints, optimization objective, convergence diagnostics, standard errors/confidence intervals, and tuning constants.
+- Preserve simulation details from the paper: true parameters, sample sizes, dependence/noise distributions, replication counts, scenario grids, and reported metrics.
+- Prefer concise R functions and simple lists/data frames over large object-oriented abstractions unless the task list explicitly requires classes.
+- Put model-specific data generation formulas in simulation.R. Put likelihood/objective functions, parameter checks, and numerical safeguards such as safe log calculations directly in estimators.R.
+- Put metric definitions, short formula comments, metric calculation, seed records for replications, and Monte Carlo or empirical-analysis orchestration in experiments.R.
+- Put result directory creation and table saving in main.R. main.R must begin with two separated numbered comment sections whose headings are exactly '### 1. Paper details requiring assumptions:' and '### 2. Output locations:'.
+"""
+    })
 
 def get_write_msg(todo_file_name, todo_file_desc):
     
@@ -173,12 +199,12 @@ for todo_file_name in tqdm(todo_file_lst):
     completion = api_call(trajectories)
     
     # response
-    completion_json = json.loads(completion.model_dump_json())
+    completion_json = normalize_completion(completion, gpt_version)
     responses.append(completion_json)
     
     # trajectories
-    message = completion.choices[0].message
-    trajectories.append({'role': message.role, 'content': message.content})
+    message = get_completion_message(completion_json)
+    trajectories.append({'role': message["role"], 'content': message["content"]})
 
     # print and logging
     print_response(completion_json)
@@ -186,7 +212,7 @@ for todo_file_name in tqdm(todo_file_lst):
     total_accumulated_cost = temp_total_accumulated_cost
 
     # save
-    with open(f'{artifact_output_dir}/{todo_file_name}_simple_analysis.txt', 'w') as f:
+    with open(f'{artifact_output_dir}/{todo_file_name}_simple_analysis.txt', 'w', encoding="utf-8") as f:
         f.write(completion_json['choices'][0]['message']['content'])
 
 
@@ -194,10 +220,10 @@ for todo_file_name in tqdm(todo_file_lst):
 
     # save for next stage(coding)
     todo_file_name = todo_file_name.replace("/", "_") 
-    with open(f'{output_dir}/{todo_file_name}_simple_analysis_response.json', 'w') as f:
-        json.dump(responses, f)
+    with open(f'{output_dir}/{todo_file_name}_simple_analysis_response.json', 'w', encoding="utf-8") as f:
+        json.dump(responses, f, ensure_ascii=False)
 
-    with open(f'{output_dir}/{todo_file_name}_simple_analysis_trajectories.json', 'w') as f:
-        json.dump(trajectories, f)
+    with open(f'{output_dir}/{todo_file_name}_simple_analysis_trajectories.json', 'w', encoding="utf-8") as f:
+        json.dump(trajectories, f, ensure_ascii=False)
 
 save_accumulated_cost(f"{output_dir}/accumulated_cost.json", total_accumulated_cost)

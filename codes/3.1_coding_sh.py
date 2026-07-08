@@ -1,10 +1,9 @@
-from openai import OpenAI
 import json
 import os
 from tqdm import tqdm
 import sys
 import copy
-from utils import extract_planning, content_to_json, extract_code_from_content, print_response, print_log_cost, load_accumulated_cost, save_accumulated_cost, read_python_files
+from utils import extract_planning, content_to_json, extract_code_from_content, print_response, print_log_cost, load_accumulated_cost, save_accumulated_cost, read_python_files, make_openai_client
 import argparse
 
 parser = argparse.ArgumentParser()
@@ -18,7 +17,7 @@ parser.add_argument('--output_dir',type=str, default="")
 parser.add_argument('--output_repo_dir',type=str, default="")
 
 args    = parser.parse_args()
-client = OpenAI(api_key = os.environ["OPENAI_API_KEY"])
+client = make_openai_client()
 
 paper_name = args.paper_name
 gpt_version = args.gpt_version
@@ -29,16 +28,16 @@ output_dir = args.output_dir
 output_repo_dir = args.output_repo_dir
 
 if paper_format == "JSON":
-    with open(f'{pdf_json_path}') as f:
+    with open(f'{pdf_json_path}', encoding="utf-8") as f:
         paper_content = json.load(f)
 elif paper_format == "LaTeX":
-    with open(f'{pdf_latex_path}') as f:
+    with open(f'{pdf_latex_path}', encoding="utf-8") as f:
         paper_content = f.read()
 else:
     print(f"[ERROR] Invalid paper format. Please select either 'JSON' or 'LaTeX.")
     sys.exit(0)
 
-with open(f'{output_dir}/planning_config.yaml') as f: 
+with open(f'{output_dir}/planning_config.yaml', encoding="utf-8") as f:
     config_yaml = f.read()
 
 context_lst = extract_planning(f'{output_dir}/planning_trajectories.json')
@@ -168,7 +167,7 @@ for todo_idx, todo_file_name in enumerate(["reproduce.sh"]):
     total_accumulated_cost = temp_total_accumulated_cost
 
     # save artifacts
-    with open(f'{artifact_output_dir}/{save_todo_file_name}_coding.txt', 'w') as f:
+    with open(f'{artifact_output_dir}/{save_todo_file_name}_coding.txt', 'w', encoding="utf-8") as f:
         f.write(completion_json['choices'][0]['message']['content'])
 
 
@@ -182,7 +181,7 @@ for todo_idx, todo_file_name in enumerate(["reproduce.sh"]):
         todo_file_dir = '/'.join(todo_file_name.split("/")[:-1])
         os.makedirs(f"{output_repo_dir}/{todo_file_dir}", exist_ok=True)
 
-    with open(f"{output_repo_dir}/{todo_file_name}", 'w') as f:
+    with open(f"{output_repo_dir}/{todo_file_name}", 'w', encoding="utf-8") as f:
         f.write(code)
 
 save_accumulated_cost(f"{output_dir}/accumulated_cost.json", total_accumulated_cost)
