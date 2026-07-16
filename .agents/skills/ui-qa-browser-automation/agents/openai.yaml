@@ -1,0 +1,4 @@
+interface:
+  display_name: "UI QA Browser Automation"
+  short_description: "Inspect frontend behavior with browser-driven QA."
+  default_prompt: "Use $ui-qa-browser-automation to verify this UI in the browser and fix visible issues."

@@ -2,6 +2,7 @@ import json
 import re
 import os
 import sys
+import uuid
 from datetime import datetime
 
 for _stream in (sys.stdout, sys.stderr):
@@ -28,14 +29,33 @@ def eval_feedback_path(output_dir):
 def load_json_file(path, default=None):
     if not os.path.exists(path):
         return default
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+        return default
 
 
 def save_json_file(path, data):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    temp_path = os.path.join(
+        directory,
+        f".{os.path.basename(path)}.{os.getpid()}.{uuid.uuid4().hex}.tmp",
+    )
+    try:
+        with open(temp_path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, path)
+    finally:
+        try:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+        except OSError:
+            pass
 
 
 def write_repo_status(output_dir, status, **kwargs):

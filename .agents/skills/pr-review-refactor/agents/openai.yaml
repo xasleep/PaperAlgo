@@ -1,0 +1,4 @@
+interface:
+  display_name: "PR Review Refactor"
+  short_description: "Review AI-written changes and make focused refactors."
+  default_prompt: "Use $pr-review-refactor to review these changes and improve them safely."

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Bug Fix CI Repair"
+  short_description: "Diagnose failures, fix bugs, and verify CI-style checks."
+  default_prompt: "Use $bug-fix-ci-repair to diagnose this failure and repair it."

@@ -2,6 +2,7 @@ import json
 import os
 import sys
 import argparse
+from openai import BadRequestError, PermissionDeniedError
 from utils import (
     read_python_files,
     extract_planning,
@@ -25,6 +26,10 @@ from utils import (
 )
 
 client = None
+MIN_GENERATED_N = 1
+MAX_GENERATED_N = 32
+MAX_REPAIR_ROUNDS_LIMIT = 10
+FALLBACK_REASON_QUOTA = "quota_like_error"
 
 
 def api_call(request_json):
@@ -61,6 +66,45 @@ def build_request_json(gpt_version, msg, generated_n):
         "stop": None,
         "n": generated_n,
     }
+
+
+def default_fallback_models(model_name):
+    model_name = model_name.lower()
+    if model_name == "qwen3.7-max":
+        return ["qwen3.7-plus"]
+    if model_name == "qwen-3.7-max":
+        return ["qwen-3.7-plus"]
+    return []
+
+
+def parse_fallback_models(value):
+    if not value:
+        return []
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def validate_eval_args(args):
+    if args.generated_n < MIN_GENERATED_N or args.generated_n > MAX_GENERATED_N:
+        raise ValueError(
+            f"generated_n must be between {MIN_GENERATED_N} and {MAX_GENERATED_N}."
+        )
+    if args.max_repair_rounds < 0 or args.max_repair_rounds > MAX_REPAIR_ROUNDS_LIMIT:
+        raise ValueError(
+            f"max_repair_rounds must be between 0 and {MAX_REPAIR_ROUNDS_LIMIT}."
+        )
+
+
+def is_quota_fallback_error(error):
+    message = str(error).lower()
+    status_code = getattr(error, "status_code", None)
+    if "allocationquota.freetieronly" in message:
+        return True
+    if status_code == 403 and any(
+        marker in message
+        for marker in ["free quota", "free tier", "quota", "insufficient"]
+    ):
+        return True
+    return False
 
 
 def build_domain_eval_instruction(domain):
@@ -167,8 +211,55 @@ def run_completion_requests(gpt_version, msg, generated_n):
     return final_request_json, aggregate_completion_json, generated_n
 
 
+def run_completion_requests_with_fallback(gpt_version, msg, generated_n, fallback_models):
+    global client
+
+    model_chain = [gpt_version] + fallback_models
+    last_error = None
+    fallback_reason = ""
+    fallback_from_model = ""
+
+    for model_idx, model_name in enumerate(model_chain):
+        if model_idx > 0:
+            print(
+                f"[WARNING] Falling back evaluation model from "
+                f"{model_chain[model_idx - 1]} to {model_name}."
+            )
+        client = make_openai_client(model_name)
+
+        try:
+            request_json, completion_json, generated_n = run_completion_requests(
+                model_name,
+                msg,
+                generated_n,
+            )
+            fallback_info = {
+                "fallback_used": model_idx > 0,
+                "fallback_reason": fallback_reason if model_idx > 0 else "",
+                "fallback_from_model": fallback_from_model if model_idx > 0 else "",
+                "fallback_eval_model": model_name if model_idx > 0 else "",
+                "fallback_model_chain": model_chain,
+                "fallback_remaining_models": model_chain[model_idx + 1 :],
+            }
+            return request_json, completion_json, generated_n, model_name, fallback_info
+        except (PermissionDeniedError, BadRequestError) as error:
+            last_error = error
+            if model_idx < len(model_chain) - 1 and is_quota_fallback_error(error):
+                fallback_reason = FALLBACK_REASON_QUOTA
+                fallback_from_model = model_name
+                print(
+                    f"[WARNING] Evaluation model {model_name} hit a quota-like "
+                    f"error. Trying fallback model."
+                )
+                continue
+            raise
+
+    raise last_error
+
+
 def main(args):
     global client
+    validate_eval_args(args)
 
     paper_name = args.paper_name
     paper_format = args.paper_format
@@ -180,8 +271,11 @@ def main(args):
     target_repo_dir = args.target_repo_dir
     eval_result_dir = args.eval_result_dir
     gpt_version = args.gpt_version
-    client = make_openai_client(gpt_version)
+    fallback_models = parse_fallback_models(args.fallback_gpt_versions)
+    if not fallback_models:
+        fallback_models = default_fallback_models(gpt_version)
     generated_n = args.generated_n
+    max_repair_rounds = args.max_repair_rounds
     data_dir = args.data_dir
     eval_type = args.eval_type
     is_papercoder = True if args.papercoder else False
@@ -341,10 +435,17 @@ def main(args):
         print(f"[ERROR] {args.paper_name} more than 128k")
         sys.exit(0)
 
-    request_json, completion_json, generated_n = run_completion_requests(
+    (
+        request_json,
+        completion_json,
+        generated_n,
+        actual_gpt_version,
+        fallback_info,
+    ) = run_completion_requests_with_fallback(
         gpt_version,
         msg,
         generated_n,
+        fallback_models,
     )
 
     score_key = "score"
@@ -412,6 +513,10 @@ def main(args):
         "eval_type": eval_type,
         "gold_repo_dir": gold_repo_dir,
         "generated_n": generated_n,
+        "requested_gpt_version": gpt_version,
+        "actual_gpt_version": actual_gpt_version,
+        "fallback_gpt_versions": fallback_models,
+        **fallback_info,
         "request_json": request_json,
         "completion_json": completion_json,
         "eval_result": {
@@ -428,7 +533,7 @@ def main(args):
     os.makedirs(eval_result_dir, exist_ok=True)
 
     with open(
-        f"{eval_result_dir}/{paper_name}_eval_{eval_type}_{gpt_version}_{now_str}.json",
+        f"{eval_result_dir}/{paper_name}_eval_{eval_type}_{actual_gpt_version}_{now_str}.json",
         "w",
         encoding="utf-8",
     ) as f:
@@ -438,7 +543,10 @@ def main(args):
         "paper_name": paper_name,
         "target_repo_dir": target_repo_dir,
         "eval_type": eval_type,
-        "eval_model": gpt_version,
+        "requested_eval_model": gpt_version,
+        "eval_model": actual_gpt_version,
+        "fallback_gpt_versions": fallback_models,
+        **fallback_info,
         "score": avg_score,
         "valid_n": len(all_scores),
         "score_lst": all_scores,
@@ -446,12 +554,12 @@ def main(args):
         "pass_rule": "score >= 4.0 and no high severity findings",
         "has_high_severity": feedback["has_high_severity"],
         "repair_round": repair_round,
-        "max_repair_rounds": MAX_REPAIR_ROUNDS,
+        "max_repair_rounds": max_repair_rounds,
         "summary": feedback["summary"],
         "findings": feedback["findings"],
         "findings_by_file": feedback["findings_by_file"],
         "files_to_repair": feedback["files_to_repair"],
-        "eval_result_file": f"{eval_result_dir}/{paper_name}_eval_{eval_type}_{gpt_version}_{now_str}.json",
+        "eval_result_file": f"{eval_result_dir}/{paper_name}_eval_{eval_type}_{actual_gpt_version}_{now_str}.json",
         "updated_at": get_now_str(),
     }
     save_json_file(eval_feedback_path(output_dir), feedback_json)
@@ -462,13 +570,15 @@ def main(args):
         paper_name=paper_name,
         target_repo_dir=target_repo_dir,
         eval_type=eval_type,
-        eval_model=gpt_version,
+        requested_eval_model=gpt_version,
+        eval_model=actual_gpt_version,
+        **fallback_info,
         eval_score=avg_score,
         valid_n=len(all_scores),
         has_high_severity=feedback["has_high_severity"],
         pass_rule="score >= 4.0 and no high severity findings",
         repair_round=repair_round,
-        max_repair_rounds=MAX_REPAIR_ROUNDS,
+        max_repair_rounds=max_repair_rounds,
         feedback_file=eval_feedback_path(output_dir),
         eval_result_file=feedback_json["eval_result_file"],
     )
@@ -489,7 +599,7 @@ def main(args):
 
     print_log_cost(
         completion_json,
-        gpt_version,
+        actual_gpt_version,
         f"[Evaluation] {paper_name} - {eval_type}",
         output_dir,
         0,
@@ -533,6 +643,8 @@ if __name__ == "__main__":
 
     argparser.add_argument("--generated_n", type=int, default=8)
     argparser.add_argument("--gpt_version", type=str, default="deepseek-v4-pro")
+    argparser.add_argument("--fallback_gpt_versions", type=str, default="")
+    argparser.add_argument("--max_repair_rounds", type=int, default=MAX_REPAIR_ROUNDS)
 
     argparser.add_argument("--selected_file_path", type=str, default="")
     argparser.add_argument("--papercoder", action="store_true")

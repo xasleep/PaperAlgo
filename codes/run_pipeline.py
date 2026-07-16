@@ -8,6 +8,8 @@ from datetime import datetime
 
 from utils import (
     MAX_REPAIR_ROUNDS,
+    STATUS_EVAL_FAILED,
+    STATUS_EVAL_PASSED,
     load_json_file,
     repo_status_path,
     save_json_file,
@@ -37,6 +39,44 @@ PROVIDER_ENV = {
     },
 }
 
+SYSTEM_ENV_ALLOWLIST = {
+    "APPDATA",
+    "COMSPEC",
+    "HOME",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "LANG",
+    "LOCALAPPDATA",
+    "NUMBER_OF_PROCESSORS",
+    "PATH",
+    "PATHEXT",
+    "PROCESSOR_ARCHITECTURE",
+    "PROCESSOR_IDENTIFIER",
+    "PROGRAMDATA",
+    "SYSTEMDRIVE",
+    "SYSTEMROOT",
+    "TEMP",
+    "TMP",
+    "USERPROFILE",
+    "VIRTUAL_ENV",
+    "WINDIR",
+}
+PROVIDER_ENV_NAMES = {
+    item
+    for env_info in PROVIDER_ENV.values()
+    for names in env_info.values()
+    for item in names
+}
+ROLE_ENV_NAMES = {
+    "EVAL_API_KEY",
+    "EVAL_BASE_URL",
+    "REPRODUCE_API_KEY",
+    "REPRODUCE_BASE_URL",
+}
+MIN_GENERATED_N = 1
+MAX_GENERATED_N = 32
+MAX_REPAIR_ROUNDS_LIMIT = 10
+
 
 def now_str():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -54,8 +94,18 @@ def get_workspace_root(script_dir):
     return os.path.abspath(os.path.join(script_dir, "..", ".."))
 
 
+def build_clean_env():
+    return {
+        name: value
+        for name, value in os.environ.items()
+        if name.upper() in SYSTEM_ENV_ALLOWLIST
+        and name.upper() not in PROVIDER_ENV_NAMES
+        and name.upper() not in ROLE_ENV_NAMES
+    }
+
+
 def get_role_env(provider, role_prefix):
-    env = os.environ.copy()
+    env = build_clean_env()
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"
     env_info = PROVIDER_ENV[provider]
@@ -150,7 +200,7 @@ def should_echo_line(line, console_output):
 
 def run_command(label, cmd, cwd, log_path, status_path, env=None, console_output="progress"):
     if env is None:
-        env = os.environ.copy()
+        env = build_clean_env()
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"
 
@@ -247,12 +297,141 @@ def parse_bool(value):
     raise argparse.ArgumentTypeError(f"Invalid boolean value: {value}")
 
 
+def validate_runtime_args(args):
+    if args.generated_n < MIN_GENERATED_N or args.generated_n > MAX_GENERATED_N:
+        raise ValueError(
+            f"generated_n must be between {MIN_GENERATED_N} and {MAX_GENERATED_N}."
+        )
+    if args.max_repair_rounds < 0 or args.max_repair_rounds > MAX_REPAIR_ROUNDS_LIMIT:
+        raise ValueError(
+            f"max_repair_rounds must be between 0 and {MAX_REPAIR_ROUNDS_LIMIT}."
+        )
+
+
 def build_python_cmd(script_dir, script_name):
     return [sys.executable, os.path.join(script_dir, script_name)]
 
 
+def is_path_under(path, root):
+    try:
+        return os.path.commonpath([path, root]) == root
+    except ValueError:
+        return False
+
+
+def validate_markdown_path(markdown_path, runs_dir):
+    if not markdown_path:
+        raise ValueError("--pdf_markdown_path is required when --skip_mineru is set.")
+
+    resolved_path = os.path.abspath(markdown_path)
+    if not os.path.isfile(resolved_path):
+        raise FileNotFoundError(resolved_path)
+    if os.path.splitext(resolved_path)[1].lower() not in {".md", ".markdown"}:
+        raise ValueError("--pdf_markdown_path must use a Markdown extension.")
+
+    resolved_runs_dir = os.path.abspath(runs_dir)
+    if not is_path_under(resolved_path, resolved_runs_dir):
+        raise ValueError("--pdf_markdown_path must be under the runs directory.")
+
+    return resolved_path
+
+
+def parse_eval_fallback_versions(value):
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if not value:
+        return []
+    return [item.strip() for item in str(value).split(",") if item.strip()]
+
+
+def format_eval_fallback_versions(models):
+    return ",".join(models)
+
+
+def effective_eval_gpt_version(args):
+    return getattr(args, "active_eval_gpt_version", "") or args.eval_gpt_version
+
+
+def current_eval_fallback_models(args):
+    if effective_eval_gpt_version(args) != args.eval_gpt_version:
+        return parse_eval_fallback_versions(
+            getattr(args, "active_eval_fallback_gpt_versions", "")
+        )
+    return parse_eval_fallback_versions(args.eval_fallback_gpt_versions)
+
+
+def eval_fallback_versions_for_command(args):
+    return format_eval_fallback_versions(current_eval_fallback_models(args))
+
+
+def remaining_fallback_models_after(repo_status, fallback_model):
+    explicit_remaining = repo_status.get("fallback_remaining_models")
+    if explicit_remaining is not None:
+        return parse_eval_fallback_versions(explicit_remaining)
+
+    model_chain = repo_status.get("fallback_model_chain")
+    if not isinstance(model_chain, list):
+        return []
+
+    normalized_chain = parse_eval_fallback_versions(model_chain)
+    try:
+        model_index = normalized_chain.index(fallback_model)
+    except ValueError:
+        return []
+    return normalized_chain[model_index + 1 :]
+
+
+def fallback_model_chain_from_status(repo_status):
+    model_chain = repo_status.get("fallback_model_chain")
+    if not isinstance(model_chain, list):
+        return []
+    return parse_eval_fallback_versions(model_chain)
+
+
+def remember_fallback_eval_model(args, repo_status, status_path=None):
+    fallback_model = repo_status.get("fallback_eval_model") or repo_status.get("eval_model")
+    fallback_used = bool(repo_status.get("fallback_used"))
+    if not fallback_used or not fallback_model:
+        return False
+    if fallback_model == args.eval_gpt_version:
+        return False
+
+    remaining_fallback_models = remaining_fallback_models_after(repo_status, fallback_model)
+    args.active_eval_gpt_version = fallback_model
+    args.active_eval_fallback_gpt_versions = format_eval_fallback_versions(
+        remaining_fallback_models
+    )
+    if status_path:
+        update_status(
+            status_path,
+            requested_eval_model=args.eval_gpt_version,
+            effective_eval_model=fallback_model,
+            fallback_eval_model=fallback_model,
+            fallback_from_model=repo_status.get("fallback_from_model") or "",
+            fallback_reason=repo_status.get("fallback_reason") or "",
+            eval_fallback_active=True,
+            remaining_eval_fallback_models=remaining_fallback_models,
+            eval_fallback_model_chain=fallback_model_chain_from_status(repo_status),
+            message=(
+                f"Using fallback evaluation model {fallback_model} for subsequent "
+                "auto-refine rounds."
+            ),
+        )
+    return True
+
+
+def repair_limit_message(repair_round, max_repair_rounds):
+    if max_repair_rounds == 0:
+        return (
+            "Evaluation failed and max_repair_rounds=0, so no repair "
+            "was attempted."
+        )
+    return f"Evaluation still failed after {repair_round} repair rounds."
+
+
 def build_eval_cmd(args, script_dir, paper_name, markdown_path, output_dir, repo_dir, results_dir):
-    return build_python_cmd(script_dir, "eval.py") + [
+    eval_model = effective_eval_gpt_version(args)
+    cmd = build_python_cmd(script_dir, "eval.py") + [
         "--paper_name",
         paper_name,
         "--paper_format",
@@ -274,9 +453,13 @@ def build_eval_cmd(args, script_dir, paper_name, markdown_path, output_dir, repo
         "--generated_n",
         str(args.generated_n),
         "--gpt_version",
-        args.eval_gpt_version,
+        eval_model,
+        "--max_repair_rounds",
+        str(args.max_repair_rounds),
         "--papercoder",
     ]
+    add_optional_arg(cmd, "--fallback_gpt_versions", eval_fallback_versions_for_command(args))
+    return cmd
 
 
 def build_repair_cmd(args, script_dir, paper_name, markdown_path, output_dir, repo_dir):
@@ -304,6 +487,7 @@ def build_repair_cmd(args, script_dir, paper_name, markdown_path, output_dir, re
 def main(args):
     script_dir = os.path.dirname(os.path.abspath(__file__))
     repo_root = get_repo_root(script_dir)
+    validate_runtime_args(args)
 
     reproduce_env = get_role_env(args.reproduce_provider, "REPRODUCE")
     eval_env = get_role_env(args.eval_provider, "EVAL")
@@ -351,8 +535,19 @@ def main(args):
         reproduce_model=args.reproduce_gpt_version,
         eval_provider=args.eval_provider,
         eval_model=args.eval_gpt_version,
+        requested_eval_model=args.eval_gpt_version,
+        effective_eval_model=effective_eval_gpt_version(args),
+        eval_fallback_active=False,
+        remaining_eval_fallback_models=current_eval_fallback_models(args),
         auto_refine=args.auto_refine,
         max_repair_rounds=args.max_repair_rounds,
+        repair_policy=(
+            "single_evaluation"
+            if not args.auto_refine
+            else "evaluate_only"
+            if args.max_repair_rounds == 0
+            else "auto_refine"
+        ),
     )
     write_summary(
         summary_path,
@@ -367,30 +562,44 @@ def main(args):
         status="running",
     )
 
-    mineru_executable = args.mineru_executable or default_mineru_executable(script_dir)
-    mineru_cmd = [
-        mineru_executable,
-        "-p",
-        copied_pdf_path,
-        "-o",
-        mineru_dir,
-        "-b",
-        args.mineru_backend,
-        "-f",
-        "true" if args.mineru_formula else "false",
-        "-t",
-        "true" if args.mineru_table else "false",
-    ]
-    run_command(
-        "mineru_parse",
-        mineru_cmd,
-        script_dir,
-        os.path.join(logs_dir, "01_mineru_parse.log"),
-        status_path,
-        console_output=args.console_output,
-    )
+    if args.skip_mineru:
+        markdown_path = validate_markdown_path(args.pdf_markdown_path, runs_dir)
+        update_status(
+            status_path,
+            status="running",
+            stage="mineru_skipped",
+            message="Skipped MinerU and reused existing Markdown.",
+            markdown_path=markdown_path,
+        )
+        print("=" * 80)
+        print("[PIPELINE] mineru_skipped")
+        print(f"Markdown: {markdown_path}")
+        print("=" * 80)
+    else:
+        mineru_executable = args.mineru_executable or default_mineru_executable(script_dir)
+        mineru_cmd = [
+            mineru_executable,
+            "-p",
+            copied_pdf_path,
+            "-o",
+            mineru_dir,
+            "-b",
+            args.mineru_backend,
+            "-f",
+            "true" if args.mineru_formula else "false",
+            "-t",
+            "true" if args.mineru_table else "false",
+        ]
+        run_command(
+            "mineru_parse",
+            mineru_cmd,
+            script_dir,
+            os.path.join(logs_dir, "01_mineru_parse.log"),
+            status_path,
+            console_output=args.console_output,
+        )
 
-    markdown_path = discover_markdown(mineru_dir, paper_name)
+        markdown_path = discover_markdown(mineru_dir, paper_name)
     write_summary(summary_path, markdown_path=markdown_path)
 
     planning_cmd = build_python_cmd(script_dir, "1_planning.py") + [
@@ -510,10 +719,11 @@ def main(args):
             )
 
             repo_status = load_json_file(repo_status_path(output_dir), default={}) or {}
-            if repo_status.get("status") == "测评且通过":
+            remember_fallback_eval_model(args, repo_status, status_path)
+            if repo_status.get("status") == STATUS_EVAL_PASSED:
                 break
 
-            if repo_status.get("status") != "测评但未通过":
+            if repo_status.get("status") != STATUS_EVAL_FAILED:
                 raise RuntimeError(
                     "Evaluation did not produce a recognized repository status. "
                     f"Found: {repo_status.get('status')!r}"
@@ -521,9 +731,17 @@ def main(args):
 
             repair_round = int(repo_status.get("repair_round", 0) or 0)
             if repair_round >= args.max_repair_rounds:
-                raise RuntimeError(
-                    f"Evaluation still failed after {repair_round} repair rounds."
-                )
+                message = repair_limit_message(repair_round, args.max_repair_rounds)
+                if args.max_repair_rounds == 0:
+                    update_status(
+                        status_path,
+                        status="failed",
+                        stage="evaluation_no_repair",
+                        message=message,
+                        repo_status=repo_status,
+                    )
+                    raise RuntimeError(message)
+                raise RuntimeError(message)
 
             repair_cmd = build_repair_cmd(
                 args,
@@ -561,6 +779,8 @@ def main(args):
             env=eval_env,
             console_output=args.console_output,
         )
+        repo_status = load_json_file(repo_status_path(output_dir), default={}) or {}
+        remember_fallback_eval_model(args, repo_status, status_path)
 
     repo_status = load_json_file(repo_status_path(output_dir), default={}) or {}
     final_status = repo_status.get("status", "unknown")
@@ -601,6 +821,8 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--paper_pdf_path", type=str, required=True)
+    parser.add_argument("--skip_mineru", action="store_true")
+    parser.add_argument("--pdf_markdown_path", type=str, default="")
     parser.add_argument("--paper_name", type=str, default="")
     parser.add_argument(
         "--domain",
@@ -622,6 +844,7 @@ if __name__ == "__main__":
         choices=sorted(PROVIDER_ENV.keys()),
     )
     parser.add_argument("--eval_gpt_version", type=str, required=True)
+    parser.add_argument("--eval_fallback_gpt_versions", type=str, default="")
     parser.add_argument("--runs_dir", type=str, default="runs")
     parser.add_argument("--job_id", type=str, default="")
     parser.add_argument("--mineru_executable", type=str, default="")

@@ -1,11 +1,24 @@
 .venv/
+venv/
+env/
+mineru_env/
 __pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
 *.py[cod]
+*.egg-info/
+build/
 
 mineru_outputs/
 outputs/
 results/
 runs/
+# Local runtime state and API settings must stay out of git history.
+.local/
 *.log
 
 .env
@@ -16,3 +29,23 @@ api.txt
 *.key
 *.p12
 *.pfx
+
+# Frontend dependency and build output.
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Browser automation and test artifacts.
+.playwright-mcp/
+playwright-report/
+test-results/
+coverage/
+
+# Editor, OS, and local scratch files.
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.tmp
+*.swp
