@@ -2,12 +2,21 @@ import os
 import json
 import argparse
 import re
-import sys
 
-from utils import read_python_files, content_to_json, extract_planning, make_openai_client
+from utils import make_openai_client
+from task_manifest import (
+    InvalidTaskPathError,
+    TaskManifest,
+    load_task_manifest,
+    read_manifest_text_files,
+    safe_join,
+    safe_write_text,
+    task_artifact_key,
+    validate_task_path,
+)
 
 
-def parse_and_apply_changes(responses, debug_dir, save_num=1):
+def parse_and_apply_changes(responses, debug_dir, manifest: TaskManifest, save_num=1):
     """Apply SEARCH / REPLACE edits produced by the LLM to files in debug_dir."""
     for response in responses:
         # Split into blocks per file
@@ -20,10 +29,15 @@ def parse_and_apply_changes(responses, debug_dir, save_num=1):
 
         # Process blocks per file (odd indices: filename, even indices: diff content)
         for i in range(1, len(file_blocks), 2):
-            filename = file_blocks[i].strip()
+            filename = file_blocks[i]
             file_content_block = file_blocks[i + 1]
-
-            filepath = os.path.join(debug_dir, filename)
+            requested_file = validate_task_path(filename)
+            task_file = manifest.find(requested_file)
+            if task_file is None:
+                raise InvalidTaskPathError(
+                    f"Rejected debug path {filename!r}: path is not present in the TaskManifest."
+                )
+            filepath = safe_join(debug_dir, task_file)
 
             # SEARCH/REPLACE pattern
             search_replace_pattern = (
@@ -40,13 +54,10 @@ def parse_and_apply_changes(responses, debug_dir, save_num=1):
                 print(f"❌ File does not exist: {filepath}\n")
                 continue
 
-            # Read file
-            try:
-                with open(filepath, "r", encoding="utf-8") as f:
-                    file_content = f.read()
-            except Exception as e:
-                print(f"❌ Error reading file {filepath}: {e}\n")
-                continue
+            # Read file. Disk and decoding failures must fail the stage.
+            with open(filepath, "r", encoding="utf-8") as f:
+                file_content = f.read()
+            original_file_content = file_content
 
             modified = False
 
@@ -67,14 +78,20 @@ def parse_and_apply_changes(responses, debug_dir, save_num=1):
 
             # If modified, create backup and save
             if modified:
-                backup_path = f"{filepath}.{save_num:03d}.bak"
-                try:
-                    os.rename(filepath, backup_path)
-                    with open(filepath, "w", encoding="utf-8") as f:
-                        f.write(file_content)
-                    print(f"💾 {filename}: File saved. Backup: {backup_path}\n")
-                except Exception as e:
-                    print(f"❌ Error saving file {filepath}: {e}\n")
+                backup_name = (
+                    f".{task_artifact_key(task_file)}.{save_num:03d}.bak.txt"
+                )
+                backup_relative_path = "/".join(
+                    (*task_file.parts[:-1], backup_name)
+                )
+                backup_file = validate_task_path(backup_relative_path)
+                backup_path = safe_write_text(
+                    debug_dir,
+                    backup_file,
+                    original_file_content,
+                )
+                safe_write_text(debug_dir, task_file, file_content)
+                print(f"💾 {filename}: File saved. Backup: {backup_path}\n")
             else:
                 print(f"ℹ️ {filename}: No modifications applied\n")
 
@@ -106,6 +123,12 @@ def parse_args() -> argparse.Namespace:
         help="Paper name for output_dir.",
     )
     parser.add_argument(
+        "--output_repo_dir",
+        type=str,
+        required=True,
+        help="Generated repository root whose files may be debugged.",
+    )
+    parser.add_argument(
         "--model",
         type=str,
         default="o4-mini",
@@ -116,7 +139,7 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         required=True,
-        help="Backup index appended as .<save_num>.bak when saving modified files.",
+        help="Backup index included in the validated backup artifact name.",
     )
     return parser.parse_args()
 
@@ -137,25 +160,19 @@ output_dir = os.path.abspath(args.output_dir)
 debug_dir = os.path.abspath(args.output_repo_dir)
 
 # --------------------------------------------------
-# Load planning trajectories and task list
+# Load the Planning-validated task manifest
 # --------------------------------------------------
-planning_traj_path = os.path.join(
-    output_dir, f"planning_trajectories.json"
-)
-if not os.path.exists(planning_traj_path):
-    print(f"❌ Planning trajectories not found: {planning_traj_path}", file=sys.stderr)
-    sys.exit(1)
-
-context_lst = extract_planning(planning_traj_path)
-# context_lst indices: 0 overview, 1 detailed, 2 PRD (per your original comment)
-
-task_list = content_to_json(context_lst[2])
-todo_file_lst = task_list.get("Task list", [])
+task_manifest = load_task_manifest(output_dir)
+todo_file_lst = task_manifest.paths
 
 # --------------------------------------------------
 # Load repo files and configuration files
 # --------------------------------------------------
-python_dict = read_python_files(debug_dir)
+python_dict = read_manifest_text_files(
+    debug_dir,
+    task_manifest,
+    allowed_extensions={".py"},
+)
 
 codes = ""
 for todo_file in todo_file_lst:
@@ -166,13 +183,13 @@ for todo_file in todo_file_lst:
         continue
     codes += f"```python\n## File name: {todo_file}\n{python_dict[todo_file]}\n```\n\n"
 
-config_path = os.path.join(debug_dir, "config.yaml")
+config_path = safe_join(debug_dir, validate_task_path("config.yaml"))
 if os.path.exists(config_path):
     with open(config_path, "r", encoding="utf-8") as f:
         config_yaml = f.read()
     codes += f"```yaml\n## File name: config.yaml\n{config_yaml}\n```\n\n"
         
-reproduce_path = os.path.join(debug_dir, "reproduce.sh")
+reproduce_path = safe_join(debug_dir, validate_task_path("reproduce.sh"))
 if os.path.exists(reproduce_path):
     with open(reproduce_path, "r", encoding="utf-8") as f:
         reproduce_sh = f.read()
@@ -256,6 +273,6 @@ answer = response.choices[0].message.content
 
 # Use the direct API response as input to the patch applier
 responses = [answer]
-parse_and_apply_changes(responses, debug_dir, save_num=args.save_num)
+parse_and_apply_changes(responses, debug_dir, task_manifest, save_num=args.save_num)
 
 

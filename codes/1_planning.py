@@ -4,6 +4,7 @@ import argparse
 import os
 import sys
 from utils import (
+    content_to_json,
     print_response,
     print_log_cost,
     load_accumulated_cost,
@@ -12,6 +13,12 @@ from utils import (
     normalize_completion,
     get_completion_message,
     load_paper_content,
+)
+from task_manifest import (
+    parse_task_manifest_mapping,
+    safe_write_text,
+    save_task_manifest,
+    validate_task_path,
 )
 
 parser = argparse.ArgumentParser()
@@ -425,6 +432,7 @@ def api_call(msg, gpt_version):
 responses = []
 trajectories = []
 total_accumulated_cost = 0
+task_manifest = None
 
 for idx, instruction_msg in enumerate([plan_msg, file_list_msg, task_list_msg, config_msg]):
     current_stage = ""
@@ -455,13 +463,25 @@ for idx, instruction_msg in enumerate([plan_msg, file_list_msg, task_list_msg, c
     # trajectories
     message = get_completion_message(completion_json)
     trajectories.append({'role': message["role"], 'content': message["content"]})
+    if idx == 2:
+        task_manifest = parse_task_manifest_mapping(
+            content_to_json(message["content"])
+        )
 
 
 # save
+if task_manifest is None:
+    raise RuntimeError("Planning did not produce a validated TaskManifest.")
+save_task_manifest(output_dir, task_manifest)
 save_accumulated_cost(f"{output_dir}/accumulated_cost.json", total_accumulated_cost)
 
-with open(f'{output_dir}/planning_response.json', 'w', encoding="utf-8") as f:
-    json.dump(responses, f, ensure_ascii=False)
-
-with open(f'{output_dir}/planning_trajectories.json', 'w', encoding="utf-8") as f:
-    json.dump(trajectories, f, ensure_ascii=False)
+safe_write_text(
+    output_dir,
+    validate_task_path("planning_response.json"),
+    json.dumps(responses, ensure_ascii=False),
+)
+safe_write_text(
+    output_dir,
+    validate_task_path("planning_trajectories.json"),
+    json.dumps(trajectories, ensure_ascii=False),
+)

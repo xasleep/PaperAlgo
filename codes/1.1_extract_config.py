@@ -2,8 +2,8 @@ import json
 import re
 import os
 import argparse
-import shutil
 from utils import extract_planning, content_to_json, format_json_data
+from task_manifest import safe_write_text, validate_task_path
 
 parser = argparse.ArgumentParser()
 
@@ -33,17 +33,19 @@ if "</think>" in yaml_raw_content:
 match = re.search(r"```yaml\n(.*?)\n```", yaml_raw_content, re.DOTALL)
 if match:
     yaml_content = match.group(1)
-    with open(f'{output_dir}/planning_config.yaml', 'w', encoding='utf8') as f:
-        f.write(yaml_content)
 else:
     # print("No YAML content found.")
     match2 = re.search(r"```yaml\\n(.*?)\\n```", yaml_raw_content, re.DOTALL)
     if match2:
         yaml_content = match2.group(1)
-        with open(f'{output_dir}/planning_config.yaml', 'w', encoding='utf8') as f:
-            f.write(yaml_content)
     else:
-        print("No YAML content found.")
+        raise ValueError("Planning response did not contain config.yaml YAML content.")
+
+safe_write_text(
+    output_dir,
+    validate_task_path("planning_config.yaml"),
+    yaml_content,
+)
 
 # ---------------------------------------
 
@@ -59,13 +61,23 @@ logic_design = content_to_json(context_lst[2])
 formatted_arch_design = format_json_data(arch_design)
 formatted_logic_design = format_json_data(logic_design)
 
-with open(f"{artifact_output_dir}/1.1_overall_plan.txt", "w", encoding="utf-8") as f:
-    f.write(context_lst[0])
-
-with open(f"{artifact_output_dir}/1.2_arch_design.txt", "w", encoding="utf-8") as f:
-    f.write(formatted_arch_design)
-
-with open(f"{artifact_output_dir}/1.3_logic_design.txt", "w", encoding="utf-8") as f:
-    f.write(formatted_logic_design)
-
-shutil.copy(f"{output_dir}/planning_config.yaml", f"{artifact_output_dir}/1.4_config.yaml")
+safe_write_text(
+    artifact_output_dir,
+    validate_task_path("1.1_overall_plan.txt"),
+    context_lst[0],
+)
+safe_write_text(
+    artifact_output_dir,
+    validate_task_path("1.2_arch_design.txt"),
+    formatted_arch_design,
+)
+safe_write_text(
+    artifact_output_dir,
+    validate_task_path("1.3_logic_design.txt"),
+    formatted_logic_design,
+)
+safe_write_text(
+    artifact_output_dir,
+    validate_task_path("1.4_config.yaml"),
+    yaml_content,
+)

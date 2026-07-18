@@ -122,20 +122,12 @@ def summarize_eval_feedback(rationales):
 
     files_to_repair = []
     for file_name in findings_by_file:
-        normalized = file_name.replace("\\", "/")
-        if normalized == "repository":
+        if file_name == "repository":
             continue
-        file_matches = re.findall(
-            r"[\w.-]+\.(?:py|r|R|yaml|yml)",
-            normalized,
-        )
-        if file_matches:
-            files_to_repair.extend(file_matches)
-            continue
-        if "/" in normalized:
-            normalized = normalized.split("/")[-1]
-        if normalized.lower().endswith((".py", ".r", ".yaml", ".yml")):
-            files_to_repair.append(normalized)
+        # Preserve the evaluator's exact path. The repair stage validates it
+        # against TaskManifest instead of silently removing traversal or
+        # normalizing backslashes into a different file.
+        files_to_repair.append(file_name)
 
     files_to_repair = sorted(set(files_to_repair))
 

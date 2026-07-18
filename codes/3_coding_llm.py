@@ -3,7 +3,14 @@ import os
 from tqdm import tqdm
 import sys
 import copy
-from utils import extract_planning, content_to_json, extract_code_from_content,extract_code_from_content2, print_response, print_log_cost, load_accumulated_cost, save_accumulated_cost
+from utils import extract_planning, extract_code_from_content,extract_code_from_content2, print_response, print_log_cost, load_accumulated_cost, save_accumulated_cost
+from task_manifest import (
+    load_task_manifest,
+    safe_join,
+    safe_write_text,
+    task_artifact_key,
+    validate_task_path,
+)
 from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
 
@@ -57,18 +64,9 @@ with open(f'{output_dir}/planning_config.yaml') as f:
 
 context_lst = extract_planning(f'{output_dir}/planning_trajectories.json')
 # 0: overview, 1: detailed, 2: PRD
-# file_list = content_to_json(context_lst[1])
-task_list = content_to_json(context_lst[2])
-
-if 'Task list' in task_list:
-    todo_file_lst = task_list['Task list']
-elif 'task_list' in task_list:
-    todo_file_lst = task_list['task_list']
-elif 'task list' in task_list:
-    todo_file_lst = task_list['task list']
-else:
-    print(f"[ERROR] 'Task list' does not exist. Please re-generate the planning.")
-    sys.exit(0)
+task_manifest = load_task_manifest(output_dir)
+todo_file_lst = task_manifest.paths
+task_file_by_path = {task.relative_path: task for task in task_manifest.files}
 
 done_file_lst = ['config.yaml']
 done_file_dict = {}
@@ -185,6 +183,27 @@ def run_llm(msg):
     completion = [output.outputs[0].text for output in outputs]
     
     return completion[0] 
+
+
+def analysis_artifact_path(task_file, suffix):
+    artifact_file = validate_task_path(f"{task_artifact_key(task_file)}{suffix}")
+    artifact_path = safe_join(output_dir, artifact_file)
+    if artifact_path.exists():
+        return artifact_path
+
+    # Read-only compatibility for artifacts produced before TaskManifest v1.
+    legacy_key = task_file.relative_path.replace("/", "_")
+    legacy_file = validate_task_path(f"{legacy_key}{suffix}")
+    legacy_matches = 0
+    for manifest_file in task_manifest.files:
+        manifest_legacy_key = manifest_file.relative_path.replace("/", "_")
+        manifest_legacy_file = validate_task_path(f"{manifest_legacy_key}{suffix}")
+        if manifest_legacy_file.canonical_key == legacy_file.canonical_key:
+            legacy_matches += 1
+    if legacy_matches != 1:
+        return artifact_path
+    legacy_path = safe_join(output_dir, legacy_file)
+    return legacy_path if legacy_path.exists() else artifact_path
     
 
 # testing for checking
@@ -192,12 +211,15 @@ detailed_logic_analysis_dict = {}
 retrieved_section_dict = {}
 for todo_file_name in todo_file_lst:
     # simple analysis
-    save_todo_file_name = todo_file_name.replace("/", "_")
-
     if todo_file_name == "config.yaml":
         continue
 
-    with open(f"{output_dir}/{save_todo_file_name}_simple_analysis_trajectories.json", encoding='utf8') as f:
+    task_file = task_file_by_path[todo_file_name]
+    analysis_path = analysis_artifact_path(
+        task_file,
+        "_simple_analysis_trajectories.json",
+    )
+    with open(analysis_path, encoding='utf8') as f:
         detailed_logic_analysis_trajectories = json.load(f)
 
     detailed_logic_analysis_dict[todo_file_name] = detailed_logic_analysis_trajectories[0]['content']
@@ -206,6 +228,7 @@ artifact_output_dir=f'{output_dir}/coding_artifacts'
 os.makedirs(artifact_output_dir, exist_ok=True)
 
 for todo_idx, todo_file_name in enumerate(tqdm(todo_file_lst)):
+    task_file = task_file_by_path[todo_file_name]
     responses = []
     trajectories = copy.deepcopy(code_msg)
 
@@ -233,15 +256,15 @@ for todo_idx, todo_file_name in enumerate(tqdm(todo_file_lst)):
 
     # save
     # save_dir_name = f"{paper_name}_repo"
-    os.makedirs(f'{output_repo_dir}', exist_ok=True)
-    save_todo_file_name = todo_file_name.replace("/", "_")
-
     # print and logging
     print_response(completion_json, is_llm=True)
 
     # save artifacts
-    with open(f'{artifact_output_dir}/{save_todo_file_name}_coding.txt', 'w', encoding='utf-8') as f:
-        f.write(completion)
+    safe_write_text(
+        artifact_output_dir,
+        validate_task_path(f"{task_artifact_key(task_file)}_coding.txt"),
+        completion,
+    )
 
     # extract code save 
     try:
@@ -253,9 +276,4 @@ for todo_idx, todo_file_name in enumerate(tqdm(todo_file_lst)):
         code = completion
 
     done_file_dict[todo_file_name] = code
-    if save_todo_file_name != todo_file_name:
-        todo_file_dir = '/'.join(todo_file_name.split("/")[:-1])
-        os.makedirs(f"{output_repo_dir}/{todo_file_dir}", exist_ok=True)
-
-    with open(f"{output_repo_dir}/{todo_file_name}", 'w', encoding='utf-8') as f:
-        f.write(code)
+    safe_write_text(output_repo_dir, task_file, code)

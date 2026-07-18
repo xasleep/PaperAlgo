@@ -2,6 +2,12 @@ import json
 import os
 from tqdm import tqdm
 from utils import extract_planning, content_to_json, print_response
+from task_manifest import (
+    load_task_manifest,
+    safe_write_text,
+    task_artifact_key,
+    validate_task_path,
+)
 import copy
 import sys
 from transformers import AutoTokenizer
@@ -61,15 +67,9 @@ if os.path.exists(f'{output_dir}/task_list.json'):
 else:
     task_list = content_to_json(context_lst[2])
 
-if 'Task list' in task_list:
-    todo_file_lst = task_list['Task list']
-elif 'task_list' in task_list:
-    todo_file_lst = task_list['task_list']
-elif 'task list' in task_list:
-    todo_file_lst = task_list['task list']
-else:
-    print(f"[ERROR] 'Task list' does not exist. Please re-generate the planning.")
-    sys.exit(0)
+task_manifest = load_task_manifest(output_dir)
+todo_file_lst = task_manifest.paths
+task_file_by_path = {task.relative_path: task for task in task_manifest.files}
 
 if 'Logic Analysis' in task_list:
     logic_analysis = task_list['Logic Analysis']
@@ -181,6 +181,8 @@ artifact_output_dir=f'{output_dir}/analyzing_artifacts'
 os.makedirs(artifact_output_dir, exist_ok=True)
 
 for todo_file_name in tqdm(todo_file_lst):
+    task_file = task_file_by_path[todo_file_name]
+    artifact_key = task_artifact_key(task_file)
     responses = []
     trajectories = copy.deepcopy(analysis_msg)
 
@@ -213,15 +215,22 @@ for todo_file_name in tqdm(todo_file_lst):
 
 
     # save
-    with open(f'{artifact_output_dir}/{todo_file_name}_simple_analysis.txt', 'w', encoding='utf-8') as f:
-        f.write(completion)
+    safe_write_text(
+        artifact_output_dir,
+        validate_task_path(f"{artifact_key}_simple_analysis.txt"),
+        completion,
+    )
 
     done_file_lst.append(todo_file_name)
 
     # save for next stage(coding)
-    todo_file_name = todo_file_name.replace("/", "_") 
-    with open(f'{output_dir}/{todo_file_name}_simple_analysis_response.json', 'w', encoding='utf-8') as f:
-        json.dump(responses, f)
-
-    with open(f'{output_dir}/{todo_file_name}_simple_analysis_trajectories.json', 'w', encoding='utf-8') as f:
-        json.dump(trajectories, f)
+    safe_write_text(
+        output_dir,
+        validate_task_path(f"{artifact_key}_simple_analysis_response.json"),
+        json.dumps(responses),
+    )
+    safe_write_text(
+        output_dir,
+        validate_task_path(f"{artifact_key}_simple_analysis_trajectories.json"),
+        json.dumps(trajectories),
+    )

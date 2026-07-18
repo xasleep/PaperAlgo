@@ -6,7 +6,6 @@ import sys
 import copy
 from utils import (
     extract_planning,
-    content_to_json,
     extract_code_from_content,
     print_response,
     print_log_cost,
@@ -24,6 +23,14 @@ from utils import (
     load_json_file,
     repo_status_path,
     write_repo_status,
+)
+from task_manifest import (
+    load_task_manifest,
+    safe_join,
+    safe_write_text,
+    task_artifact_key,
+    validate_repair_paths,
+    validate_task_path,
 )
 import argparse
 
@@ -69,10 +76,9 @@ with open(f'{output_dir}/planning_config.yaml', encoding="utf-8") as f:
 
 context_lst = extract_planning(f'{output_dir}/planning_trajectories.json')
 # 0: overview, 1: detailed, 2: PRD
-# file_list = content_to_json(context_lst[1])
-task_list = content_to_json(context_lst[2])
-
-todo_file_lst = task_list['Task list']
+task_manifest = load_task_manifest(output_dir)
+todo_file_lst = task_manifest.paths
+task_file_by_path = {task.relative_path: task for task in task_manifest.files}
 done_file_lst = ['config.yaml']
 done_file_dict = {}
 
@@ -98,13 +104,17 @@ if repair_from_eval:
             f"Maximum repair rounds reached: {current_repair_round}/{max_repair_rounds}."
         )
 
-    repair_files = set(repair_feedback.get("files_to_repair") or [])
-    if not repair_files:
-        repair_files = {
-            file_name
-            for file_name in todo_file_lst
-            if not file_name.endswith((".yaml", ".yml"))
-        }
+    raw_repair_files = repair_feedback.get("files_to_repair")
+    if raw_repair_files is None:
+        raw_repair_files = []
+    repair_task_files = validate_repair_paths(raw_repair_files, task_manifest)
+    if not repair_task_files:
+        repair_task_files = tuple(
+            task
+            for task in task_manifest.files
+            if not task.relative_path.endswith((".yaml", ".yml"))
+        )
+    repair_files = {task.relative_path for task in repair_task_files}
 
     print(
         f"[INFO] Repair mode enabled. Repair round "
@@ -115,7 +125,7 @@ if repair_from_eval:
     for todo_file_name in todo_file_lst:
         if todo_file_name.endswith((".yaml", ".yml")):
             continue
-        file_path = os.path.join(output_repo_dir, todo_file_name)
+        file_path = safe_join(output_repo_dir, task_file_by_path[todo_file_name])
         if os.path.exists(file_path):
             with open(file_path, "r", encoding="utf-8") as f:
                 done_file_dict[todo_file_name] = f.read()
@@ -372,6 +382,27 @@ def api_call(msg):
             messages=msg
         )
     return completion
+
+
+def analysis_artifact_path(task_file, suffix):
+    artifact_file = validate_task_path(f"{task_artifact_key(task_file)}{suffix}")
+    artifact_path = safe_join(output_dir, artifact_file)
+    if artifact_path.exists():
+        return artifact_path
+
+    # Read-only compatibility for artifacts produced before TaskManifest v1.
+    legacy_key = task_file.relative_path.replace("/", "_")
+    legacy_file = validate_task_path(f"{legacy_key}{suffix}")
+    legacy_matches = 0
+    for manifest_file in task_manifest.files:
+        manifest_legacy_key = manifest_file.relative_path.replace("/", "_")
+        manifest_legacy_file = validate_task_path(f"{manifest_legacy_key}{suffix}")
+        if manifest_legacy_file.canonical_key == legacy_file.canonical_key:
+            legacy_matches += 1
+    if legacy_matches != 1:
+        return artifact_path
+    legacy_path = safe_join(output_dir, legacy_file)
+    return legacy_path if legacy_path.exists() else artifact_path
     
 
 # testing for checking
@@ -379,12 +410,15 @@ detailed_logic_analysis_dict = {}
 retrieved_section_dict = {}
 for todo_file_name in todo_file_lst:
     # simple analysis
-    save_todo_file_name = todo_file_name.replace("/", "_")
-
     if todo_file_name == "config.yaml":
         continue
-    
-    with open(f"{output_dir}/{save_todo_file_name}_simple_analysis_response.json", encoding="utf-8") as f:
+
+    task_file = task_file_by_path[todo_file_name]
+    analysis_path = analysis_artifact_path(
+        task_file,
+        "_simple_analysis_response.json",
+    )
+    with open(analysis_path, encoding="utf-8") as f:
         detailed_logic_analysis_response = json.load(f)
     detailed_logic_analysis_dict[todo_file_name] = detailed_logic_analysis_response[0]['choices'][0]['message']['content']
 
@@ -393,6 +427,7 @@ os.makedirs(artifact_output_dir, exist_ok=True)
 
 total_accumulated_cost = load_accumulated_cost(f"{output_dir}/accumulated_cost.json")
 for todo_idx, todo_file_name in enumerate(tqdm(todo_file_lst)):
+    task_file = task_file_by_path[todo_file_name]
     responses = []
     trajectories = copy.deepcopy(code_msg)
 
@@ -435,18 +470,17 @@ for todo_idx, todo_file_name in enumerate(tqdm(todo_file_lst)):
 
     # save
     # save_dir_name = f"{paper_name}_repo"
-    os.makedirs(f'{output_repo_dir}', exist_ok=True)
-    save_todo_file_name = todo_file_name.replace("/", "_")
-
-
     # print and logging
     print_response(completion_json)
     temp_total_accumulated_cost = print_log_cost(completion_json, gpt_version, current_stage, output_dir, total_accumulated_cost)
     total_accumulated_cost = temp_total_accumulated_cost
 
     # save artifacts
-    with open(f'{artifact_output_dir}/{save_todo_file_name}_coding.txt', 'w', encoding="utf-8") as f:
-        f.write(completion_json['choices'][0]['message']['content'])
+    safe_write_text(
+        artifact_output_dir,
+        validate_task_path(f"{task_artifact_key(task_file)}_coding.txt"),
+        completion_json['choices'][0]['message']['content'],
+    )
 
 
     # extract code save 
@@ -455,12 +489,7 @@ for todo_idx, todo_file_name in enumerate(tqdm(todo_file_lst)):
         code = message["content"]
 
     done_file_dict[todo_file_name] = code
-    if save_todo_file_name != todo_file_name:
-        todo_file_dir = '/'.join(todo_file_name.split("/")[:-1])
-        os.makedirs(f"{output_repo_dir}/{todo_file_dir}", exist_ok=True)
-
-    with open(f"{output_repo_dir}/{todo_file_name}", 'w', encoding="utf-8") as f:
-        f.write(code)
+    safe_write_text(output_repo_dir, task_file, code)
 
 save_accumulated_cost(f"{output_dir}/accumulated_cost.json", total_accumulated_cost)
 

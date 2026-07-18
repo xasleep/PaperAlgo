@@ -2,7 +2,13 @@ import json
 import argparse
 import os
 import sys
-from utils import print_response
+from utils import content_to_json, print_response
+from task_manifest import (
+    parse_task_manifest_mapping,
+    safe_write_text,
+    save_task_manifest,
+    validate_task_path,
+)
 from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
 
@@ -256,6 +262,7 @@ def run_llm(msg):
 responses = []
 trajectories = []
 total_accumulated_cost = 0
+task_manifest = None
 
 for idx, instruction_msg in enumerate([plan_msg, file_list_msg, task_list_msg, config_msg]):
     current_stage = ""
@@ -285,13 +292,23 @@ for idx, instruction_msg in enumerate([plan_msg, file_list_msg, task_list_msg, c
 
     # trajectories
     trajectories.append({'role': 'assistant', 'content': completion})
+    if idx == 2:
+        task_manifest = parse_task_manifest_mapping(content_to_json(completion))
 
 
 # save
 os.makedirs(output_dir, exist_ok=True)
+if task_manifest is None:
+    raise RuntimeError("Planning did not produce a validated TaskManifest.")
+save_task_manifest(output_dir, task_manifest)
 
-with open(f'{output_dir}/planning_response.json', 'w') as f:
-    json.dump(responses, f)
-
-with open(f'{output_dir}/planning_trajectories.json', 'w') as f:
-    json.dump(trajectories, f)
+safe_write_text(
+    output_dir,
+    validate_task_path("planning_response.json"),
+    json.dumps(responses),
+)
+safe_write_text(
+    output_dir,
+    validate_task_path("planning_trajectories.json"),
+    json.dumps(trajectories),
+)

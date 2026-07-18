@@ -2,11 +2,9 @@ import json
 import os
 import sys
 import argparse
+from task_manifest import load_task_manifest, read_manifest_text_files
 from openai import BadRequestError, PermissionDeniedError
 from utils import (
-    read_python_files,
-    extract_planning,
-    content_to_json,
     num_tokens_from_messages,
     read_all_files,
     extract_json_from_string,
@@ -292,30 +290,18 @@ def main(args):
     codes = ""
 
     if is_papercoder:
-        if domain == "statistics":
-            target_files_dict = read_all_files(
-                target_repo_dir,
-                allowed_ext=[".R", ".r", ".yaml", ".yml"],
-                is_print=False,
-            )
-        else:
-            target_files_dict = read_python_files(target_repo_dir)
-
         # configuration
         with open(f"{output_dir}/planning_config.yaml", "r", encoding="utf-8") as f:
             config_yaml = f.read()
 
-        context_lst = extract_planning(f"{output_dir}/planning_trajectories.json")
-
-        if os.path.exists(f"{output_dir}/task_list.json"):
-            with open(f"{output_dir}/task_list.json", "r", encoding="utf-8") as f:
-                task_list = json.load(f)
-        else:
-            task_list = content_to_json(context_lst[2])
-
-        todo_file_lst = task_list["Task list"]
-
-        included_files = set()
+        task_manifest = load_task_manifest(output_dir)
+        todo_file_lst = task_manifest.paths
+        allowed_extensions = {".r"} if domain == "statistics" else {".py"}
+        target_files_dict = read_manifest_text_files(
+            target_repo_dir,
+            task_manifest,
+            allowed_extensions=allowed_extensions,
+        )
 
         for todo_file in todo_file_lst:
             if todo_file.endswith(".yaml"):
@@ -332,20 +318,6 @@ def main(args):
                 f"{target_files_dict[todo_file]}\n"
                 f"```\n\n"
             )
-            included_files.add(todo_file)
-
-        for file_name, code in target_files_dict.items():
-            if file_name in included_files or file_name.endswith((".yaml", ".yml")):
-                continue
-
-            language = get_code_language(file_name)
-            codes += (
-                f"```{language}\n"
-                f"## File name: {file_name}\n"
-                f"{code}\n"
-                f"```\n\n"
-            )
-            included_files.add(file_name)
 
         codes += (
             f"```yaml\n"

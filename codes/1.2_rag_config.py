@@ -4,6 +4,7 @@ import sys
 import argparse
 
 from utils import make_openai_client
+from task_manifest import safe_join, safe_write_text, validate_task_path
 
 try:
     from huggingface_hub import HfApi
@@ -35,9 +36,8 @@ def parse_args() -> argparse.Namespace:
 args = parse_args()
 client = make_openai_client()
 
-planning_config_path = os.path.join(
-    args.output_dir, f"planning_config.yaml"
-)
+planning_config_file = validate_task_path("planning_config.yaml")
+planning_config_path = safe_join(args.output_dir, planning_config_file)
 if not os.path.exists(planning_config_path):
     print(f"❌ Planning config not found: {planning_config_path}", file=sys.stderr)
     sys.exit(1)
@@ -159,18 +159,14 @@ print(refined_config_yaml)
 # ---------------------------------------------------------
 # 4. Backup and save the refined config
 # ---------------------------------------------------------
-filepath = planning_config_path
-backup_path = f"{filepath}.bak"
+backup_file = validate_task_path("planning_config.bak.yaml")
+if planning_config_path.exists():
+    backup_path = safe_write_text(args.output_dir, backup_file, config_yaml)
+    print(f"🔁 Existing file backed up to: {backup_path}")
 
-try:
-    if os.path.exists(filepath):
-        os.rename(filepath, backup_path)
-        print(f"🔁 Existing file backed up to: {backup_path}")
-
-    with open(filepath, "w", encoding="utf-8") as f:
-        f.write(refined_config_yaml)
-
-    print(f"💾 {filepath}: File saved.\n")
-except Exception as e:
-    print(f"❌ Error saving file {filepath}: {e}\n")
-    sys.exit(1)
+filepath = safe_write_text(
+    args.output_dir,
+    planning_config_file,
+    refined_config_yaml,
+)
+print(f"💾 {filepath}: File saved.\n")

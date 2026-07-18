@@ -3,7 +3,14 @@ import os
 from tqdm import tqdm
 import sys
 import copy
-from utils import extract_planning, content_to_json, extract_code_from_content, print_response, print_log_cost, load_accumulated_cost, save_accumulated_cost, read_python_files, make_openai_client
+from utils import extract_code_from_content, print_response, print_log_cost, load_accumulated_cost, save_accumulated_cost, make_openai_client
+from task_manifest import (
+    load_task_manifest,
+    safe_join,
+    safe_write_text,
+    task_artifact_key,
+    validate_task_path,
+)
 import argparse
 
 parser = argparse.ArgumentParser()
@@ -40,12 +47,8 @@ else:
 with open(f'{output_dir}/planning_config.yaml', encoding="utf-8") as f:
     config_yaml = f.read()
 
-context_lst = extract_planning(f'{output_dir}/planning_trajectories.json')
-# 0: overview, 1: detailed, 2: PRD
-# file_list = content_to_json(context_lst[1])
-task_list = content_to_json(context_lst[2])
-
-todo_file_lst = task_list['Task list']
+task_manifest = load_task_manifest(output_dir)
+todo_file_lst = task_manifest.paths
 done_file_lst = ['config.yaml']
 done_file_dict = {}
 
@@ -118,7 +121,14 @@ def api_call(msg):
 artifact_output_dir=f'{output_dir}/coding_artifacts'
 os.makedirs(artifact_output_dir, exist_ok=True)
 
-python_dict = read_python_files(output_repo_dir)
+python_dict = {}
+for task_file in task_manifest.files:
+    if task_file.relative_path.endswith((".yaml", ".yml")):
+        continue
+    task_path = safe_join(output_repo_dir, task_file)
+    if task_path.exists():
+        with open(task_path, "r", encoding="utf-8") as task_stream:
+            python_dict[task_file.relative_path] = task_stream.read()
 
 for todo_idx, todo_file_name in enumerate(tqdm(todo_file_lst)):
     if todo_file_name == "config.yaml":
@@ -129,7 +139,8 @@ for todo_idx, todo_file_name in enumerate(tqdm(todo_file_lst)):
 
 
 total_accumulated_cost = load_accumulated_cost(f"{output_dir}/accumulated_cost.json")
-for todo_idx, todo_file_name in enumerate(["reproduce.sh"]):
+reproduce_task = validate_task_path("reproduce.sh")
+for todo_idx, todo_file_name in enumerate([reproduce_task.relative_path]):
     responses = []
     trajectories = copy.deepcopy(code_msg)
 
@@ -157,18 +168,17 @@ for todo_idx, todo_file_name in enumerate(["reproduce.sh"]):
 
     # save
     # save_dir_name = f"{paper_name}_repo"
-    os.makedirs(f'{output_repo_dir}', exist_ok=True)
-    save_todo_file_name = todo_file_name.replace("/", "_")
-
-
     # print and logging
     print_response(completion_json)
     temp_total_accumulated_cost = print_log_cost(completion_json, gpt_version, current_stage, output_dir, total_accumulated_cost)
     total_accumulated_cost = temp_total_accumulated_cost
 
     # save artifacts
-    with open(f'{artifact_output_dir}/{save_todo_file_name}_coding.txt', 'w', encoding="utf-8") as f:
-        f.write(completion_json['choices'][0]['message']['content'])
+    safe_write_text(
+        artifact_output_dir,
+        validate_task_path(f"{task_artifact_key(reproduce_task)}_coding.txt"),
+        completion_json['choices'][0]['message']['content'],
+    )
 
 
     # extract code save 
@@ -177,11 +187,6 @@ for todo_idx, todo_file_name in enumerate(["reproduce.sh"]):
         code = message.content 
 
     done_file_dict[todo_file_name] = code
-    if save_todo_file_name != todo_file_name:
-        todo_file_dir = '/'.join(todo_file_name.split("/")[:-1])
-        os.makedirs(f"{output_repo_dir}/{todo_file_dir}", exist_ok=True)
-
-    with open(f"{output_repo_dir}/{todo_file_name}", 'w', encoding="utf-8") as f:
-        f.write(code)
+    safe_write_text(output_repo_dir, reproduce_task, code)
 
 save_accumulated_cost(f"{output_dir}/accumulated_cost.json", total_accumulated_cost)

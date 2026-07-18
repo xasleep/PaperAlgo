@@ -14,6 +14,12 @@ from utils import (
     repo_status_path,
     save_json_file,
 )
+from task_manifest import (
+    load_task_manifest,
+    safe_join,
+    safe_write_text,
+    validate_task_path,
+)
 
 
 PROVIDER_ENV = {
@@ -625,6 +631,7 @@ def main(args):
         env=reproduce_env,
         console_output=args.console_output,
     )
+    load_task_manifest(output_dir)
 
     extract_config_cmd = build_python_cmd(script_dir, "1.1_extract_config.py") + [
         "--paper_name",
@@ -665,9 +672,15 @@ def main(args):
         console_output=args.console_output,
     )
 
-    planning_config = os.path.join(output_dir, "planning_config.yaml")
-    if os.path.exists(planning_config):
-        shutil.copy2(planning_config, os.path.join(repo_dir, "config.yaml"))
+    planning_config_file = validate_task_path("planning_config.yaml")
+    planning_config = safe_join(output_dir, planning_config_file)
+    if planning_config.exists():
+        with open(planning_config, "r", encoding="utf-8") as stream:
+            safe_write_text(
+                repo_dir,
+                validate_task_path("config.yaml"),
+                stream.read(),
+            )
 
     coding_cmd = build_python_cmd(script_dir, "3_coding.py") + [
         "--paper_name",
