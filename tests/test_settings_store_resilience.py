@@ -9,6 +9,10 @@ from web_api import main as main_module, settings_store
 from web_api.schemas import WebSettings
 
 
+API_PREFIX = "/api/v1"
+LOCAL_ORIGIN = "http://localhost"
+
+
 @pytest.fixture()
 def settings_client(
     monkeypatch: pytest.MonkeyPatch,
@@ -17,7 +21,16 @@ def settings_client(
     settings_path = tmp_path / "web_settings.json"
     monkeypatch.setattr(settings_store, "LOCAL_DIR", tmp_path)
     monkeypatch.setattr(settings_store, "SETTINGS_PATH", settings_path)
-    return TestClient(main_module.app, raise_server_exceptions=False), settings_path
+    client = TestClient(
+        main_module.app,
+        base_url=LOCAL_ORIGIN,
+        raise_server_exceptions=False,
+    )
+    session = client.get(f"{API_PREFIX}/session", headers={"Origin": LOCAL_ORIGIN})
+    client.headers.update(
+        {"Origin": LOCAL_ORIGIN, "X-CSRF-Token": session.json()["csrf_token"]}
+    )
+    return client, settings_path
 
 
 def _settings_payload(
@@ -53,8 +66,8 @@ def _contains_key(data: object, key_name: str) -> bool:
 
 def _post_job(client: TestClient):
     return client.post(
-        "/jobs",
-        files={"file": ("paper.pdf", b"%PDF-1.4\n%EOF\n", "application/pdf")},
+        f"{API_PREFIX}/jobs",
+        json={"upload_id": "0" * 32},
     )
 
 
@@ -64,7 +77,7 @@ def test_missing_settings_file_is_treated_as_unconfigured(
     client, settings_path = settings_client
     assert not settings_path.exists()
 
-    status_response = client.get("/settings/status")
+    status_response = client.get(f"{API_PREFIX}/settings/status")
     job_response = _post_job(client)
 
     assert status_response.status_code == 200
@@ -79,7 +92,7 @@ def test_settings_status_treats_corrupt_settings_file_as_unconfigured(
     client, settings_path = settings_client
     settings_path.write_text('{"reproduce": ', encoding="utf-8")
 
-    response = client.get("/settings/status")
+    response = client.get(f"{API_PREFIX}/settings/status")
 
     assert response.status_code == 200
     assert response.json()["configured"] is False
@@ -103,7 +116,7 @@ def test_empty_settings_file_is_treated_as_unconfigured(
     client, settings_path = settings_client
     settings_path.write_text("", encoding="utf-8")
 
-    status_response = client.get("/settings/status")
+    status_response = client.get(f"{API_PREFIX}/settings/status")
     job_response = _post_job(client)
 
     assert status_response.status_code == 200
@@ -118,7 +131,7 @@ def test_invalid_settings_shape_is_treated_as_unconfigured(
     client, settings_path = settings_client
     settings_path.write_text(json.dumps({"reproduce": {}}), encoding="utf-8")
 
-    status_response = client.get("/settings/status")
+    status_response = client.get(f"{API_PREFIX}/settings/status")
     job_response = _post_job(client)
 
     assert status_response.status_code == 200
@@ -217,7 +230,7 @@ def test_update_settings_returns_clear_error_when_storage_cannot_be_secured(
 
     monkeypatch.setattr(settings_store, "harden_local_storage", broken_harden)
 
-    response = client.post("/settings", json=_settings_payload())
+    response = client.post(f"{API_PREFIX}/settings", json=_settings_payload())
 
     assert response.status_code == 500
     assert response.json()["error"]["code"] == "internal_error"
@@ -230,8 +243,8 @@ def test_settings_endpoints_still_do_not_echo_api_keys(
     client, _ = settings_client
     payload = _settings_payload()
 
-    post_response = client.post("/settings", json=payload)
-    status_response = client.get("/settings/status")
+    post_response = client.post(f"{API_PREFIX}/settings", json=payload)
+    status_response = client.get(f"{API_PREFIX}/settings/status")
 
     assert post_response.status_code == 200
     assert status_response.status_code == 200

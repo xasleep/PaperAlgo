@@ -45,17 +45,6 @@ export default function SettingsPage() {
       .then((nextStatus) => {
         if (ignore) return;
         setStatus(nextStatus);
-        setForm((current) => ({
-          ...current,
-          reproduceProvider: asProvider(nextStatus.reproduce?.provider) || current.reproduceProvider,
-          reproduceModel: nextStatus.reproduce?.model || current.reproduceModel,
-          reproduceBaseUrl: nextStatus.reproduce?.base_url || "",
-          evaluationProvider:
-            asProvider(nextStatus.evaluation?.provider) || current.evaluationProvider,
-          evaluationModel: nextStatus.evaluation?.model || current.evaluationModel,
-          evaluationBaseUrl: nextStatus.evaluation?.base_url || "",
-          evaluationFallbackModels: nextStatus.evaluation?.fallback_models.join(", ") || "",
-        }));
       })
       .catch((err) => setError(toApiError(err)))
       .finally(() => {
@@ -201,10 +190,6 @@ export default function SettingsPage() {
       </form>
     </section>
   );
-}
-
-function asProvider(value: string | undefined): ProviderName | null {
-  return PROVIDERS.includes(value as ProviderName) ? (value as ProviderName) : null;
 }
 
 function ProviderSelect({

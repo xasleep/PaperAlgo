@@ -13,13 +13,16 @@ from web_api import artifact_service, log_service, main as main_module
 from web_api.errors import FileTooLargeError
 
 
+API_PREFIX = "/api/v1"
+
+
 @pytest.fixture()
 def artifacts_client(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     runs_dir = tmp_path / "runs"
     runs_dir.mkdir()
     monkeypatch.setattr(artifact_service, "RUNS_DIR", runs_dir)
     monkeypatch.setattr(log_service, "RUNS_DIR", runs_dir)
-    return TestClient(main_module.app), runs_dir
+    return TestClient(main_module.app, base_url="http://localhost"), runs_dir
 
 
 def _make_job(runs_dir: Path, job_id: str = "job1") -> tuple[Path, Path, Path]:
@@ -39,7 +42,7 @@ def test_repo_file_rejects_large_text_file(
     big_file = repo_dir / "big.txt"
     big_file.write_bytes(b"a" * (artifact_service.MAX_TEXT_FILE_BYTES + 1))
 
-    response = client.get("/jobs/job1/repo/file", params={"path": "big.txt"})
+    response = client.get(f"{API_PREFIX}/jobs/job1/repo/file", params={"path": "big.txt"})
 
     assert response.status_code == 413
     assert response.json()["error"]["code"] == "file_too_large"
@@ -52,7 +55,7 @@ def test_repo_file_rejects_binary_file_even_with_text_extension(
     _, repo_dir, _ = _make_job(runs_dir)
     (repo_dir / "binary.txt").write_bytes(b"text\x00binary")
 
-    response = client.get("/jobs/job1/repo/file", params={"path": "binary.txt"})
+    response = client.get(f"{API_PREFIX}/jobs/job1/repo/file", params={"path": "binary.txt"})
 
     assert response.status_code == 415
     assert response.json()["error"]["code"] == "binary_file_not_supported"
@@ -65,7 +68,7 @@ def test_repo_file_rejects_disallowed_extension(
     _, repo_dir, _ = _make_job(runs_dir)
     (repo_dir / "data.bin").write_bytes(b"plain text but disallowed")
 
-    response = client.get("/jobs/job1/repo/file", params={"path": "data.bin"})
+    response = client.get(f"{API_PREFIX}/jobs/job1/repo/file", params={"path": "data.bin"})
 
     assert response.status_code == 415
     assert response.json()["error"]["code"] == "unsupported_file_type"
@@ -91,7 +94,7 @@ def test_repo_preview_rejects_unsafe_paths_without_touching_sentinel(
     sentinel.write_text("unchanged", encoding="utf-8")
     before = sentinel.stat()
 
-    response = client.get("/jobs/job1/repo/file", params={"path": unsafe_path})
+    response = client.get(f"{API_PREFIX}/jobs/job1/repo/file", params={"path": unsafe_path})
 
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "invalid_repo_path"
@@ -104,7 +107,7 @@ def test_logs_missing_job_returns_404(
 ) -> None:
     client, _ = artifacts_client
 
-    response = client.get("/jobs/missing_job/logs")
+    response = client.get(f"{API_PREFIX}/jobs/missing_job/logs")
 
     assert response.status_code == 404
     assert response.json()["error"]["code"] == "job_not_found"
@@ -116,7 +119,7 @@ def test_existing_job_without_logs_returns_empty_logs(
     client, runs_dir = artifacts_client
     (runs_dir / "job_without_logs").mkdir()
 
-    response = client.get("/jobs/job_without_logs/logs")
+    response = client.get(f"{API_PREFIX}/jobs/job_without_logs/logs")
 
     assert response.status_code == 200
     assert response.json()["logs"] == []
@@ -134,7 +137,7 @@ def test_large_log_tail_returns_only_requested_lines(
     )
 
     response = client.get(
-        "/jobs/job1/logs",
+        f"{API_PREFIX}/jobs/job1/logs",
         params={"file": "run.log", "tail_lines": 3},
     )
 
@@ -154,8 +157,8 @@ def test_repeated_and_concurrent_repo_downloads_are_unique_and_complete(
     (repo_dir / "main.py").write_text("print('ok')\n", encoding="utf-8")
     (repo_dir / "README.md").write_text("# ok\n", encoding="utf-8")
 
-    first_response = client.get("/jobs/job1/repo/download")
-    second_response = client.get("/jobs/job1/repo/download")
+    first_response = client.get(f"{API_PREFIX}/jobs/job1/export")
+    second_response = client.get(f"{API_PREFIX}/jobs/job1/export")
     assert first_response.status_code == 200
     assert second_response.status_code == 200
     for response in [first_response, second_response]:
@@ -202,7 +205,7 @@ def test_repo_download_excludes_local_runtime_state_and_sibling_runtime_dirs(
     report_dir.mkdir()
     (report_dir / "report.txt").write_text("separate report root", encoding="utf-8")
 
-    response = client.get("/jobs/job1/repo/download")
+    response = client.get(f"{API_PREFIX}/jobs/job1/export")
 
     assert response.status_code == 200
     with zipfile.ZipFile(BytesIO(response.content)) as zf:
@@ -231,8 +234,8 @@ def test_repo_preview_and_zip_reject_symlink_and_never_export_sentinel(
     link = repo_dir / "linked.txt"
     _create_symlink_or_skip(link, sentinel, directory=False)
 
-    preview = client.get("/jobs/job1/repo/file", params={"path": "linked.txt"})
-    download = client.get("/jobs/job1/repo/download")
+    preview = client.get(f"{API_PREFIX}/jobs/job1/repo/file", params={"path": "linked.txt"})
+    download = client.get(f"{API_PREFIX}/jobs/job1/export")
 
     assert preview.status_code == 400
     assert preview.json()["error"]["code"] == "invalid_repo_path"
@@ -261,8 +264,8 @@ def test_repo_tree_and_zip_reject_junction_parent(
     if result.returncode != 0:
         pytest.skip(f"junction creation failed: {result.stderr or result.stdout}")
     try:
-        tree = client.get("/jobs/job1/repo/tree")
-        download = client.get("/jobs/job1/repo/download")
+        tree = client.get(f"{API_PREFIX}/jobs/job1/repo/tree")
+        download = client.get(f"{API_PREFIX}/jobs/job1/export")
 
         assert tree.status_code == 400
         assert download.status_code == 400
@@ -285,8 +288,8 @@ def test_repo_preview_and_zip_reject_hardlink_and_never_export_sentinel(
     except OSError as exc:
         pytest.skip(f"hardlink creation is not supported on this host: {exc}")
 
-    preview = client.get("/jobs/job1/repo/file", params={"path": "hardlink.txt"})
-    download = client.get("/jobs/job1/repo/download")
+    preview = client.get(f"{API_PREFIX}/jobs/job1/repo/file", params={"path": "hardlink.txt"})
+    download = client.get(f"{API_PREFIX}/jobs/job1/export")
 
     assert preview.status_code == 400
     assert download.status_code == 400
@@ -442,7 +445,7 @@ def test_repo_preview_opens_then_revalidates_with_fstat(
 
     monkeypatch.setattr(artifact_service.os, "fstat", recording_fstat)
 
-    response = client.get("/jobs/job1/repo/file", params={"path": "main.py"})
+    response = client.get(f"{API_PREFIX}/jobs/job1/repo/file", params={"path": "main.py"})
 
     assert response.status_code == 200
     assert calls
@@ -466,7 +469,7 @@ def test_list_jobs_best_effort_with_many_bad_run_dirs(
         encoding="utf-8",
     )
 
-    response = client.get("/jobs", params={"limit": 200})
+    response = client.get(f"{API_PREFIX}/jobs", params={"limit": 200})
 
     assert response.status_code == 200
     body = response.json()

@@ -10,6 +10,10 @@ from web_api.path_security import validate_job_id
 from web_api.schemas import WebSettings
 
 
+API_PREFIX = "/api/v1"
+LOCAL_ORIGIN = "http://localhost"
+
+
 def _settings() -> WebSettings:
     return WebSettings(
         reproduce={"provider": "openai", "model": "test-model", "api_key": "test-key"},
@@ -21,8 +25,9 @@ def _settings() -> WebSettings:
     )
 
 
-def _job_form(**overrides: str) -> dict[str, str]:
-    form = {
+def _job_payload(**overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "upload_id": "0" * 32,
         "paper_name": "paper",
         "domain": "statistics",
         "eval_type": "ref_free",
@@ -33,8 +38,8 @@ def _job_form(**overrides: str) -> dict[str, str]:
         "skip_mineru": "false",
         "pdf_markdown_path": "",
     }
-    form.update(overrides)
-    return form
+    payload.update(overrides)
+    return payload
 
 
 @pytest.fixture()
@@ -50,7 +55,15 @@ def client_context(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setattr(job_service, "REPO_ROOT", tmp_path)
     monkeypatch.setattr(main_module, "load_settings", _settings)
 
-    return TestClient(main_module.app), runs_dir, tmp_path
+    client = TestClient(main_module.app, base_url=LOCAL_ORIGIN)
+    session = client.get(f"{API_PREFIX}/session", headers={"Origin": LOCAL_ORIGIN})
+    client.headers.update(
+        {
+            "Origin": LOCAL_ORIGIN,
+            "X-CSRF-Token": session.json()["csrf_token"],
+        }
+    )
+    return client, runs_dir, tmp_path
 
 
 @pytest.mark.parametrize(
@@ -83,10 +96,10 @@ def test_validate_job_id_rejects_traversal_and_absolute_paths(job_id: str) -> No
 @pytest.mark.parametrize(
     "url_template",
     [
-        "/jobs/{job_id}/repo/tree",
-        "/jobs/{job_id}/repo/file?path=secret.txt",
-        "/jobs/{job_id}/repo/download",
-        "/jobs/{job_id}/logs",
+        f"{API_PREFIX}/jobs/{{job_id}}/repo/tree",
+        f"{API_PREFIX}/jobs/{{job_id}}/repo/file?path=secret.txt",
+        f"{API_PREFIX}/jobs/{{job_id}}/export",
+        f"{API_PREFIX}/jobs/{{job_id}}/logs",
     ],
 )
 def test_job_id_traversal_requests_are_rejected(
@@ -114,8 +127,7 @@ def test_create_job_rejects_fake_pdf_content(
     client, _, _ = client_context
 
     response = client.post(
-        "/jobs",
-        data=_job_form(),
+        f"{API_PREFIX}/uploads",
         files={"file": ("paper.pdf", b"not actually a pdf", "application/pdf")},
     )
 
@@ -129,14 +141,19 @@ def test_create_job_rejects_external_markdown_path(
     client, _, tmp_path = client_context
     external_markdown = tmp_path / "outside.md"
     external_markdown.write_text("# external", encoding="utf-8")
+    upload = client.post(
+        f"{API_PREFIX}/uploads",
+        files={"file": ("paper.pdf", b"%PDF-1.7\nbody", "application/pdf")},
+    )
+    assert upload.status_code == 200
 
     response = client.post(
-        "/jobs",
-        data=_job_form(
-            skip_mineru="true",
+        f"{API_PREFIX}/jobs",
+        json=_job_payload(
+            upload_id=upload.json()["upload_id"],
+            skip_mineru=True,
             pdf_markdown_path=str(external_markdown),
         ),
-        files={"file": ("paper.pdf", b"%PDF-1.7\nbody", "application/pdf")},
     )
 
     assert response.status_code == 400

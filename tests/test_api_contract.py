@@ -8,6 +8,10 @@ from web_api import artifact_service, job_service, log_service, main as main_mod
 from web_api.schemas import WebSettings
 
 
+API_PREFIX = "/api/v1"
+LOCAL_ORIGIN = "http://localhost"
+
+
 def _settings() -> WebSettings:
     return WebSettings(
         reproduce={"provider": "openai", "model": "test-model", "api_key": "repro-secret"},
@@ -20,8 +24,9 @@ def _settings() -> WebSettings:
     )
 
 
-def _job_form(**overrides: str) -> dict[str, str]:
-    form = {
+def _job_payload(**overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "upload_id": "0" * 32,
         "paper_name": "paper",
         "domain": "statistics",
         "eval_type": "ref_free",
@@ -32,8 +37,26 @@ def _job_form(**overrides: str) -> dict[str, str]:
         "skip_mineru": "false",
         "pdf_markdown_path": "",
     }
-    form.update(overrides)
-    return form
+    payload.update(overrides)
+    return payload
+
+
+def _authorize(client: TestClient) -> None:
+    session = client.get(f"{API_PREFIX}/session", headers={"Origin": LOCAL_ORIGIN})
+    assert session.status_code == 200
+    client.headers.update(
+        {
+            "Origin": LOCAL_ORIGIN,
+            "X-CSRF-Token": session.json()["csrf_token"],
+        }
+    )
+
+
+def _upload(client: TestClient, name: str, content: bytes):
+    return client.post(
+        f"{API_PREFIX}/uploads",
+        files={"file": (name, content, "application/pdf")},
+    )
 
 
 def _assert_error(
@@ -81,7 +104,12 @@ def contract_client(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     job_service.ACTIVE_PROCESSES.clear()
     job_service.ACTIVE_LOG_FILES.clear()
 
-    client = TestClient(main_module.app, raise_server_exceptions=False)
+    client = TestClient(
+        main_module.app,
+        base_url=LOCAL_ORIGIN,
+        raise_server_exceptions=False,
+    )
+    _authorize(client)
     yield client, runs_dir, tmp_path, settings_path
 
     job_service.ACTIVE_PROCESSES.clear()
@@ -96,9 +124,8 @@ def test_settings_not_configured_create_job_returns_structured_error(
     settings_path.write_text('{"reproduce": "broken"', encoding="utf-8")
 
     response = client.post(
-        "/jobs",
-        data=_job_form(),
-        files={"file": ("paper.pdf", b"%PDF-1.7\nbody", "application/pdf")},
+        f"{API_PREFIX}/jobs",
+        json=_job_payload(),
     )
 
     _assert_error(
@@ -112,13 +139,13 @@ def test_settings_not_configured_create_job_returns_structured_error(
 @pytest.mark.parametrize(
     ("method", "url"),
     [
-        ("get", "/jobs/missing_job"),
-        ("get", "/jobs/missing_job/logs"),
-        ("get", "/jobs/missing_job/artifacts"),
-        ("get", "/jobs/missing_job/repo/tree"),
-        ("get", "/jobs/missing_job/repo/file?path=main.py"),
-        ("get", "/jobs/missing_job/repo/download"),
-        ("post", "/jobs/missing_job/cancel"),
+        ("get", f"{API_PREFIX}/jobs/missing_job"),
+        ("get", f"{API_PREFIX}/jobs/missing_job/logs"),
+        ("get", f"{API_PREFIX}/jobs/missing_job/artifacts"),
+        ("get", f"{API_PREFIX}/jobs/missing_job/repo/tree"),
+        ("get", f"{API_PREFIX}/jobs/missing_job/repo/file?path=main.py"),
+        ("get", f"{API_PREFIX}/jobs/missing_job/export"),
+        ("post", f"{API_PREFIX}/jobs/missing_job/cancel"),
     ],
 )
 def test_missing_job_routes_return_job_not_found(
@@ -136,9 +163,9 @@ def test_missing_job_routes_return_job_not_found(
 @pytest.mark.parametrize(
     "url",
     [
-        "/jobs/C:Windows",
-        "/jobs/C:Windows/logs",
-        "/jobs/C:Windows/repo/tree",
+        f"{API_PREFIX}/jobs/C:Windows",
+        f"{API_PREFIX}/jobs/C:Windows/logs",
+        f"{API_PREFIX}/jobs/C:Windows/repo/tree",
     ],
 )
 def test_invalid_job_id_returns_stable_error(
@@ -171,7 +198,7 @@ def test_cancel_finished_jobs_returns_conflict(
         {"job_id": "done_job", "status": status_value},
     )
 
-    response = client.post("/jobs/done_job/cancel")
+    response = client.post(f"{API_PREFIX}/jobs/done_job/cancel")
 
     body = _assert_error(response, status_code=409, code="job_not_cancelable")
     assert body["error"]["details"]["reason"] == expected_reason
@@ -194,8 +221,8 @@ def test_cancel_detached_and_orphaned_jobs_return_conflict(
     )
     monkeypatch.setattr(job_service, "is_pid_alive", lambda pid: pid == detached_pid)
 
-    detached = client.post("/jobs/detached_job/cancel")
-    orphaned = client.post("/jobs/orphaned_job/cancel")
+    detached = client.post(f"{API_PREFIX}/jobs/detached_job/cancel")
+    orphaned = client.post(f"{API_PREFIX}/jobs/orphaned_job/cancel")
 
     detached_body = _assert_error(detached, status_code=409, code="job_not_cancelable")
     orphaned_body = _assert_error(orphaned, status_code=409, code="job_not_cancelable")
@@ -214,11 +241,11 @@ def test_repo_file_contract_errors(
     (repo_dir / "data.bin").write_bytes(b"plain text but disallowed")
     (repo_dir / "latin1.txt").write_bytes(b"\xff\xfeinvalid")
 
-    traversal = client.get("/jobs/job1/repo/file", params={"path": "../secret.txt"})
-    too_large = client.get("/jobs/job1/repo/file", params={"path": "big.txt"})
-    binary = client.get("/jobs/job1/repo/file", params={"path": "binary.txt"})
-    unsupported_ext = client.get("/jobs/job1/repo/file", params={"path": "data.bin"})
-    invalid_utf8 = client.get("/jobs/job1/repo/file", params={"path": "latin1.txt"})
+    traversal = client.get(f"{API_PREFIX}/jobs/job1/repo/file", params={"path": "../secret.txt"})
+    too_large = client.get(f"{API_PREFIX}/jobs/job1/repo/file", params={"path": "big.txt"})
+    binary = client.get(f"{API_PREFIX}/jobs/job1/repo/file", params={"path": "binary.txt"})
+    unsupported_ext = client.get(f"{API_PREFIX}/jobs/job1/repo/file", params={"path": "data.bin"})
+    invalid_utf8 = client.get(f"{API_PREFIX}/jobs/job1/repo/file", params={"path": "latin1.txt"})
 
     _assert_error(traversal, status_code=400, code="invalid_repo_path")
     _assert_error(too_large, status_code=413, code="file_too_large")
@@ -236,9 +263,9 @@ def test_logs_semantics_are_stable(
     logs_dir.mkdir(parents=True)
     (logs_dir / "run.log").write_text("hello\nworld\n", encoding="utf-8")
 
-    no_logs = client.get("/jobs/job_without_logs/logs")
-    missing_log = client.get("/jobs/job_with_logs/logs", params={"file": "missing.log"})
-    invalid_log = client.get("/jobs/job_with_logs/logs", params={"file": "../secret.log"})
+    no_logs = client.get(f"{API_PREFIX}/jobs/job_without_logs/logs")
+    missing_log = client.get(f"{API_PREFIX}/jobs/job_with_logs/logs", params={"file": "missing.log"})
+    invalid_log = client.get(f"{API_PREFIX}/jobs/job_with_logs/logs", params={"file": "../secret.log"})
 
     assert no_logs.status_code == 200
     assert no_logs.json()["logs"] == []
@@ -252,7 +279,7 @@ def test_artifacts_without_generated_outputs_return_200(
     client, runs_dir, _, _ = contract_client
     (runs_dir / "job1").mkdir()
 
-    response = client.get("/jobs/job1/artifacts")
+    response = client.get(f"{API_PREFIX}/jobs/job1/artifacts")
 
     assert response.status_code == 200
     body = response.json()
@@ -271,7 +298,7 @@ def test_jobs_route_is_not_captured_by_dynamic_job_route(
         {"job_id": "job1", "status": "running", "paper_name": "paper"},
     )
 
-    response = client.get("/jobs")
+    response = client.get(f"{API_PREFIX}/jobs")
 
     assert response.status_code == 200
     assert "jobs" in response.json()
@@ -294,8 +321,8 @@ def test_jobs_and_job_detail_use_stable_status_fields(
     )
     monkeypatch.setattr(job_service, "is_pid_alive", lambda pid: pid == detached_pid)
 
-    list_response = client.get("/jobs")
-    detail_response = client.get("/jobs/detached_job")
+    list_response = client.get(f"{API_PREFIX}/jobs")
+    detail_response = client.get(f"{API_PREFIX}/jobs/detached_job")
 
     assert list_response.status_code == 200
     jobs = {job["job_id"]: job for job in list_response.json()["jobs"]}
@@ -319,32 +346,27 @@ def test_post_jobs_upload_and_parameter_errors_are_stable(
     client, runs_dir, tmp_path, _ = contract_client
     monkeypatch.setattr(main_module, "load_settings", _settings)
 
-    not_pdf = client.post(
-        "/jobs",
-        data=_job_form(),
-        files={"file": ("paper.txt", b"%PDF-1.7\nbody", "application/pdf")},
-    )
-    fake_pdf = client.post(
-        "/jobs",
-        data=_job_form(),
-        files={"file": ("paper.pdf", b"not a pdf", "application/pdf")},
-    )
+    not_pdf = _upload(client, "paper.txt", b"%PDF-1.7\nbody")
+    fake_pdf = _upload(client, "paper.pdf", b"not a pdf")
+    valid_upload = _upload(client, "paper.pdf", b"%PDF-1.7\nbody")
+    upload_id = valid_upload.json()["upload_id"]
     bad_generated_n = client.post(
-        "/jobs",
-        data=_job_form(generated_n="33"),
-        files={"file": ("paper.pdf", b"%PDF-1.7\nbody", "application/pdf")},
+        f"{API_PREFIX}/jobs",
+        json=_job_payload(upload_id=upload_id, generated_n=33),
     )
     missing_markdown = client.post(
-        "/jobs",
-        data=_job_form(skip_mineru="true"),
-        files={"file": ("paper.pdf", b"%PDF-1.7\nbody", "application/pdf")},
+        f"{API_PREFIX}/jobs",
+        json=_job_payload(upload_id=upload_id, skip_mineru=True),
     )
     external_markdown = tmp_path / "outside.md"
     external_markdown.write_text("# outside", encoding="utf-8")
     bad_markdown_path = client.post(
-        "/jobs",
-        data=_job_form(skip_mineru="true", pdf_markdown_path=str(external_markdown)),
-        files={"file": ("paper.pdf", b"%PDF-1.7\nbody", "application/pdf")},
+        f"{API_PREFIX}/jobs",
+        json=_job_payload(
+            upload_id=upload_id,
+            skip_mineru=True,
+            pdf_markdown_path=str(external_markdown),
+        ),
     )
 
     _assert_error(not_pdf, status_code=415, code="unsupported_file_type")
@@ -379,7 +401,7 @@ def test_repo_download_internal_errors_do_not_leak_paths_or_secrets(
 
     monkeypatch.setattr(main_module, "make_repo_zip", broken_zip)
 
-    response = client.get("/jobs/job1/repo/download")
+    response = client.get(f"{API_PREFIX}/jobs/job1/export")
 
     _assert_error(
         response,
@@ -396,8 +418,8 @@ def test_repo_missing_returns_stable_codes(
     client, runs_dir, _, _ = contract_client
     (runs_dir / "job1").mkdir()
 
-    file_response = client.get("/jobs/job1/repo/file", params={"path": "main.py"})
-    download_response = client.get("/jobs/job1/repo/download")
+    file_response = client.get(f"{API_PREFIX}/jobs/job1/repo/file", params={"path": "main.py"})
+    download_response = client.get(f"{API_PREFIX}/jobs/job1/export")
 
     _assert_error(file_response, status_code=404, code="repo_not_available")
     _assert_error(download_response, status_code=404, code="repo_not_available")

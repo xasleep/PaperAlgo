@@ -7,24 +7,19 @@ export type ApiError = {
 
 export type ProviderName = "deepseek" | "kimi" | "qwen" | "claude" | "openai";
 export type DomainName = "general" | "statistics";
-export type EvalType = "ref_free" | "ref_based";
+export type EvalType = "ref_free";
 export type ConsoleOutput = "progress" | "full" | "quiet";
 
 export type ProviderSettingsStatus = {
-  provider: string;
-  model: string;
-  base_url: string;
   has_api_key: boolean;
 };
 
-export type EvaluationSettingsStatus = ProviderSettingsStatus & {
-  fallback_models: string[];
-};
+export type EvaluationSettingsStatus = ProviderSettingsStatus;
 
 export type SettingsStatus = {
   configured: boolean;
-  reproduce: ProviderSettingsStatus | null;
-  evaluation: EvaluationSettingsStatus | null;
+  reproduce: ProviderSettingsStatus;
+  evaluation: EvaluationSettingsStatus;
 };
 
 export type WebSettingsPayload = {
@@ -96,6 +91,24 @@ export type JobCreateResponse = {
   run_dir: string;
   status_path: string;
   summary_path: string;
+};
+
+export type UploadResponse = {
+  upload_id: string;
+  size: number;
+};
+
+export type JobCreatePayload = {
+  upload_id: string;
+  paper_name: string;
+  domain: DomainName;
+  eval_type: EvalType;
+  generated_n: number;
+  auto_refine: boolean;
+  max_repair_rounds: number;
+  console_output: ConsoleOutput;
+  skip_mineru: boolean;
+  pdf_markdown_path: string;
 };
 
 export type CancelResponse = {

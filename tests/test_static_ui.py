@@ -1,10 +1,9 @@
 from pathlib import Path
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from fastapi.responses import FileResponse
 
-from web_api.static_ui import install_static_ui, spa_index_response
+from web_api.static_ui import install_static_ui
 
 
 def _write_dist(tmp_path: Path) -> Path:
@@ -37,37 +36,38 @@ def test_static_ui_serves_root_fallback_and_assets(tmp_path: Path) -> None:
     assert "paper2code smoke" in asset.text
 
 
-def test_static_ui_does_not_swallow_api_like_unknown_paths(tmp_path: Path) -> None:
+def test_static_ui_does_not_swallow_api_unknown_paths(tmp_path: Path) -> None:
     dist = _write_dist(tmp_path)
     app = FastAPI()
     install_static_ui(app, dist)
     client = TestClient(app)
 
-    response = client.get("/jobs/missing/extra", headers={"accept": "text/html"})
+    response = client.get("/api/v1/missing", headers={"accept": "text/html"})
 
     assert response.status_code == 404
     assert '<div id="root"></div>' not in response.text
 
 
-def test_spa_response_allows_html_browser_routes_without_hiding_json_api(
+def test_spa_jobs_is_independent_of_accept_and_api_remains_json(
     tmp_path: Path,
 ) -> None:
     dist = _write_dist(tmp_path)
     app = FastAPI()
 
-    @app.get("/jobs", response_model=None)
-    def jobs(request: Request) -> dict[str, list] | FileResponse:
-        ui_response = spa_index_response(request, dist)
-        if ui_response is not None:
-            return ui_response
+    @app.get("/api/v1/jobs")
+    def jobs() -> dict[str, list]:
         return {"jobs": []}
 
+    install_static_ui(app, dist)
     client = TestClient(app)
 
     browser_response = client.get("/jobs", headers={"accept": "text/html"})
-    api_response = client.get("/jobs", headers={"accept": "application/json"})
+    alternate_accept = client.get("/jobs", headers={"accept": "application/json"})
+    api_response = client.get("/api/v1/jobs", headers={"accept": "text/html"})
 
     assert browser_response.status_code == 200
     assert '<div id="root"></div>' in browser_response.text
+    assert alternate_accept.status_code == 200
+    assert '<div id="root"></div>' in alternate_accept.text
     assert api_response.status_code == 200
     assert api_response.json() == {"jobs": []}

@@ -2,7 +2,7 @@ import { FormEvent, useState } from "react";
 import { Send } from "lucide-react";
 import { Link, useNavigate } from "react-router-dom";
 import { api, toApiError } from "../api/client";
-import type { ApiError, ConsoleOutput, DomainName, EvalType } from "../api/types";
+import type { ApiError, ConsoleOutput, DomainName } from "../api/types";
 import ErrorNotice from "../components/ErrorNotice";
 
 export default function CreateJobPage() {
@@ -10,7 +10,6 @@ export default function CreateJobPage() {
   const [file, setFile] = useState<File | null>(null);
   const [paperName, setPaperName] = useState("");
   const [domain, setDomain] = useState<DomainName>("statistics");
-  const [evalType, setEvalType] = useState<EvalType>("ref_free");
   const [generatedN, setGeneratedN] = useState(8);
   const [autoRefine, setAutoRefine] = useState(true);
   const [maxRepairRounds, setMaxRepairRounds] = useState(3);
@@ -36,22 +35,22 @@ export default function CreateJobPage() {
       return;
     }
 
-    const formData = new FormData();
-    formData.append("file", file as File);
-    formData.append("paper_name", paperName);
-    formData.append("domain", domain);
-    formData.append("eval_type", evalType);
-    formData.append("generated_n", String(generatedN));
-    formData.append("auto_refine", String(autoRefine));
-    formData.append("max_repair_rounds", String(maxRepairRounds));
-    formData.append("console_output", consoleOutput);
-    formData.append("skip_mineru", String(skipMineru));
-    formData.append("pdf_markdown_path", pdfMarkdownPath);
-
     setSubmitting(true);
     setError(null);
     try {
-      const response = await api.createJob(formData);
+      const upload = await api.uploadPdf(file as File);
+      const response = await api.createJob({
+        upload_id: upload.upload_id,
+        paper_name: paperName,
+        domain,
+        eval_type: "ref_free",
+        generated_n: generatedN,
+        auto_refine: autoRefine,
+        max_repair_rounds: maxRepairRounds,
+        console_output: consoleOutput,
+        skip_mineru: skipMineru,
+        pdf_markdown_path: pdfMarkdownPath,
+      });
       navigate(`/jobs/${encodeURIComponent(response.job_id)}`);
     } catch (err) {
       const apiError = toApiError(err);
@@ -100,13 +99,7 @@ export default function CreateJobPage() {
               <option value="general">general</option>
             </select>
           </label>
-          <label>
-            <span>eval_type</span>
-            <select value={evalType} onChange={(event) => setEvalType(event.target.value as EvalType)}>
-              <option value="ref_free">ref_free</option>
-              <option value="ref_based">ref_based</option>
-            </select>
-          </label>
+          <div className="field-meta">eval_type: ref_free</div>
         </fieldset>
 
         <fieldset>

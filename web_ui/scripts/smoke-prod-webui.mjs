@@ -33,7 +33,7 @@ async function waitForFastApi(baseUrl) {
   const deadline = Date.now() + 25_000;
   while (Date.now() < deadline) {
     try {
-      const response = await fetch(`${baseUrl}/health`, {
+      const response = await fetch(`${baseUrl}/api/v1/health`, {
         headers: { Accept: "application/json" },
       });
       if (response.ok) return;
@@ -58,21 +58,21 @@ async function assertHtmlRoute(baseUrl, route) {
 }
 
 async function assertApiRoutes(baseUrl) {
-  const health = await fetch(`${baseUrl}/health`, {
+  const health = await fetch(`${baseUrl}/api/v1/health`, {
     headers: { Accept: "application/json" },
   });
   const healthBody = await health.json();
   if (!health.ok || healthBody.status !== "ok") {
-    throw new Error("/health did not return expected JSON");
+    throw new Error("/api/v1/health did not return expected JSON");
   }
 
-  const jobs = await fetch(`${baseUrl}/jobs`, {
-    headers: { Accept: "application/json" },
+  const jobs = await fetch(`${baseUrl}/api/v1/jobs`, {
+    headers: { Accept: "text/html" },
   });
   const contentType = jobs.headers.get("content-type") || "";
   const jobsBody = await jobs.json();
   if (!jobs.ok || !contentType.includes("application/json") || !Array.isArray(jobsBody.jobs)) {
-    throw new Error("/jobs did not return JobList JSON for application/json");
+    throw new Error("/api/v1/jobs did not return JobList JSON");
   }
 }
 
@@ -132,7 +132,9 @@ try {
     await assertHtmlRoute(baseUrl, route);
   }
   await assertApiRoutes(baseUrl);
-  console.log(`Production smoke passed at ${baseUrl}: ${htmlRoutes.join(", ")}, /health, /jobs`);
+  console.log(
+    `Production smoke passed at ${baseUrl}: ${htmlRoutes.join(", ")}, /api/v1/health, /api/v1/jobs`,
+  );
 } catch (error) {
   console.error(output);
   console.error(error);

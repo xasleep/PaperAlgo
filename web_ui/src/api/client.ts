@@ -3,12 +3,14 @@ import type {
   ArtifactSummary,
   CancelResponse,
   JobCreateResponse,
+  JobCreatePayload,
   JobDetail,
   JobListItem,
   LogsResponse,
   RepoFileResponse,
   RepoTreeResponse,
   SettingsStatus,
+  UploadResponse,
   WebSettingsPayload,
 } from "./types";
 
@@ -16,12 +18,13 @@ const configuredApiBaseUrl = import.meta.env.VITE_API_BASE_URL;
 const API_BASE_URL =
   configuredApiBaseUrl !== undefined
     ? configuredApiBaseUrl.replace(/\/+$/, "")
-    : import.meta.env.PROD
-      ? ""
-      : "http://localhost:8000";
+    : "";
+const API_PREFIX = "/api/v1";
+const MUTATING_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+let csrfToken: string | null = null;
 
 function apiUrl(path: string): string {
-  return `${API_BASE_URL}${path}`;
+  return `${API_BASE_URL}${API_PREFIX}${path}`;
 }
 
 type ErrorEnvelope = {
@@ -98,11 +101,15 @@ async function parseResponse<T>(response: Response): Promise<T> {
 
 async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
   try {
+    const method = (init?.method || "GET").toUpperCase();
+    const token = MUTATING_METHODS.has(method) ? await getCsrfToken() : null;
     const response = await fetch(apiUrl(path), {
       ...init,
+      credentials: "include",
       headers: {
         Accept: "application/json",
         ...(init?.body instanceof FormData ? {} : { "Content-Type": "application/json" }),
+        ...(token ? { "X-CSRF-Token": token } : {}),
         ...init?.headers,
       },
     });
@@ -113,6 +120,19 @@ async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
     }
     throw new ApiClientError(toApiError(error));
   }
+}
+
+async function getCsrfToken(): Promise<string> {
+  if (csrfToken) {
+    return csrfToken;
+  }
+  const response = await fetch(apiUrl("/session"), {
+    credentials: "include",
+    headers: { Accept: "application/json" },
+  });
+  const session = await parseResponse<{ csrf_token: string }>(response);
+  csrfToken = session.csrf_token;
+  return csrfToken;
 }
 
 export const api = {
@@ -128,10 +148,19 @@ export const api = {
 
   listJobs: () => requestJson<{ jobs: JobListItem[] }>("/jobs"),
 
-  createJob: (formData: FormData) =>
-    requestJson<JobCreateResponse>("/jobs", {
+  uploadPdf: (file: File) => {
+    const formData = new FormData();
+    formData.append("file", file);
+    return requestJson<UploadResponse>("/uploads", {
       method: "POST",
       body: formData,
+    });
+  },
+
+  createJob: (payload: JobCreatePayload) =>
+    requestJson<JobCreateResponse>("/jobs", {
+      method: "POST",
+      body: JSON.stringify(payload),
     }),
 
   getJob: (jobId: string) => requestJson<JobDetail>(`/jobs/${encodeURIComponent(jobId)}`),
@@ -167,7 +196,10 @@ export const api = {
 
   downloadRepo: async (jobId: string): Promise<Blob> => {
     try {
-      const response = await fetch(apiUrl(`/jobs/${encodeURIComponent(jobId)}/repo/download`));
+      const response = await fetch(apiUrl(`/jobs/${encodeURIComponent(jobId)}/export`), {
+        credentials: "include",
+        headers: { Accept: "application/zip" },
+      });
       if (!response.ok) {
         await parseResponse<never>(response);
       }
@@ -181,4 +213,4 @@ export const api = {
   },
 };
 
-export { API_BASE_URL };
+export { API_BASE_URL, API_PREFIX };

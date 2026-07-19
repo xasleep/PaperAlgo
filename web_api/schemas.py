@@ -26,20 +26,43 @@ class WebSettings(BaseModel):
 
 
 class ProviderSettingsStatus(BaseModel):
-    provider: str
-    model: str
-    base_url: str = ""
     has_api_key: bool
 
 
 class EvaluationSettingsStatus(ProviderSettingsStatus):
-    fallback_models: list[str] = Field(default_factory=list)
+    pass
 
 
 class SettingsStatus(BaseModel):
     configured: bool
-    reproduce: ProviderSettingsStatus | None = None
-    evaluation: EvaluationSettingsStatus | None = None
+    reproduce: ProviderSettingsStatus = Field(
+        default_factory=lambda: ProviderSettingsStatus(has_api_key=False)
+    )
+    evaluation: EvaluationSettingsStatus = Field(
+        default_factory=lambda: EvaluationSettingsStatus(has_api_key=False)
+    )
+
+
+class SessionResponse(BaseModel):
+    csrf_token: str
+
+
+class UploadResponse(BaseModel):
+    upload_id: str
+    size: int
+
+
+class JobCreateRequest(BaseModel):
+    upload_id: str = Field(min_length=1, max_length=128)
+    paper_name: str = ""
+    domain: DomainName = "statistics"
+    eval_type: EvalType = "ref_free"
+    generated_n: int = 8
+    auto_refine: bool = True
+    max_repair_rounds: int = 3
+    console_output: ConsoleOutput = "quiet"
+    skip_mineru: bool = False
+    pdf_markdown_path: str = ""
 
 
 class ErrorBody(BaseModel):

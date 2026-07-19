@@ -1,6 +1,7 @@
-from fastapi import FastAPI, File, Form, Query, Request, UploadFile
+from fastapi import APIRouter, FastAPI, File, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from starlette.concurrency import run_in_threadpool
 
 from .artifact_service import (
     artifact_summary,
@@ -9,12 +10,12 @@ from .artifact_service import (
     read_repo_file,
     repo_tree,
 )
-from .config import LOCAL_DEV_CORS_ORIGINS
+from .config import API_PREFIX, LOCAL_DEV_CORS_ORIGINS, TRUSTED_HOSTS
 from .errors import (
+    FeatureNotSupportedError,
     InternalApiError,
     InvalidParameterError,
     SettingsNotConfiguredError,
-    UnsupportedFileTypeError,
     install_exception_handlers,
 )
 from .job_service import (
@@ -22,51 +23,97 @@ from .job_service import (
     get_job_status,
     get_job_summary,
     make_job_id,
+    make_upload_id,
+    resolve_upload,
     sanitize_name,
     save_upload,
     start_job,
 )
 from .log_service import list_logs, read_log
 from .schemas import (
-    CancelResponse,
-    ConsoleOutput,
-    DomainName,
-    EvalType,
     ArtifactSummaryResponse,
+    CancelResponse,
+    JobCreateRequest,
     JobCreateResponse,
     JobListResponse,
     JsonDict,
     LogsResponse,
     RepoFileResponse,
     RepoTreeResponse,
+    SessionResponse,
     SettingsStatus,
+    UploadResponse,
     WebSettings,
 )
 from .settings_store import get_settings_status, load_settings, save_settings
-from .static_ui import install_static_ui, spa_index_response
+from .static_ui import install_static_ui
 from .storage_security import LocalStorageSecurityError
+from .web_security import (
+    LocalRequestSecurityMiddleware,
+    LocalTrustedHostMiddleware,
+    SESSION_COOKIE_NAME,
+    SESSION_MAX_AGE_SECONDS,
+    UploadBodyLimitMiddleware,
+    issue_session,
+)
 
 
-app = FastAPI(title="Paper2Code Agent API", version="0.1.0")
+app = FastAPI(
+    title="Paper2Code Agent API",
+    version="0.2.0",
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=f"{API_PREFIX}/openapi.json",
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=LOCAL_DEV_CORS_ORIGINS,
-    allow_credentials=False,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Accept", "Content-Type"],
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Accept", "Content-Type", "X-CSRF-Token"],
 )
+app.add_middleware(UploadBodyLimitMiddleware)
+app.add_middleware(LocalRequestSecurityMiddleware)
+app.add_middleware(LocalTrustedHostMiddleware, allowed_hosts=TRUSTED_HOSTS)
 install_exception_handlers(app)
+
+api = APIRouter(prefix=API_PREFIX)
 MIN_GENERATED_N = 1
 MAX_GENERATED_N = 32
 MAX_REPAIR_ROUNDS_LIMIT = 10
 
 
-@app.get("/health")
+@api.get("/health")
 def health() -> JsonDict:
     return {"status": "ok"}
 
 
-@app.post("/settings", response_model=SettingsStatus)
+@api.get("/session", response_model=SessionResponse)
+def local_session(request: Request) -> SessionResponse:
+    session_id, csrf_token = issue_session(request)
+    response = SessionResponse(csrf_token=csrf_token)
+    request.state.session_cookie = session_id
+    return response
+
+
+@app.middleware("http")
+async def set_session_cookie(request: Request, call_next):
+    response = await call_next(request)
+    session_id = getattr(request.state, "session_cookie", None)
+    if session_id:
+        response.set_cookie(
+            SESSION_COOKIE_NAME,
+            session_id,
+            max_age=SESSION_MAX_AGE_SECONDS,
+            httponly=True,
+            secure=request.url.scheme == "https",
+            samesite="strict",
+            path="/",
+        )
+    return response
+
+
+@api.post("/settings", response_model=SettingsStatus)
 def update_settings(settings: WebSettings) -> SettingsStatus:
     try:
         save_settings(settings)
@@ -75,43 +122,33 @@ def update_settings(settings: WebSettings) -> SettingsStatus:
     return get_settings_status()
 
 
-@app.get("/settings/status", response_model=SettingsStatus)
+@api.get("/settings/status", response_model=SettingsStatus)
 def settings_status() -> SettingsStatus:
     return get_settings_status()
 
 
-@app.get("/jobs", response_model=JobListResponse)
-def jobs(
-    request: Request,
-    limit: int = Query(default=50, ge=1, le=200),
-) -> JobListResponse | FileResponse:
-    ui_response = spa_index_response(request)
-    if ui_response is not None:
-        return ui_response
-    return JobListResponse(jobs=list_jobs(limit=limit))
+@api.post("/uploads", response_model=UploadResponse)
+async def upload_pdf(file: UploadFile = File(...)) -> UploadResponse:
+    upload_id = make_upload_id()
+    try:
+        path = await run_in_threadpool(
+            save_upload,
+            upload_id,
+            file.filename or "",
+            file.file,
+        )
+    finally:
+        await file.close()
+    return UploadResponse(upload_id=upload_id, size=path.stat().st_size)
 
 
-@app.post("/jobs", response_model=JobCreateResponse)
-async def create_job(
-    file: UploadFile = File(...),
-    paper_name: str = Form(""),
-    domain: DomainName = Form("statistics"),
-    eval_type: EvalType = Form("ref_free"),
-    generated_n: int = Form(8),
-    auto_refine: bool = Form(True),
-    max_repair_rounds: int = Form(3),
-    console_output: ConsoleOutput = Form("quiet"),
-    skip_mineru: bool = Form(False),
-    pdf_markdown_path: str = Form(""),
-) -> JobCreateResponse:
-    settings = load_settings()
-    if settings is None:
-        raise SettingsNotConfiguredError()
-
-    if not file.filename or not file.filename.lower().endswith(".pdf"):
-        raise UnsupportedFileTypeError("Only PDF uploads are supported.")
-
-    if generated_n < MIN_GENERATED_N or generated_n > MAX_GENERATED_N:
+def _validate_job_parameters(payload: JobCreateRequest) -> None:
+    if payload.eval_type == "ref_based":
+        raise FeatureNotSupportedError(
+            "ref_based evaluation is not supported by the local Web API.",
+            details={"parameter": "eval_type", "value": "ref_based"},
+        )
+    if payload.generated_n < MIN_GENERATED_N or payload.generated_n > MAX_GENERATED_N:
         raise InvalidParameterError(
             f"generated_n must be between {MIN_GENERATED_N} and {MAX_GENERATED_N}.",
             details={
@@ -120,8 +157,10 @@ async def create_job(
                 "max": MAX_GENERATED_N,
             },
         )
-
-    if max_repair_rounds < 0 or max_repair_rounds > MAX_REPAIR_ROUNDS_LIMIT:
+    if (
+        payload.max_repair_rounds < 0
+        or payload.max_repair_rounds > MAX_REPAIR_ROUNDS_LIMIT
+    ):
         raise InvalidParameterError(
             f"max_repair_rounds must be between 0 and {MAX_REPAIR_ROUNDS_LIMIT}.",
             details={
@@ -130,54 +169,63 @@ async def create_job(
                 "max": MAX_REPAIR_ROUNDS_LIMIT,
             },
         )
-
-    resolved_paper_name = sanitize_name(paper_name or file.filename, "paper")
-    job_id = make_job_id(resolved_paper_name)
-    upload_path = save_upload(job_id, file.filename, file.file)
-
-    if skip_mineru and not pdf_markdown_path:
+    if payload.skip_mineru and not payload.pdf_markdown_path:
         raise InvalidParameterError(
             "pdf_markdown_path is required when skip_mineru is true.",
             details={"parameter": "pdf_markdown_path"},
         )
 
+
+@api.post("/jobs", response_model=JobCreateResponse)
+def create_job(payload: JobCreateRequest) -> JobCreateResponse:
+    _validate_job_parameters(payload)
+    settings = load_settings()
+    if settings is None:
+        raise SettingsNotConfiguredError()
+
+    pdf_path = resolve_upload(payload.upload_id)
+    resolved_paper_name = sanitize_name(payload.paper_name, "paper")
+    job_id = make_job_id(resolved_paper_name)
     job = start_job(
         job_id=job_id,
-        pdf_path=upload_path,
+        pdf_path=pdf_path,
         paper_name=resolved_paper_name,
         settings=settings,
-        domain=domain,
-        eval_type=eval_type,
-        generated_n=generated_n,
-        auto_refine=auto_refine,
-        max_repair_rounds=max_repair_rounds,
-        console_output=console_output,
-        skip_mineru=skip_mineru,
-        pdf_markdown_path=pdf_markdown_path,
+        domain=payload.domain,
+        eval_type=payload.eval_type,
+        generated_n=payload.generated_n,
+        auto_refine=payload.auto_refine,
+        max_repair_rounds=payload.max_repair_rounds,
+        console_output=payload.console_output,
+        skip_mineru=payload.skip_mineru,
+        pdf_markdown_path=payload.pdf_markdown_path,
     )
     return JobCreateResponse(**job)
 
 
-@app.get("/jobs/{job_id}/artifacts", response_model=ArtifactSummaryResponse)
+@api.get("/jobs", response_model=JobListResponse)
+def jobs(limit: int = Query(default=50, ge=1, le=200)) -> JobListResponse:
+    return JobListResponse(jobs=list_jobs(limit=limit))
+
+
+@api.get("/jobs/{job_id}", response_model=None)
+def job_status(job_id: str) -> JsonDict:
+    return get_job_status(job_id)
+
+
+@api.post("/jobs/{job_id}/cancel", response_model=CancelResponse)
+def cancel(job_id: str) -> CancelResponse:
+    canceled, message = cancel_job(job_id)
+    return CancelResponse(job_id=job_id, canceled=canceled, message=message)
+
+
+@api.get("/jobs/{job_id}/artifacts", response_model=ArtifactSummaryResponse)
 def job_artifacts(job_id: str) -> ArtifactSummaryResponse:
     return ArtifactSummaryResponse(**artifact_summary(job_id))
 
 
-@app.get("/jobs/{job_id}/repo/tree", response_model=RepoTreeResponse)
-def job_repo_tree(
-    job_id: str,
-    max_files: int = Query(default=500, ge=1, le=2000),
-) -> RepoTreeResponse:
-    return RepoTreeResponse(job_id=job_id, files=repo_tree(job_id, max_files=max_files))
-
-
-@app.get("/jobs/{job_id}/repo/file", response_model=RepoFileResponse)
-def job_repo_file(job_id: str, path: str = Query(..., min_length=1)) -> RepoFileResponse:
-    return RepoFileResponse(**read_repo_file(job_id, path))
-
-
-@app.get("/jobs/{job_id}/repo/download")
-def job_repo_download(job_id: str) -> FileResponse:
+@api.get("/jobs/{job_id}/export")
+def job_export(job_id: str) -> FileResponse:
     zip_path = make_repo_zip(job_id)
     return FileResponse(
         path=str(zip_path),
@@ -186,20 +234,12 @@ def job_repo_download(job_id: str) -> FileResponse:
     )
 
 
-@app.get("/jobs/{job_id}", response_model=None)
-def job_status(request: Request, job_id: str) -> JsonDict | FileResponse:
-    ui_response = spa_index_response(request)
-    if ui_response is not None:
-        return ui_response
-    return get_job_status(job_id)
-
-
-@app.get("/jobs/{job_id}/summary")
+@api.get("/jobs/{job_id}/summary")
 def job_summary(job_id: str) -> JsonDict:
     return get_job_summary(job_id)
 
 
-@app.get("/jobs/{job_id}/logs", response_model=LogsResponse)
+@api.get("/jobs/{job_id}/logs", response_model=LogsResponse)
 def job_logs(
     job_id: str,
     file: str | None = Query(default=None),
@@ -212,10 +252,18 @@ def job_logs(
     return LogsResponse(job_id=job_id, logs=logs, file=file, content=content)
 
 
-@app.post("/jobs/{job_id}/cancel", response_model=CancelResponse)
-def cancel(job_id: str) -> CancelResponse:
-    canceled, message = cancel_job(job_id)
-    return CancelResponse(job_id=job_id, canceled=True, message=message)
+@api.get("/jobs/{job_id}/repo/tree", response_model=RepoTreeResponse)
+def job_repo_tree(
+    job_id: str,
+    max_files: int = Query(default=500, ge=1, le=2000),
+) -> RepoTreeResponse:
+    return RepoTreeResponse(job_id=job_id, files=repo_tree(job_id, max_files=max_files))
 
 
+@api.get("/jobs/{job_id}/repo/file", response_model=RepoFileResponse)
+def job_repo_file(job_id: str, path: str = Query(..., min_length=1)) -> RepoFileResponse:
+    return RepoFileResponse(**read_repo_file(job_id, path))
+
+
+app.include_router(api)
 install_static_ui(app)

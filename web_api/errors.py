@@ -3,7 +3,9 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 
 def error_payload(
@@ -114,6 +116,12 @@ class UnsupportedFileTypeError(ContractError, ValueError):
     default_message = "File type is not supported."
 
 
+class FeatureNotSupportedError(ContractError, ValueError):
+    status_code = 422
+    code = "feature_not_supported"
+    default_message = "The requested feature is not supported by the local Web API."
+
+
 class TextEncodingNotSupportedError(ContractError, ValueError):
     status_code = 415
     code = "unsupported_file_type"
@@ -151,6 +159,25 @@ class InternalApiError(ContractError):
     default_message = "Internal server error."
 
 
+def safe_validation_errors(exc: RequestValidationError) -> list[dict[str, Any]]:
+    """Return useful validation locations without reflecting request inputs."""
+
+    safe_errors: list[dict[str, Any]] = []
+    for error in exc.errors():
+        location = [
+            item if isinstance(item, (str, int)) and not isinstance(item, bool) else "?"
+            for item in error.get("loc", ())
+        ]
+        safe_errors.append(
+            {
+                "type": str(error.get("type") or "validation_error"),
+                "loc": location,
+                "msg": str(error.get("msg") or "Invalid value."),
+            }
+        )
+    return safe_errors
+
+
 def install_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(ContractError)
     async def handle_contract_error(
@@ -158,6 +185,32 @@ def install_exception_handlers(app: FastAPI) -> None:
         exc: ContractError,
     ) -> JSONResponse:
         return exc.to_response()
+
+    @app.exception_handler(RequestValidationError)
+    async def handle_validation_error(
+        request: Request,
+        exc: RequestValidationError,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=422,
+            content=error_payload(
+                "validation_error",
+                "Request validation failed.",
+                {"errors": safe_validation_errors(exc)},
+            ),
+        )
+
+    @app.exception_handler(StarletteHTTPException)
+    async def handle_http_error(
+        request: Request,
+        exc: StarletteHTTPException,
+    ) -> JSONResponse:
+        code = "not_found" if exc.status_code == 404 else "http_error"
+        message = "API endpoint not found." if exc.status_code == 404 else "HTTP request failed."
+        return JSONResponse(
+            status_code=exc.status_code,
+            content=error_payload(code, message),
+        )
 
     @app.exception_handler(Exception)
     async def handle_unexpected_error(

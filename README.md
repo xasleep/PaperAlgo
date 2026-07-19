@@ -63,7 +63,7 @@ Set-Location .\web_ui
 npm run dev
 ```
 
-浏览器打开 `http://localhost:5173`。Vite 固定使用 `5173`；端口被占用时会直接失败，以保持与 FastAPI 本地 CORS 白名单一致。API 文档位于 `http://127.0.0.1:8000/docs`。
+浏览器打开 `http://localhost:5173`。Vite 固定使用 `5173`；端口被占用时会直接失败，以保持与 FastAPI 本地 CORS 白名单一致。当前 Swagger 和 Redoc 页面均已关闭；OpenAPI JSON 位于 `http://127.0.0.1:8000/api/v1/openapi.json`。
 
 如需由 FastAPI 托管生产构建：
 
