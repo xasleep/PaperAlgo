@@ -225,14 +225,22 @@ def _sqlite_job_view(
         "pending",
         "claimed",
     }
+    identity_unresolved = bool(
+        execution_status == "running"
+        and process is not None
+        and process.get("launch_state") == "identity_unresolved"
+    )
     process_active = bool(
         execution_status == "running"
         and process is not None
+        and process.get("launch_state") == "registered"
         and process.get("pid")
         and process.get("exited_at") is None
     )
     if process_active:
         process_state = "active"
+    elif identity_unresolved:
+        process_state = "detached"
     elif terminal:
         process_state = "finished"
     else:
@@ -241,19 +249,25 @@ def _sqlite_job_view(
         **job,
         "status": execution_status,
         "process_state": process_state,
-        "cancelable": not terminal,
+        "cancelable": not terminal and not identity_unresolved,
         "cancel_unavailable_reason": (
-            "already_finished" if terminal else ""
+            "process_identity_unresolved"
+            if identity_unresolved
+            else ("already_finished" if terminal else "")
         ),
         "process_active": process_active,
         "stage": execution_status,
         "message": (
-            "Cancellation requested."
-            if cancel_requested
+            "Pipeline launch identity is unresolved; new work is blocked for safety."
+            if identity_unresolved
             else (
-                "Queued for the SQLite worker runtime."
-                if execution_status == "queued"
-                else None
+                "Cancellation requested."
+                if cancel_requested
+                else (
+                    "Queued for the SQLite worker runtime."
+                    if execution_status == "queued"
+                    else None
+                )
             )
         ),
         "repo_status": None,

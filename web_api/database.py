@@ -180,6 +180,29 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             "ALTER TABLE worker_leases ADD COLUMN owner_token TEXT",
         ),
     ),
+    (
+        4,
+        (
+            """
+            ALTER TABLE job_processes ADD COLUMN launch_state TEXT NOT NULL
+                DEFAULT 'claimed'
+                CHECK(launch_state IN (
+                    'claimed', 'registered', 'identity_unresolved', 'exited'
+                ))
+            """,
+            "ALTER TABLE job_processes ADD COLUMN launch_error_code TEXT",
+            """
+            UPDATE job_processes
+            SET launch_state = 'registered'
+            WHERE pid IS NOT NULL AND exited_at IS NULL
+            """,
+            """
+            UPDATE job_processes
+            SET launch_state = 'exited'
+            WHERE exited_at IS NOT NULL
+            """,
+        ),
+    ),
 )
 
 

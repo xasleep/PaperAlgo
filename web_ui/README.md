@@ -77,6 +77,19 @@ The browser client obtains a local session from `/api/v1/session`, keeps the
 returned CSRF token in memory, and sends it with state-changing requests. The
 session cookie uses `SameSite=Strict`.
 
+## Current Runtime Semantics
+
+The job detail UI polls active jobs every 2 seconds. SSE and WebSocket event streams
+are not implemented. In SQLite runtime, cancellation is asynchronous: the API creates one
+idempotent cancel command and the independent Worker performs verified process-
+tree termination. The response acknowledges the request; it does not mean the
+job is already canceled. Legacy cancellation remains owned by the FastAPI
+process that launched the Pipeline.
+
+Settings status returns only boolean configuration flags and does not return API key
+values. Keys are stored locally in `.local/web_settings.json` as plaintext JSON;
+this local single-user boundary is not encrypted credential storage.
+
 ## Checks
 
 ```powershell

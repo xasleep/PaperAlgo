@@ -388,8 +388,8 @@ class JobRepository:
                 connection.execute(
                     """
                     INSERT INTO job_processes (
-                        job_id, worker_id, launch_token, heartbeat_at
-                    ) VALUES (?, ?, ?, ?)
+                        job_id, worker_id, launch_token, launch_state, heartbeat_at
+                    ) VALUES (?, ?, ?, 'claimed', ?)
                     """,
                     (current["job_id"], worker_id, launch_token, now),
                 )
@@ -433,6 +433,19 @@ class JobRepository:
                         "already_finished",
                         "Job is already finished and cannot be canceled.",
                     )
+                if job["execution_status"] == "running":
+                    process = connection.execute(
+                        "SELECT launch_state FROM job_processes WHERE job_id = ?",
+                        (job_id,),
+                    ).fetchone()
+                    if (
+                        process is not None
+                        and process["launch_state"] == "identity_unresolved"
+                    ):
+                        raise JobNotCancelableError(
+                            "process_identity_unresolved",
+                            "Pipeline process identity is unresolved and cannot be canceled safely.",
+                        )
                 command = connection.execute(
                     """
                     SELECT * FROM job_commands
@@ -650,8 +663,10 @@ class JobRepository:
                     """
                     UPDATE job_processes
                     SET pid = ?, process_create_time = ?, process_group_id = ?,
-                        command_summary = ?, heartbeat_at = ?, started_at = ?
+                        command_summary = ?, heartbeat_at = ?, started_at = ?,
+                        launch_state = 'registered', launch_error_code = NULL
                     WHERE job_id = ? AND launch_token = ? AND pid IS NULL
+                      AND launch_state IN ('claimed', 'identity_unresolved')
                     """,
                     (
                         pid,
@@ -673,6 +688,107 @@ class JobRepository:
                     raise OptimisticLockConflictError()
                 connection.commit()
                 return dict(process)
+            except Exception:
+                connection.rollback()
+                raise
+
+    def mark_launch_identity_unresolved(
+        self,
+        job_id: str,
+        *,
+        worker_id: str,
+        instance_token: str,
+        launch_token: str,
+    ) -> dict[str, Any]:
+        job_id = validate_job_id(job_id)
+        worker_id = _runtime_identifier(worker_id, "worker_id")
+        instance_token = _runtime_identifier(instance_token, "instance_token")
+        launch_token = _runtime_identifier(launch_token, "launch_token")
+        now = utc_now()
+        with closing(connect_database(self.database_path)) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                self._assert_current_lease(
+                    connection, worker_id, instance_token, now
+                )
+                job = connection.execute(
+                    "SELECT * FROM jobs WHERE job_id = ?", (job_id,)
+                ).fetchone()
+                process = connection.execute(
+                    "SELECT * FROM job_processes WHERE job_id = ?", (job_id,)
+                ).fetchone()
+                if job is None:
+                    raise JobNotFoundError()
+                if (
+                    process is None
+                    or job["execution_status"] != "running"
+                    or process["launch_token"] != launch_token
+                    or process["launch_state"] == "exited"
+                ):
+                    raise OptimisticLockConflictError()
+                identity_incomplete = (
+                    process["pid"] is None
+                    or not process["process_create_time"]
+                    or process["process_group_id"] is None
+                )
+                if not identity_incomplete:
+                    raise OptimisticLockConflictError()
+                if process["launch_state"] == "identity_unresolved":
+                    connection.commit()
+                    return dict(process)
+
+                cursor = connection.execute(
+                    """
+                    UPDATE job_processes
+                    SET launch_state = 'identity_unresolved',
+                        launch_error_code = 'process_identity_unresolved',
+                        heartbeat_at = ?
+                    WHERE job_id = ? AND launch_token = ?
+                      AND launch_state != 'exited'
+                      AND (
+                          pid IS NULL
+                          OR NULLIF(process_create_time, '') IS NULL
+                          OR process_group_id IS NULL
+                      )
+                    """,
+                    (now, job_id, launch_token),
+                )
+                if cursor.rowcount != 1:
+                    raise OptimisticLockConflictError()
+                connection.execute(
+                    """
+                    UPDATE job_commands
+                    SET status = 'failed',
+                        error_code = 'process_identity_unresolved',
+                        completed_at = ?, version = version + 1
+                    WHERE job_id = ? AND command_type = 'cancel'
+                      AND status IN ('pending', 'claimed')
+                    """,
+                    (now, job_id),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO job_events (
+                        job_id, event_type, source, job_version,
+                        execution_status, evaluation_status, quality_status, created_at
+                    ) VALUES (
+                        ?, 'job.launch_identity_unresolved', 'worker', ?, ?, ?, ?, ?
+                    )
+                    """,
+                    (
+                        job_id,
+                        job["version"],
+                        job["execution_status"],
+                        job["evaluation_status"],
+                        job["quality_status"],
+                        now,
+                    ),
+                )
+                updated = connection.execute(
+                    "SELECT * FROM job_processes WHERE job_id = ?", (job_id,)
+                ).fetchone()
+                connection.commit()
+                return dict(updated)
             except Exception:
                 connection.rollback()
                 raise
@@ -725,7 +841,8 @@ class JobRepository:
                 SELECT j.*, p.worker_id, p.launch_token, p.pid,
                        p.process_create_time, p.process_group_id,
                        p.command_summary, p.heartbeat_at, p.started_at,
-                       p.exited_at, p.exit_code
+                       p.exited_at, p.exit_code, p.launch_state,
+                       p.launch_error_code
                 FROM jobs AS j
                 LEFT JOIN job_processes AS p ON p.job_id = j.job_id
                 WHERE j.execution_status = 'running'
@@ -771,6 +888,20 @@ class JobRepository:
                 if current["execution_status"] != "running":
                     connection.commit()
                     return _row_to_dict(current)
+                if execution_status == "canceled":
+                    cancel_command = connection.execute(
+                        """
+                        SELECT status FROM job_commands
+                        WHERE job_id = ? AND command_type = 'cancel'
+                        ORDER BY id DESC LIMIT 1
+                        """,
+                        (job_id,),
+                    ).fetchone()
+                    if (
+                        cancel_command is None
+                        or cancel_command["status"] not in {"pending", "claimed"}
+                    ):
+                        raise OptimisticLockConflictError()
                 next_state = validate_job_transition(
                     JobState(
                         execution_status=current["execution_status"],
@@ -801,7 +932,8 @@ class JobRepository:
                 connection.execute(
                     """
                     UPDATE job_processes
-                    SET heartbeat_at = ?, exited_at = ?, exit_code = ?
+                    SET heartbeat_at = ?, exited_at = ?, exit_code = ?,
+                        launch_state = 'exited'
                     WHERE job_id = ? AND launch_token = ?
                     """,
                     (now, now, exit_code, job_id, launch_token),

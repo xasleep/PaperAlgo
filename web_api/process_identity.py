@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import ctypes
+import math
 import os
 import signal
-import subprocess
 import sys
 import time
+from ctypes import wintypes
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -22,32 +24,54 @@ class TerminationResult:
     reason: str
 
 
-def _windows_create_time_from_handle(handle: int) -> str | None:
-    import ctypes
-    from ctypes import wintypes
+_WINDOWS_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_WINDOWS_PROCESS_TERMINATE = 0x0001
+_WINDOWS_SYNCHRONIZE = 0x00100000
+_WINDOWS_STILL_ACTIVE = 259
+_WINDOWS_WAIT_OBJECT_0 = 0
+_WINDOWS_WAIT_TIMEOUT = 258
 
-    class FileTime(ctypes.Structure):
-        _fields_ = [
-            ("low", wintypes.DWORD),
-            ("high", wintypes.DWORD),
-        ]
 
-    creation = FileTime()
-    exit_time = FileTime()
-    kernel_time = FileTime()
-    user_time = FileTime()
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    get_process_times = kernel32.GetProcessTimes
-    get_process_times.argtypes = [
-        wintypes.HANDLE,
-        ctypes.POINTER(FileTime),
-        ctypes.POINTER(FileTime),
-        ctypes.POINTER(FileTime),
-        ctypes.POINTER(FileTime),
+class _WindowsFileTime(ctypes.Structure):
+    _fields_ = [
+        ("low", wintypes.DWORD),
+        ("high", wintypes.DWORD),
     ]
-    get_process_times.restype = wintypes.BOOL
-    if not get_process_times(
-        wintypes.HANDLE(handle),
+
+
+def _load_kernel32() -> Any:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.GetProcessTimes.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(_WindowsFileTime),
+        ctypes.POINTER(_WindowsFileTime),
+        ctypes.POINTER(_WindowsFileTime),
+        ctypes.POINTER(_WindowsFileTime),
+    ]
+    kernel32.GetProcessTimes.restype = wintypes.BOOL
+    kernel32.GetExitCodeProcess.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    kernel32.TerminateProcess.restype = wintypes.BOOL
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    return kernel32
+
+
+def _windows_create_time_from_open_handle(kernel32: Any, handle: Any) -> str | None:
+    creation = _WindowsFileTime()
+    exit_time = _WindowsFileTime()
+    kernel_time = _WindowsFileTime()
+    user_time = _WindowsFileTime()
+    if not kernel32.GetProcessTimes(
+        handle,
         ctypes.byref(creation),
         ctypes.byref(exit_time),
         ctypes.byref(kernel_time),
@@ -57,33 +81,31 @@ def _windows_create_time_from_handle(handle: int) -> str | None:
     return str((int(creation.high) << 32) | int(creation.low))
 
 
-def _windows_process_create_time(pid: int) -> str | None:
-    import ctypes
-    from ctypes import wintypes
+def _windows_create_time_from_handle(handle: int) -> str | None:
+    return _windows_create_time_from_open_handle(
+        _load_kernel32(),
+        wintypes.HANDLE(handle),
+    )
 
-    process_query_limited_information = 0x1000
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    open_process = kernel32.OpenProcess
-    open_process.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-    open_process.restype = wintypes.HANDLE
-    close_handle = kernel32.CloseHandle
-    close_handle.argtypes = [wintypes.HANDLE]
-    close_handle.restype = wintypes.BOOL
-    handle = open_process(process_query_limited_information, False, pid)
+
+def _windows_process_create_time(pid: int) -> str | None:
+    kernel32 = _load_kernel32()
+    handle = kernel32.OpenProcess(
+        _WINDOWS_PROCESS_QUERY_LIMITED_INFORMATION,
+        False,
+        pid,
+    )
     if not handle:
         return None
     try:
         exit_code = wintypes.DWORD()
-        get_exit_code = kernel32.GetExitCodeProcess
-        get_exit_code.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
-        get_exit_code.restype = wintypes.BOOL
-        if not get_exit_code(handle, ctypes.byref(exit_code)):
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
             return None
-        if exit_code.value != 259:
+        if exit_code.value != _WINDOWS_STILL_ACTIVE:
             return None
-        return _windows_create_time_from_handle(int(handle))
+        return _windows_create_time_from_open_handle(kernel32, handle)
     finally:
-        close_handle(handle)
+        kernel32.CloseHandle(handle)
 
 
 def _posix_process_stat(pid: int) -> tuple[int, str] | None:
@@ -229,65 +251,188 @@ def _snapshot_process_tree(root: ProcessIdentity) -> list[ProcessIdentity]:
     return identities
 
 
-def _identity_is_alive(identity: ProcessIdentity) -> bool:
-    return get_process_create_time(identity.pid) == identity.create_time
+def _windows_identity_status_for_wait(
+    identity: ProcessIdentity,
+    *,
+    kernel32: Any | None = None,
+) -> str:
+    system_kernel32 = kernel32 is None
+    kernel32 = kernel32 or _load_kernel32()
+    handle = kernel32.OpenProcess(
+        _WINDOWS_PROCESS_QUERY_LIMITED_INFORMATION | _WINDOWS_SYNCHRONIZE,
+        False,
+        identity.pid,
+    )
+    if not handle:
+        if system_kernel32 and ctypes.get_last_error() == 87:
+            return "missing"
+        return "unresolved"
+    try:
+        exit_code = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return "unresolved"
+        create_time = _windows_create_time_from_open_handle(kernel32, handle)
+        if create_time is None:
+            return "unresolved"
+        if create_time != identity.create_time:
+            return "mismatch"
+        return (
+            "matching"
+            if exit_code.value == _WINDOWS_STILL_ACTIVE
+            else "missing"
+        )
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _identity_status_for_wait(identity: ProcessIdentity) -> str:
+    if sys.platform == "win32":
+        return _windows_identity_status_for_wait(identity)
+    current_create_time = get_process_create_time(identity.pid)
+    if current_create_time is None:
+        return "missing"
+    return "matching" if current_create_time == identity.create_time else "mismatch"
+
+
+def _tree_has_exited(identities: list[ProcessIdentity]) -> bool:
+    return all(
+        _identity_status_for_wait(identity) in {"missing", "mismatch"}
+        for identity in identities
+    )
 
 
 def _wait_for_tree_exit(identities: list[ProcessIdentity], timeout: float) -> bool:
     deadline = time.monotonic() + max(0.0, timeout)
     while time.monotonic() < deadline:
-        if not any(_identity_is_alive(identity) for identity in identities):
+        if _tree_has_exited(identities):
             return True
         time.sleep(0.05)
-    return not any(_identity_is_alive(identity) for identity in identities)
+    return _tree_has_exited(identities)
 
 
-def _send_graceful(process_group_id: int) -> bool:
+def _validated_process_group_status(
+    root: ProcessIdentity,
+    process_group_id: int,
+) -> str:
+    status = process_identity_status(root.pid, root.create_time)
+    if status != "matching":
+        return (
+            "process_missing"
+            if status == "missing"
+            else "process_identity_mismatch"
+        )
+    if sys.platform == "win32":
+        return (
+            "matching"
+            if process_group_id == root.pid
+            else "process_identity_mismatch"
+        )
     try:
-        if sys.platform == "win32":
-            os.kill(process_group_id, signal.CTRL_BREAK_EVENT)
-        else:
-            os.killpg(process_group_id, signal.SIGTERM)
-        return True
-    except (ProcessLookupError, PermissionError, OSError):
-        return False
-
-
-def _force_windows_identity(identity: ProcessIdentity) -> None:
-    if not _identity_is_alive(identity):
-        return
-    subprocess.run(
-        ["taskkill", "/PID", str(identity.pid), "/T", "/F"],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        check=False,
+        current_process_group = os.getpgid(root.pid)
+    except ProcessLookupError:
+        return "process_missing"
+    except (PermissionError, OSError):
+        return "process_tree_termination_failed"
+    return (
+        "matching"
+        if current_process_group == process_group_id
+        else "process_identity_mismatch"
     )
 
 
-def _force_process_tree(
-    identities: list[ProcessIdentity],
+def _send_verified_group_signal(
+    root: ProcessIdentity,
     process_group_id: int,
-) -> None:
-    root = identities[0]
-    if sys.platform == "win32":
-        _force_windows_identity(root)
-        for identity in reversed(identities[1:]):
-            _force_windows_identity(identity)
-        return
-    if _identity_is_alive(root):
-        try:
-            os.killpg(process_group_id, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError, OSError):
-            pass
-    for identity in reversed(identities[1:]):
-        if not _identity_is_alive(identity):
+    sig: int,
+) -> tuple[bool, str]:
+    status = _validated_process_group_status(root, process_group_id)
+    if status != "matching":
+        return False, status
+    try:
+        if sys.platform == "win32":
+            os.kill(process_group_id, sig)
+        else:
+            os.killpg(process_group_id, sig)
+    except ProcessLookupError:
+        return False, "process_missing"
+    except (PermissionError, OSError):
+        return False, "process_tree_termination_failed"
+    return True, "signal_sent"
+
+
+def _terminate_windows_identity(
+    identity: ProcessIdentity,
+    *,
+    timeout: float,
+    kernel32: Any | None = None,
+) -> TerminationResult:
+    kernel32 = kernel32 or _load_kernel32()
+    access = (
+        _WINDOWS_PROCESS_QUERY_LIMITED_INFORMATION
+        | _WINDOWS_PROCESS_TERMINATE
+        | _WINDOWS_SYNCHRONIZE
+    )
+    handle = kernel32.OpenProcess(access, False, identity.pid)
+    if not handle:
+        return TerminationResult(False, "process_tree_termination_failed")
+    try:
+        exit_code = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return TerminationResult(False, "process_tree_termination_failed")
+        if exit_code.value != _WINDOWS_STILL_ACTIVE:
+            return TerminationResult(False, "process_missing")
+        create_time = _windows_create_time_from_open_handle(kernel32, handle)
+        if create_time is None:
+            return TerminationResult(False, "process_tree_termination_failed")
+        if create_time != identity.create_time:
+            return TerminationResult(False, "process_identity_mismatch")
+        if not kernel32.TerminateProcess(handle, 1):
+            return TerminationResult(False, "process_tree_termination_failed")
+        timeout_ms = min(
+            int(wintypes.DWORD(-1).value - 1),
+            max(0, int(math.ceil(timeout * 1000))),
+        )
+        wait_result = int(kernel32.WaitForSingleObject(handle, timeout_ms))
+        if wait_result == _WINDOWS_WAIT_OBJECT_0:
+            return TerminationResult(True, "process_tree_terminated")
+        if wait_result == _WINDOWS_WAIT_TIMEOUT:
+            return TerminationResult(False, "process_termination_timeout")
+        return TerminationResult(False, "process_tree_termination_failed")
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _force_windows_process_tree(
+    identities: list[ProcessIdentity],
+    *,
+    timeout: float,
+    kernel32: Any | None = None,
+) -> TerminationResult:
+    kernel32 = kernel32 or _load_kernel32()
+    deadline = time.monotonic() + max(0.0, timeout)
+    for identity in [*reversed(identities[1:]), identities[0]]:
+        remaining = max(0.0, deadline - time.monotonic())
+        result = _terminate_windows_identity(
+            identity,
+            timeout=remaining,
+            kernel32=kernel32,
+        )
+        if result.terminated:
             continue
-        try:
-            os.kill(identity.pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError, OSError):
-            pass
+        if identity is not identities[0] and result.reason in {
+            "process_identity_mismatch",
+            "process_missing",
+        }:
+            continue
+        return result
+    return TerminationResult(True, "process_tree_terminated")
+
+
+def _send_verified_posix_force(
+    root: ProcessIdentity,
+    process_group_id: int,
+) -> tuple[bool, str]:
+    return _send_verified_group_signal(root, process_group_id, signal.SIGKILL)
 
 
 def terminate_verified_process_tree(
@@ -298,6 +443,10 @@ def terminate_verified_process_tree(
     graceful_timeout: float = 10.0,
     force_timeout: float = 5.0,
 ) -> TerminationResult:
+    if not math.isfinite(graceful_timeout) or graceful_timeout < 0:
+        raise ValueError("graceful_timeout must be a finite non-negative value.")
+    if not math.isfinite(force_timeout) or force_timeout < 0:
+        raise ValueError("force_timeout must be a finite non-negative value.")
     status = process_identity_status(pid, expected_create_time)
     if status == "mismatch":
         return TerminationResult(False, "process_identity_mismatch")
@@ -306,14 +455,33 @@ def terminate_verified_process_tree(
 
     root = ProcessIdentity(pid=pid, create_time=expected_create_time)
     identities = _snapshot_process_tree(root)
-    if process_identity_status(pid, expected_create_time) != "matching":
-        return TerminationResult(False, "process_identity_mismatch")
-
-    graceful_sent = _send_graceful(process_group_id)
+    graceful_signal = (
+        signal.CTRL_BREAK_EVENT if sys.platform == "win32" else signal.SIGTERM
+    )
+    graceful_sent, graceful_reason = _send_verified_group_signal(
+        root,
+        process_group_id,
+        graceful_signal,
+    )
+    if graceful_reason in {
+        "process_identity_mismatch",
+        "process_missing",
+    }:
+        return TerminationResult(False, graceful_reason)
     if graceful_sent and _wait_for_tree_exit(identities, graceful_timeout):
         return TerminationResult(True, "process_tree_terminated")
 
-    _force_process_tree(identities, process_group_id)
+    if sys.platform == "win32":
+        return _force_windows_process_tree(
+            identities,
+            timeout=force_timeout,
+        )
+    force_sent, force_reason = _send_verified_posix_force(
+        root,
+        process_group_id,
+    )
+    if not force_sent:
+        return TerminationResult(False, force_reason)
     if _wait_for_tree_exit(identities, force_timeout):
         return TerminationResult(True, "process_tree_terminated")
-    return TerminationResult(False, "process_tree_termination_failed")
+    return TerminationResult(False, "process_termination_timeout")

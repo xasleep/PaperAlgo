@@ -42,7 +42,14 @@ class ManagedProcess:
     log_file: TextIO | None = None
 
 
+@dataclass(frozen=True)
+class ReconcileResult:
+    safe_to_schedule: bool
+    unresolved_job_ids: tuple[str, ...]
+
+
 CommandBuilder = Callable[[dict[str, object]], LaunchSpec]
+FORCE_CANCEL_SECONDS = 5.0
 
 
 def _default_worker_id() -> str:
@@ -106,7 +113,7 @@ class PipelineWorker:
             raise ValueError("lease_seconds must be greater than poll_interval.")
         if cancel_grace_seconds < 0 or cancel_grace_seconds > 10:
             raise ValueError("cancel_grace_seconds must be between 0 and 10.")
-        if lease_seconds <= cancel_grace_seconds + 5:
+        if lease_seconds <= cancel_grace_seconds + FORCE_CANCEL_SECONDS:
             raise ValueError(
                 "lease_seconds must exceed the graceful and forced cancel windows."
             )
@@ -119,8 +126,14 @@ class PipelineWorker:
         self.cancel_grace_seconds = cancel_grace_seconds
         self.command_builder = command_builder or _pipeline_launch_spec
         self._managed: dict[str, ManagedProcess] = {}
+        self._unresolved_job_ids: tuple[str, ...] = ()
+        self._last_reconcile_result = ReconcileResult(True, ())
         self._lease_owned = False
         self._reconciled = False
+
+    @property
+    def last_reconcile_result(self) -> ReconcileResult:
+        return self._last_reconcile_result
 
     def _forget(self, job_id: str) -> None:
         managed = self._managed.pop(job_id, None)
@@ -150,8 +163,41 @@ class PipelineWorker:
         )
         self._forget(managed.job_id)
 
-    def _reconcile(self) -> None:
+    def _finish_managed(self, managed: ManagedProcess, exit_code: int) -> None:
+        self.repository.finish_process(
+            managed.job_id,
+            worker_id=self.worker_id,
+            instance_token=self.instance_token,
+            launch_token=managed.launch_token,
+            exit_code=exit_code,
+        )
+        self._forget(managed.job_id)
+
+    def _record_launch_failure(self, job_id: str, launch_token: str) -> None:
+        self.repository.fail_process(
+            job_id,
+            worker_id=self.worker_id,
+            instance_token=self.instance_token,
+            launch_token=launch_token,
+            failure_code="process_launch_failed",
+            event_type="job.process_launch_failed",
+        )
+
+    @staticmethod
+    def _launch_spec_is_valid(launch: LaunchSpec) -> bool:
+        return bool(
+            isinstance(launch.command, list)
+            and launch.command
+            and all(isinstance(part, str) for part in launch.command)
+            and isinstance(launch.command_summary, str)
+            and launch.command_summary
+            and len(launch.command_summary) <= 1024
+            and launch.command_summary.isprintable()
+        )
+
+    def _reconcile(self) -> ReconcileResult:
         self._detach_all()
+        unresolved_job_ids: list[str] = []
         for process in self.repository.list_running_processes():
             job_id = str(process["job_id"])
             launch_token = process.get("launch_token")
@@ -160,20 +206,22 @@ class PipelineWorker:
             process_group_id = process.get("process_group_id")
             if not launch_token:
                 raise RuntimeError(f"Running job {job_id} has no launch token.")
+            if not pid or not create_time or not process_group_id:
+                self.repository.mark_launch_identity_unresolved(
+                    job_id,
+                    worker_id=self.worker_id,
+                    instance_token=self.instance_token,
+                    launch_token=str(launch_token),
+                )
+                unresolved_job_ids.append(job_id)
+                continue
             managed = ManagedProcess(
                 job_id=job_id,
                 launch_token=str(launch_token),
-                pid=int(pid) if pid else 0,
-                process_create_time=str(create_time or ""),
-                process_group_id=int(process_group_id) if process_group_id else 0,
+                pid=int(pid),
+                process_create_time=str(create_time),
+                process_group_id=int(process_group_id),
             )
-            if not pid or not create_time or not process_group_id:
-                self._fail_managed(
-                    managed,
-                    "process_missing_without_checkpoint",
-                    event_type="job.reconciliation_failed",
-                )
-                continue
             identity = process_identity_status(int(pid), str(create_time))
             if identity == "mismatch":
                 self._fail_managed(
@@ -196,7 +244,23 @@ class PipelineWorker:
                 instance_token=self.instance_token,
                 launch_token=managed.launch_token,
             )
+        result = ReconcileResult(
+            safe_to_schedule=not unresolved_job_ids,
+            unresolved_job_ids=tuple(unresolved_job_ids),
+        )
+        self._unresolved_job_ids = result.unresolved_job_ids
+        self._last_reconcile_result = result
         self._reconciled = True
+        return result
+
+    def _remember_unresolved_launch(self, job_id: str) -> None:
+        self._unresolved_job_ids = tuple(
+            sorted({*self._unresolved_job_ids, job_id})
+        )
+        self._last_reconcile_result = ReconcileResult(
+            safe_to_schedule=False,
+            unresolved_job_ids=self._unresolved_job_ids,
+        )
 
     def _cancel_before_launch(self, job: dict[str, object], launch_token: str) -> bool:
         command = self.repository.get_cancel_command(str(job["job_id"]))
@@ -222,26 +286,12 @@ class PipelineWorker:
         job_id = str(job["job_id"])
         try:
             launch = self.command_builder(job)
-        except (FileNotFoundError, SettingsNotConfiguredError, ValueError, OSError):
-            self.repository.fail_process(
-                job_id,
-                worker_id=self.worker_id,
-                instance_token=self.instance_token,
-                launch_token=launch_token,
-                failure_code="process_launch_failed",
-                event_type="job.process_launch_failed",
-            )
-            raise
-        if not launch.command or not launch.command_summary:
-            self.repository.fail_process(
-                job_id,
-                worker_id=self.worker_id,
-                instance_token=self.instance_token,
-                launch_token=launch_token,
-                failure_code="process_launch_failed",
-                event_type="job.process_launch_failed",
-            )
-            raise ValueError("The pipeline launch specification is incomplete.")
+        except (SettingsNotConfiguredError, ValueError, OSError):
+            self._record_launch_failure(job_id, launch_token)
+            return
+        if not self._launch_spec_is_valid(launch):
+            self._record_launch_failure(job_id, launch_token)
+            return
         if self._cancel_before_launch(job, launch_token):
             return
 
@@ -261,31 +311,23 @@ class PipelineWorker:
                 errors="replace",
                 **job_service.pipeline_popen_kwargs(),
             )
-        except OSError:
+        except (OSError, ValueError):
             log_file.close()
-            self.repository.fail_process(
-                job_id,
-                worker_id=self.worker_id,
-                instance_token=self.instance_token,
-                launch_token=launch_token,
-                failure_code="process_launch_failed",
-                event_type="job.process_launch_failed",
-            )
-            raise
+            self._record_launch_failure(job_id, launch_token)
+            return
 
         create_time = get_process_create_time(process.pid, process)
         if create_time is None:
-            job_service.terminate_process_tree(process.pid, process, timeout=3.0)
-            log_file.close()
-            self.repository.fail_process(
-                job_id,
-                worker_id=self.worker_id,
-                instance_token=self.instance_token,
-                launch_token=launch_token,
-                failure_code="process_identity_unavailable",
-                event_type="job.process_launch_failed",
-                exit_code=process.poll(),
-            )
+            self._remember_unresolved_launch(job_id)
+            try:
+                self.repository.mark_launch_identity_unresolved(
+                    job_id,
+                    worker_id=self.worker_id,
+                    instance_token=self.instance_token,
+                    launch_token=launch_token,
+                )
+            finally:
+                log_file.close()
             raise RuntimeError("The pipeline process identity could not be recorded.")
 
         managed = ManagedProcess(
@@ -309,22 +351,65 @@ class PipelineWorker:
                 command_summary=launch.command_summary,
             )
         except Exception:
-            job_service.terminate_process_tree(process.pid, process, timeout=3.0)
-            log_file.close()
+            self._remember_unresolved_launch(job_id)
+            try:
+                termination = terminate_verified_process_tree(
+                    pid=managed.pid,
+                    expected_create_time=managed.process_create_time,
+                    process_group_id=managed.process_group_id,
+                    graceful_timeout=min(self.cancel_grace_seconds, 3.0),
+                )
+                if termination.terminated:
+                    self.repository.fail_process(
+                        job_id,
+                        worker_id=self.worker_id,
+                        instance_token=self.instance_token,
+                        launch_token=launch_token,
+                        failure_code="process_registration_failed",
+                        event_type="job.process_registration_failed",
+                        exit_code=process.poll(),
+                    )
+                    self._unresolved_job_ids = tuple(
+                        unresolved_job_id
+                        for unresolved_job_id in self._unresolved_job_ids
+                        if unresolved_job_id != job_id
+                    )
+                    self._last_reconcile_result = ReconcileResult(
+                        safe_to_schedule=not self._unresolved_job_ids,
+                        unresolved_job_ids=self._unresolved_job_ids,
+                    )
+                else:
+                    self.repository.mark_launch_identity_unresolved(
+                        job_id,
+                        worker_id=self.worker_id,
+                        instance_token=self.instance_token,
+                        launch_token=launch_token,
+                    )
+            finally:
+                log_file.close()
             raise
         self._managed[job_id] = managed
 
     def _cancel_managed(self, managed: ManagedProcess) -> None:
-        self.repository.claim_cancel_command(
+        if not self.repository.acquire_worker_lease(
+            self.worker_id,
+            self.instance_token,
+            lease_seconds=self.lease_seconds,
+        ):
+            raise RuntimeError("The worker could not renew the global lease before canceling.")
+        command = self.repository.claim_cancel_command(
             managed.job_id,
             worker_id=self.worker_id,
             instance_token=self.instance_token,
         )
+        if command is None or command["status"] not in {"pending", "claimed"}:
+            return
         result = terminate_verified_process_tree(
             pid=managed.pid,
             expected_create_time=managed.process_create_time,
             process_group_id=managed.process_group_id,
             graceful_timeout=self.cancel_grace_seconds,
+            force_timeout=FORCE_CANCEL_SECONDS,
         )
         if result.reason == "process_identity_mismatch":
             self._fail_managed(
@@ -334,6 +419,11 @@ class PipelineWorker:
             )
             return
         if result.reason == "process_missing":
+            if managed.process is not None:
+                exit_code = managed.process.poll()
+                if exit_code is not None:
+                    self._finish_managed(managed, exit_code)
+                    return
             self._fail_managed(
                 managed,
                 "process_exited_without_checkpoint",
@@ -361,24 +451,18 @@ class PipelineWorker:
 
     def _monitor_managed(self) -> None:
         for managed in list(self._managed.values()):
+            if managed.process is not None:
+                exit_code = managed.process.poll()
+                if exit_code is not None:
+                    self._finish_managed(managed, exit_code)
+                    continue
+
             command = self.repository.get_cancel_command(managed.job_id)
             if command is not None and command["status"] in {"pending", "claimed"}:
                 self._cancel_managed(managed)
                 continue
 
-            if managed.process is not None:
-                exit_code = managed.process.poll()
-                if exit_code is not None:
-                    self.repository.finish_process(
-                        managed.job_id,
-                        worker_id=self.worker_id,
-                        instance_token=self.instance_token,
-                        launch_token=managed.launch_token,
-                        exit_code=exit_code,
-                    )
-                    self._forget(managed.job_id)
-                    continue
-            else:
+            if managed.process is None:
                 identity = process_identity_status(
                     managed.pid,
                     managed.process_create_time,
@@ -412,12 +496,16 @@ class PipelineWorker:
         )
         if not lease_owned:
             self._detach_all()
+            self._unresolved_job_ids = ()
+            self._last_reconcile_result = ReconcileResult(True, ())
             self._lease_owned = False
             self._reconciled = False
             return False
         self._lease_owned = True
-        if not self._reconciled:
-            self._reconcile()
+        if not self._reconciled or self._unresolved_job_ids:
+            reconciliation = self._reconcile()
+            if not reconciliation.safe_to_schedule:
+                return True
 
         while (
             self.repository.cancel_next_queued_job(
@@ -454,6 +542,8 @@ class PipelineWorker:
             )
         self._lease_owned = False
         self._reconciled = False
+        self._unresolved_job_ids = ()
+        self._last_reconcile_result = ReconcileResult(True, ())
         for job_id in list(self._managed):
             self._forget(job_id)
 

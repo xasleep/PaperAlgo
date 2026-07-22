@@ -244,6 +244,83 @@ def test_sqlite_cancel_is_idempotent_command_without_legacy_side_effects(
         ).fetchone()[0] == 1
 
 
+def test_sqlite_unresolved_launch_is_detached_redacted_and_not_cancelable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / ".local" / "paper2code.db"
+    monkeypatch.setenv("JOB_RUNTIME", "sqlite")
+    monkeypatch.setenv("PAPER2CODE_DB_PATH", str(db_path))
+    monkeypatch.setattr(job_service, "RUNS_DIR", tmp_path / "runs")
+    repository = JobRepository(db_path)
+    repository.create_job(
+        job_id="unresolved_job",
+        request=_payload("0" * 32),
+        paper_name="paper",
+    )
+    assert repository.acquire_worker_lease("worker", "instance-secret") is True
+    repository.claim_next_queued_job(
+        worker_id="worker",
+        instance_token="instance-secret",
+        launch_token="launch-secret",
+    )
+    repository.mark_launch_identity_unresolved(
+        "unresolved_job",
+        worker_id="worker",
+        instance_token="instance-secret",
+        launch_token="launch-secret",
+    )
+    assert repository.release_worker_lease("worker", "instance-secret") is True
+    legacy_calls: list[str] = []
+
+    def forbidden_legacy_cancel(job_id: str):
+        legacy_calls.append(job_id)
+        raise AssertionError("sqlite unresolved cancel must not enter legacy runtime")
+
+    monkeypatch.setattr(main_module, "cancel_job", forbidden_legacy_cancel)
+    with TestClient(
+        main_module.app,
+        base_url=LOCAL_ORIGIN,
+        raise_server_exceptions=False,
+    ) as client:
+        headers = _authorize(client)
+        listed = client.get(f"{API_PREFIX}/jobs")
+        detail = client.get(f"{API_PREFIX}/jobs/unresolved_job")
+        canceled = client.post(
+            f"{API_PREFIX}/jobs/unresolved_job/cancel",
+            headers=headers,
+        )
+
+    assert listed.status_code == detail.status_code == 200
+    list_item = listed.json()["jobs"][0]
+    for view in (list_item, detail.json()):
+        assert view["status"] == "running"
+        assert view["process_state"] == "detached"
+        assert view["process_active"] is False
+        assert view["cancelable"] is False
+        assert view["cancel_unavailable_reason"] == "process_identity_unresolved"
+        assert view["message"] == (
+            "Pipeline launch identity is unresolved; new work is blocked for safety."
+        )
+        for forbidden_field in (
+            "pid",
+            "process_create_time",
+            "process_group_id",
+            "launch_token",
+            "instance_token",
+            "command_summary",
+        ):
+            assert forbidden_field not in view
+    assert canceled.status_code == 409
+    assert canceled.json()["error"]["code"] == "job_not_cancelable"
+    assert canceled.json()["error"]["details"] == {
+        "reason": "process_identity_unresolved"
+    }
+    assert repository.get_job("unresolved_job")["execution_status"] == "running"
+    assert repository.get_cancel_command("unresolved_job") is None
+    assert legacy_calls == []
+
+
 def test_legacy_runtime_keeps_existing_start_path(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
