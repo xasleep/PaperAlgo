@@ -6,7 +6,7 @@
 
 本仓库的执行内核是 `codes/run_pipeline.py` 及现有阶段脚本；`web_api/` 是 FastAPI 控制面，`web_ui/` 是 React + Vite 本地控制台。FastAPI 以子进程启动 Pipeline，任务状态和 artifacts 保存在本地文件系统。
 
-当前没有 SQLite、SSE、WebSocket、Celery、Redis、PostgreSQL、Kubernetes 或 LangGraph。WebUI 对活跃任务每 2 秒轮询，FastAPI 只支持单实例、单 worker。
+当前提供标准库 SQLite 持久化控制面，但默认 `JOB_RUNTIME=legacy` 仍保持既有子进程行为；`JOB_RUNTIME=sqlite` 只创建 queued job，尚未实现完整 Worker。当前没有 SSE、WebSocket、Celery、Redis、PostgreSQL、Kubernetes 或 LangGraph。WebUI 对活跃任务每 2 秒轮询，FastAPI 只支持单实例、单 worker。
 
 ## 验证命令
 
@@ -57,7 +57,7 @@ Set-Location ..
 ## 已知限制
 
 - `.local/web_settings.json` 是本地明文 JSON；接口脱敏和本地 ACL 不等于加密凭据存储。
-- 状态/摘要 JSON 可能在进程中断时损坏；读取侧有容错，但当前没有数据库事务或迁移。
+- legacy 状态/摘要 JSON 仍可能在进程中断时损坏；sqlite 模式已有事务和 migration，但尚无 Worker 消费与恢复协议。
 - FastAPI 重启后不能重新接管已启动的 Pipeline 子进程。
 - 历史 repo zip 没有自动清理策略。
 - `pdf_markdown_path` 被限制在 `runs/` 下，但尚未收紧到当前 job 子目录。

@@ -81,6 +81,10 @@ class JobCreateResponse(BaseModel):
     run_dir: str
     status_path: str
     summary_path: str
+    execution_status: str | None = None
+    evaluation_status: str | None = None
+    quality_status: str | None = None
+    version: int | None = None
 
 
 class CancelResponse(BaseModel):
@@ -110,6 +114,10 @@ class JobListItem(BaseModel):
     repo_status: str | None = None
     eval_score: float | None = None
     run_dir: str
+    execution_status: str | None = None
+    evaluation_status: str | None = None
+    quality_status: str | None = None
+    version: int | None = None
 
 
 class JobListResponse(BaseModel):

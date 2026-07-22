@@ -9,6 +9,7 @@ RUNS_DIR = REPO_ROOT / "runs"
 LOCAL_DIR = REPO_ROOT / ".local"
 UPLOADS_DIR = LOCAL_DIR / "uploads"
 SETTINGS_PATH = LOCAL_DIR / "web_settings.json"
+DEFAULT_DB_PATH = LOCAL_DIR / "paper2code.db"
 API_PREFIX = "/api/v1"
 MAX_PDF_UPLOAD_BYTES = 100 * 1024 * 1024
 MAX_MULTIPART_OVERHEAD_BYTES = 1 * 1024 * 1024
@@ -39,6 +40,19 @@ def configured_trusted_hosts() -> list[str]:
 
 
 TRUSTED_HOSTS = configured_trusted_hosts()
+
+
+def configured_database_path() -> Path:
+    configured = os.environ.get("PAPER2CODE_DB_PATH", "").strip()
+    return Path(configured) if configured else DEFAULT_DB_PATH
+
+
+def configured_job_runtime() -> str:
+    runtime = os.environ.get("JOB_RUNTIME", "legacy").strip().lower()
+    if runtime not in {"legacy", "sqlite"}:
+        raise ValueError("JOB_RUNTIME must be either 'legacy' or 'sqlite'.")
+    return runtime
+
 
 PROVIDERS = {"deepseek", "kimi", "qwen", "claude", "openai"}
 DOMAINS = {"general", "statistics"}

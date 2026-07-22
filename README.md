@@ -22,7 +22,7 @@
 - `web_ui/` 已实现 settings、创建任务、任务列表、状态/日志/文件查看、取消任务和仓库下载。开发模式直连 FastAPI；构建后的 `web_ui/dist/` 可由 FastAPI 同源托管。
 - `web_api/` 是轻量控制面，负责输入校验、本地 settings、任务进程和 artifacts。它通过子进程调用 `codes/run_pipeline.py`，不替代执行内核。
 - `codes/run_pipeline.py` 负责 MinerU、规划、分析、编码、评测和可选自动修复的阶段编排。
-- 当前任务元数据和 settings 使用 `.local/`、`runs/` 下的 JSON/文件存储；当前 checkout **没有** SQLite 数据库。
+- 默认 `JOB_RUNTIME=legacy` 继续使用 `runs/` 下的 JSON/文件状态并直接启动 Pipeline；`JOB_RUNTIME=sqlite` 使用 `.local/paper2code.db` 创建持久化 queued job，但当前尚未提供消费队列的完整 Worker。
 - 当前 WebUI 对运行中任务每 2 秒轮询；当前 checkout **没有** SSE 或 WebSocket 事件接口。
 - 活跃进程句柄保存在单个 FastAPI 进程的内存中，因此只支持单实例、单 worker 运行。
 
@@ -76,6 +76,15 @@ Set-Location ..
 
 随后打开 `http://127.0.0.1:8000`。`web_ui/dist/` 是生成物，不进入版本管理。
 
+SQLite 过渡模式可在启动前显式启用；数据库路径可通过 `PAPER2CODE_DB_PATH` 覆盖：
+
+```powershell
+$env:JOB_RUNTIME="sqlite"
+$env:PAPER2CODE_DB_PATH=Join-Path (Get-Location) ".local\paper2code.db"
+```
+
+该模式的 `POST /api/v1/jobs` 支持 `Idempotency-Key`，只持久化 queued 控制面记录，不直接启动子进程。需要实际执行 Pipeline 时仍应使用默认 `legacy` 模式；完整 Worker 属于后续工作。
+
 ## Provider 配置原则
 
 WebUI 的 Settings 页面分别配置复现模型和评测模型，当前 schema 支持 `deepseek`、`kimi`、`qwen`、`claude`、`openai`。模型名称必须与实际 Provider 一致；自定义 `base_url` 应指向对应的 OpenAI-compatible API 根地址，而不是 Provider 官网页面。评测模型可以配置 fallback 模型链。
@@ -122,4 +131,4 @@ Set-Location ..
 - CORS 白名单只为本地 Vite 开发服务，不是身份认证机制。
 - 只运行一个 FastAPI worker；多 worker 会分裂内存中的进程登记和取消语义。
 - `.local/`、`runs/`、`outputs/`、`results/` 和 MinerU 产物可能含论文、日志或模型输出，均应留在本机且不提交。
-- API key、完整 Prompt 和完整模型响应不得写入状态接口、事件或未来的数据库元数据。
+- API key、完整 Prompt 和完整模型响应不得写入状态接口、SQLite 事件或其他数据库元数据。

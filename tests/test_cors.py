@@ -51,13 +51,14 @@ def test_settings_preflight_allows_local_vite_origin(client: TestClient) -> None
         headers={
             "Origin": ALLOWED_ORIGIN,
             "Access-Control-Request-Method": "POST",
-            "Access-Control-Request-Headers": "content-type,x-csrf-token",
+            "Access-Control-Request-Headers": "content-type,idempotency-key,x-csrf-token",
         },
     )
 
     assert response.status_code == 200
     assert response.headers["access-control-allow-origin"] == ALLOWED_ORIGIN
     assert response.headers["access-control-allow-credentials"] == "true"
+    assert "idempotency-key" in response.headers["access-control-allow-headers"].lower()
 
 
 def test_settings_preflight_does_not_allow_public_origin(client: TestClient) -> None:

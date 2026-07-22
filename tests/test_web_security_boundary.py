@@ -277,6 +277,52 @@ def test_cross_site_fetch_metadata_is_rejected_before_mutation(
     assert called is False
 
 
+def test_sqlite_cancel_security_checks_precede_repository_and_legacy_cancel(
+    secure_client: tuple[TestClient, Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, _, _ = secure_client
+    monkeypatch.setenv("JOB_RUNTIME", "sqlite")
+    repository_calls: list[str] = []
+    cancel_calls: list[str] = []
+
+    def forbidden_repository() -> None:
+        repository_calls.append("repository")
+        raise AssertionError(
+            "security middleware must reject before repository access"
+        )
+
+    monkeypatch.setattr(main_module, "_sqlite_repository", forbidden_repository)
+    monkeypatch.setattr(
+        main_module,
+        "cancel_job",
+        lambda job_id: cancel_calls.append(job_id),
+    )
+    authorized = _session_headers(client)
+
+    evil_origin = client.post(
+        f"{API_PREFIX}/jobs/job1/cancel",
+        headers={**authorized, "Origin": EVIL_ORIGIN},
+    )
+    missing_csrf = client.post(
+        f"{API_PREFIX}/jobs/job1/cancel",
+        headers={"Origin": LOCAL_ORIGIN},
+    )
+    cross_site = client.post(
+        f"{API_PREFIX}/jobs/job1/cancel",
+        headers={**authorized, "Sec-Fetch-Site": "cross-site"},
+    )
+
+    assert evil_origin.status_code == 403
+    assert evil_origin.json()["error"]["code"] == "origin_not_allowed"
+    assert missing_csrf.status_code == 403
+    assert missing_csrf.json()["error"]["code"] == "csrf_failed"
+    assert cross_site.status_code == 403
+    assert cross_site.json()["error"]["code"] == "cross_site_request"
+    assert repository_calls == []
+    assert cancel_calls == []
+
+
 def test_untrusted_host_is_rejected_with_json() -> None:
     client = TestClient(
         main_module.app,

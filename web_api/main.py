@@ -1,4 +1,7 @@
-from fastapi import APIRouter, FastAPI, File, Query, Request, UploadFile
+from pathlib import Path
+from threading import Lock
+
+from fastapi import APIRouter, FastAPI, File, Header, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from starlette.concurrency import run_in_threadpool
@@ -10,11 +13,20 @@ from .artifact_service import (
     read_repo_file,
     repo_tree,
 )
-from .config import API_PREFIX, LOCAL_DEV_CORS_ORIGINS, TRUSTED_HOSTS
+from . import job_service as job_service_module
+from .config import (
+    API_PREFIX,
+    LOCAL_DEV_CORS_ORIGINS,
+    TRUSTED_HOSTS,
+    configured_database_path,
+    configured_job_runtime,
+)
+from .database import normalize_database_path
 from .errors import (
     FeatureNotSupportedError,
     InternalApiError,
     InvalidParameterError,
+    JobNotCancelableError,
     SettingsNotConfiguredError,
     install_exception_handlers,
 )
@@ -29,7 +41,9 @@ from .job_service import (
     save_upload,
     start_job,
 )
+from .job_repository import JobRepository
 from .log_service import list_logs, read_log
+from .path_security import validate_job_id
 from .schemas import (
     ArtifactSummaryResponse,
     CancelResponse,
@@ -70,7 +84,7 @@ app.add_middleware(
     allow_origins=LOCAL_DEV_CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Accept", "Content-Type", "X-CSRF-Token"],
+    allow_headers=["Accept", "Content-Type", "Idempotency-Key", "X-CSRF-Token"],
 )
 app.add_middleware(UploadBodyLimitMiddleware)
 app.add_middleware(LocalRequestSecurityMiddleware)
@@ -80,6 +94,20 @@ install_exception_handlers(app)
 api = APIRouter(prefix=API_PREFIX)
 MIN_GENERATED_N = 1
 MAX_GENERATED_N = 32
+_REPOSITORY_CACHE_LOCK = Lock()
+_SQLITE_REPOSITORIES: dict[Path, JobRepository] = {}
+
+
+def _sqlite_repository() -> JobRepository:
+    database_path = normalize_database_path(configured_database_path())
+    with _REPOSITORY_CACHE_LOCK:
+        repository = _SQLITE_REPOSITORIES.get(database_path)
+        if repository is None:
+            repository = JobRepository(database_path)
+            _SQLITE_REPOSITORIES[database_path] = repository
+        return repository
+
+
 MAX_REPAIR_ROUNDS_LIMIT = 10
 
 
@@ -176,9 +204,75 @@ def _validate_job_parameters(payload: JobCreateRequest) -> None:
         )
 
 
-@api.post("/jobs", response_model=JobCreateResponse)
-def create_job(payload: JobCreateRequest) -> JobCreateResponse:
+def _job_request_dict(payload: JobCreateRequest) -> dict[str, object]:
+    if hasattr(payload, "model_dump"):
+        return payload.model_dump(mode="json")
+    return payload.dict()
+
+
+def _sqlite_job_view(job: dict[str, object]) -> JsonDict:
+    job_id = str(job["job_id"])
+    execution_status = str(job["execution_status"])
+    run_dir = job_service_module.RUNS_DIR / job_id
+    terminal = execution_status in {"completed", "failed", "canceled"}
+    return {
+        **job,
+        "status": execution_status,
+        "process_state": "none",
+        "cancelable": False,
+        "cancel_unavailable_reason": (
+            "already_finished" if terminal else "process_not_registered"
+        ),
+        "process_active": False,
+        "stage": execution_status,
+        "message": (
+            "Queued for the SQLite worker runtime."
+            if execution_status == "queued"
+            else None
+        ),
+        "repo_status": None,
+        "eval_score": None,
+        "run_dir": str(run_dir),
+    }
+
+
+def _sqlite_create_response(job: dict[str, object]) -> JobCreateResponse:
+    view = _sqlite_job_view(job)
+    run_dir = job_service_module.RUNS_DIR / str(job["job_id"])
+    return JobCreateResponse(
+        job_id=str(job["job_id"]),
+        status=str(view["status"]),
+        run_dir=str(run_dir),
+        status_path=str(run_dir / "run_status.json"),
+        summary_path=str(run_dir / "run_summary.json"),
+        execution_status=str(job["execution_status"]),
+        evaluation_status=str(job["evaluation_status"]),
+        quality_status=str(job["quality_status"]),
+        version=int(job["version"]),
+    )
+
+
+@api.post(
+    "/jobs",
+    response_model=JobCreateResponse,
+    response_model_exclude_none=True,
+)
+def create_job(
+    payload: JobCreateRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> JobCreateResponse:
     _validate_job_parameters(payload)
+    runtime = configured_job_runtime()
+    request_data = _job_request_dict(payload)
+    repository = _sqlite_repository() if runtime == "sqlite" else None
+    if repository is not None:
+        replay = repository.find_idempotent_job(
+            request=request_data,
+            idempotency_key=idempotency_key,
+        )
+        if replay is not None:
+            return _sqlite_create_response(replay)
+
     settings = load_settings()
     if settings is None:
         raise SettingsNotConfiguredError()
@@ -186,6 +280,15 @@ def create_job(payload: JobCreateRequest) -> JobCreateResponse:
     pdf_path = resolve_upload(payload.upload_id)
     resolved_paper_name = sanitize_name(payload.paper_name, "paper")
     job_id = make_job_id(resolved_paper_name)
+    if repository is not None:
+        job, _ = repository.create_job(
+            job_id=job_id,
+            request=request_data,
+            paper_name=resolved_paper_name,
+            idempotency_key=idempotency_key,
+        )
+        return _sqlite_create_response(job)
+
     job = start_job(
         job_id=job_id,
         pdf_path=pdf_path,
@@ -203,18 +306,37 @@ def create_job(payload: JobCreateRequest) -> JobCreateResponse:
     return JobCreateResponse(**job)
 
 
-@api.get("/jobs", response_model=JobListResponse)
+@api.get(
+    "/jobs",
+    response_model=JobListResponse,
+    response_model_exclude_none=True,
+)
 def jobs(limit: int = Query(default=50, ge=1, le=200)) -> JobListResponse:
+    if configured_job_runtime() == "sqlite":
+        repository = _sqlite_repository()
+        return JobListResponse(
+            jobs=[_sqlite_job_view(job) for job in repository.list_jobs(limit=limit)]
+        )
     return JobListResponse(jobs=list_jobs(limit=limit))
 
 
 @api.get("/jobs/{job_id}", response_model=None)
 def job_status(job_id: str) -> JsonDict:
+    if configured_job_runtime() == "sqlite":
+        repository = _sqlite_repository()
+        return _sqlite_job_view(repository.get_job(validate_job_id(job_id)))
     return get_job_status(job_id)
 
 
 @api.post("/jobs/{job_id}/cancel", response_model=CancelResponse)
 def cancel(job_id: str) -> CancelResponse:
+    if configured_job_runtime() == "sqlite":
+        repository = _sqlite_repository()
+        repository.get_job(validate_job_id(job_id))
+        raise JobNotCancelableError(
+            "sqlite_worker_not_implemented",
+            "SQLite job cancellation requires worker support that is not implemented.",
+        )
     canceled, message = cancel_job(job_id)
     return CancelResponse(job_id=job_id, canceled=canceled, message=message)
 

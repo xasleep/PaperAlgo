@@ -1,6 +1,6 @@
 # ADR 0002：SQLite 与单 worker 约束
 
-- 状态：已接受（方向性决策，PR-00 未实现）
+- 状态：已接受（PR-03 已实现持久化控制面，完整 Worker 尚未实现）
 - 日期：2026-07-14
 
 ## 背景
@@ -11,12 +11,14 @@
 
 ## 决策
 
-- 后续元数据持久化如被实现，选择仓库本地 SQLite，而不是外部数据库服务。
+- 控制面元数据使用仓库本地 SQLite，而不是外部数据库服务；默认路径为 `.local/paper2code.db`，可由 `PAPER2CODE_DB_PATH` 显式覆盖。
 - FastAPI 始终以单进程、单 worker 运行；SQLite 访问和子进程登记都服从这一约束。
 - 大型 artifacts、日志和生成仓库继续保存在 `runs/<job_id>/`，不写入数据库 BLOB。
 - API key、完整 Prompt 和完整模型响应不得写入 SQLite；数据库只保存控制面所需的最小、脱敏元数据。
-- PR-00 只记录决策，不创建 schema、迁移或数据库代码。
+- 使用标准库 `sqlite3`、编号 migration、WAL、foreign keys 和 busy timeout，不引入 ORM。
+- `JOB_RUNTIME=legacy|sqlite` 提供过渡边界：legacy 保持现有子进程行为；sqlite 只创建 queued job，不直接启动 Pipeline。
+- SQLite 状态拆分为 execution、evaluation、quality 三个轴；所有状态更新经统一验证入口并使用 version 乐观锁。
 
 ## 后果
 
-该选择符合 Windows 本地部署并降低运维成本，但不支持横向扩展或多 worker 高可用。真正引入 SQLite 时必须用测试定义事务、迁移、崩溃恢复和文件权限行为。
+该选择符合 Windows 本地部署并降低运维成本，但不支持横向扩展或多 worker 高可用。PR-03 仅建立持久化事实源、幂等创建和未来 Worker 所需的表；lease 获取、命令消费、阶段执行、恢复与完整 Worker 生命周期仍属于后续工作。

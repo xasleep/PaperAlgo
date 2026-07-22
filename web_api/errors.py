@@ -122,6 +122,24 @@ class FeatureNotSupportedError(ContractError, ValueError):
     default_message = "The requested feature is not supported by the local Web API."
 
 
+class IdempotencyConflictError(ContractError, ValueError):
+    status_code = 409
+    code = "idempotency_conflict"
+    default_message = "Idempotency-Key was already used with a different request."
+
+
+class InvalidStateTransitionError(ContractError, ValueError):
+    status_code = 409
+    code = "invalid_state_transition"
+    default_message = "The requested job state transition is not allowed."
+
+
+class OptimisticLockConflictError(ContractError):
+    status_code = 409
+    code = "optimistic_lock_conflict"
+    default_message = "The job was updated by another control-plane operation."
+
+
 class TextEncodingNotSupportedError(ContractError, ValueError):
     status_code = 415
     code = "unsupported_file_type"
