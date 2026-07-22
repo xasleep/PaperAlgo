@@ -321,6 +321,91 @@ def test_sqlite_unresolved_launch_is_detached_redacted_and_not_cancelable(
     assert legacy_calls == []
 
 
+def test_sqlite_recovery_status_is_limited_and_redacts_process_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / ".local" / "paper2code.db"
+    monkeypatch.setenv("JOB_RUNTIME", "sqlite")
+    monkeypatch.setenv("PAPER2CODE_DB_PATH", str(db_path))
+    monkeypatch.setattr(job_service, "RUNS_DIR", tmp_path / "runs")
+    repository = JobRepository(db_path)
+    repository.create_job(
+        job_id="recovery_view",
+        request=_payload("0" * 32),
+        paper_name="paper",
+    )
+    assert repository.acquire_worker_lease("worker", "instance-secret")
+    repository.claim_next_queued_job(
+        worker_id="worker",
+        instance_token="instance-secret",
+        launch_token="old-launch-secret",
+    )
+    repository.record_process_started(
+        "recovery_view",
+        worker_id="worker",
+        instance_token="instance-secret",
+        launch_token="old-launch-secret",
+        pid=12345,
+        process_create_time="create-12345",
+        process_group_id=12345,
+        command_summary="python run_pipeline.py --job-id redacted",
+    )
+    repository.record_completed_checkpoint(
+        "recovery_view",
+        worker_id="worker",
+        instance_token="instance-secret",
+        launch_token="old-launch-secret",
+        checkpoint={
+            "version": 1,
+            "stage_name": "planning",
+            "stage_sequence": 2,
+            "stage_attempt": 2,
+            "status": "completed",
+            "resume_from_stage": "extract_config",
+        },
+        checkpoint_path="checkpoints/checkpoint-0002-planning-002.json",
+    )
+    repository.prepare_recovery_attempt(
+        "recovery_view",
+        worker_id="worker",
+        instance_token="instance-secret",
+        launch_token="old-launch-secret",
+        new_launch_token="new-launch-secret",
+        resume_from_stage="extract_config",
+        resume_stage_sequence=3,
+        resume_stage_attempt=3,
+    )
+    assert repository.release_worker_lease("worker", "instance-secret")
+
+    with TestClient(main_module.app, base_url=LOCAL_ORIGIN) as client:
+        response = client.get(f"{API_PREFIX}/jobs/recovery_view")
+
+    assert response.status_code == 200
+    view = response.json()
+    assert view["status"] == "running"
+    assert view["stage"] == "extract_config"
+    assert view["current_stage"] == "extract_config"
+    assert view["stage_attempt"] == 3
+    assert view["last_checkpoint_stage"] == "planning"
+    assert view["recovery_count"] == 1
+    assert view["recovery_status"] == "prepared"
+    assert view["recovery_error_code"] is None
+    assert view["message"] == (
+        "Pipeline recovery is starting from the last verified stage boundary."
+    )
+    for forbidden_field in (
+        "pid",
+        "process_create_time",
+        "process_group_id",
+        "launch_token",
+        "instance_token",
+        "command_summary",
+        "checkpoint_path",
+    ):
+        assert forbidden_field not in view
+
+
 def test_legacy_runtime_keeps_existing_start_path(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

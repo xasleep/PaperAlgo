@@ -9,6 +9,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from codes.checkpoint_protocol import (
+    CHECKPOINT_STAGES,
+    CHECKPOINT_STATUSES,
+    checkpoint_stage_order_is_valid,
+    checkpoint_relative_path,
+)
+
 from .database import connect_database, initialize_database, utc_now
 from .errors import (
     IdempotencyConflictError,
@@ -38,6 +45,7 @@ REQUEST_FIELDS = frozenset(
 EVENT_SOURCES = frozenset({"control_plane", "pipeline_adapter", "recovery", "worker"})
 GLOBAL_WORKER_LEASE = "pipeline-worker"
 CANCEL_DEDUPE_HASH = hashlib.sha256(b"cancel:v1").hexdigest()
+DEFAULT_MAX_RECOVERIES = 1
 
 
 def _future_utc(seconds: float) -> str:
@@ -50,6 +58,16 @@ def _runtime_identifier(value: str, field: str) -> str:
         raise ValueError(f"{field} must contain between 1 and 256 characters.")
     if not value.isprintable():
         raise ValueError(f"{field} must contain printable characters.")
+    return value
+
+
+def _checkpoint_path(value: str) -> str:
+    if not isinstance(value, str) or not value or len(value) > 512:
+        raise ValueError("checkpoint_path must contain between 1 and 512 characters.")
+    if not value.isascii() or not value.isprintable() or "\\" in value:
+        raise ValueError("checkpoint_path must be a printable relative POSIX path.")
+    if value.startswith("/") or ":" in value or ".." in value.split("/"):
+        raise ValueError("checkpoint_path must be a printable relative POSIX path.")
     return value
 
 
@@ -654,7 +672,7 @@ class JobRepository:
                     connection, worker_id, instance_token, now
                 )
                 running = connection.execute(
-                    "SELECT 1 FROM jobs WHERE job_id = ? AND execution_status = 'running'",
+                    "SELECT * FROM jobs WHERE job_id = ? AND execution_status = 'running'",
                     (job_id,),
                 ).fetchone()
                 if running is None:
@@ -686,6 +704,32 @@ class JobRepository:
                 ).fetchone()
                 if process is None:
                     raise OptimisticLockConflictError()
+                if running["recovery_status"] == "prepared":
+                    next_version = int(running["version"]) + 1
+                    connection.execute(
+                        """
+                        UPDATE jobs
+                        SET recovery_status = 'running', version = ?, updated_at = ?
+                        WHERE job_id = ? AND version = ?
+                        """,
+                        (next_version, now, job_id, running["version"]),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO job_events (
+                            job_id, event_type, source, job_version,
+                            execution_status, evaluation_status, quality_status, created_at
+                        ) VALUES (?, 'job.recovery_started', 'recovery', ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            job_id,
+                            next_version,
+                            running["execution_status"],
+                            running["evaluation_status"],
+                            running["quality_status"],
+                            now,
+                        ),
+                    )
                 connection.commit()
                 return dict(process)
             except Exception:
@@ -789,6 +833,433 @@ class JobRepository:
                 ).fetchone()
                 connection.commit()
                 return dict(updated)
+            except Exception:
+                connection.rollback()
+                raise
+
+    def record_stage_checkpoint(
+        self,
+        job_id: str,
+        *,
+        worker_id: str,
+        instance_token: str,
+        launch_token: str,
+        checkpoint: Mapping[str, object],
+        checkpoint_path: str,
+    ) -> dict[str, Any]:
+        """Persist validated checkpoint metadata without storing artifact contents."""
+
+        job_id = validate_job_id(job_id)
+        worker_id = _runtime_identifier(worker_id, "worker_id")
+        instance_token = _runtime_identifier(instance_token, "instance_token")
+        launch_token = _runtime_identifier(launch_token, "launch_token")
+        checkpoint_path = _checkpoint_path(checkpoint_path)
+        checkpoint_version = checkpoint.get("version")
+        stage_name = checkpoint.get("stage_name")
+        stage_sequence = checkpoint.get("stage_sequence")
+        stage_attempt = checkpoint.get("stage_attempt")
+        status = checkpoint.get("status")
+        resume_from_stage = checkpoint.get("resume_from_stage")
+        error_code = checkpoint.get("error_code")
+        if (
+            not isinstance(checkpoint_version, int)
+            or isinstance(checkpoint_version, bool)
+            or checkpoint_version < 1
+        ):
+            raise ValueError("checkpoint version must be a positive integer.")
+        if not isinstance(stage_name, str) or stage_name not in CHECKPOINT_STAGES:
+            raise ValueError("checkpoint stage is not allowed.")
+        if (
+            not isinstance(stage_sequence, int)
+            or isinstance(stage_sequence, bool)
+            or stage_sequence < 1
+        ):
+            raise ValueError("checkpoint stage_sequence must be a positive integer.")
+        if (
+            not isinstance(stage_attempt, int)
+            or isinstance(stage_attempt, bool)
+            or stage_attempt < 1
+        ):
+            raise ValueError("checkpoint stage_attempt must be a positive integer.")
+        if not isinstance(status, str) or status not in CHECKPOINT_STATUSES:
+            raise ValueError("checkpoint status is not allowed.")
+        if not checkpoint_stage_order_is_valid(stage_name, stage_sequence):
+            raise ValueError("checkpoint stage order is invalid.")
+        if checkpoint_path != checkpoint_relative_path(checkpoint):
+            raise ValueError("checkpoint_path does not match the server-defined key.")
+        if resume_from_stage is not None and (
+            not isinstance(resume_from_stage, str)
+            or resume_from_stage not in CHECKPOINT_STAGES
+        ):
+            raise ValueError("checkpoint resume stage is not allowed.")
+        if error_code is not None:
+            error_code = _runtime_identifier(str(error_code), "error_code")
+        if status == "running" and (resume_from_stage is not None or error_code is not None):
+            raise ValueError("running checkpoint metadata is inconsistent.")
+        if status == "completed" and error_code is not None:
+            raise ValueError("completed checkpoint metadata is inconsistent.")
+        if status == "failed" and (error_code is None or resume_from_stage is not None):
+            raise ValueError("failed checkpoint metadata is inconsistent.")
+        now = utc_now()
+        with closing(connect_database(self.database_path)) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                self._assert_current_lease(
+                    connection, worker_id, instance_token, now
+                )
+                job = connection.execute(
+                    "SELECT * FROM jobs WHERE job_id = ?", (job_id,)
+                ).fetchone()
+                process = connection.execute(
+                    "SELECT * FROM job_processes WHERE job_id = ?", (job_id,)
+                ).fetchone()
+                if job is None or process is None:
+                    raise JobNotFoundError()
+                if (
+                    job["execution_status"] != "running"
+                    or process["launch_token"] != launch_token
+                    or process["launch_state"] not in {"registered", "exited"}
+                ):
+                    raise OptimisticLockConflictError()
+                existing = connection.execute(
+                    """
+                    SELECT * FROM stage_runs
+                    WHERE job_id = ? AND stage_name = ? AND attempt = ?
+                    """,
+                    (job_id, stage_name, stage_attempt),
+                ).fetchone()
+                if existing is not None:
+                    identity = (
+                        existing["stage_sequence"] == stage_sequence
+                        and existing["checkpoint_version"] == checkpoint_version
+                        and existing["checkpoint_path"] == checkpoint_path
+                        and existing["launch_token"] == launch_token
+                    )
+                    if not identity:
+                        raise OptimisticLockConflictError()
+                    if existing["status"] == status:
+                        connection.commit()
+                        return dict(existing)
+                    if existing["status"] != "running" or status == "running":
+                        raise OptimisticLockConflictError()
+                    next_stage_version = int(existing["version"]) + 1
+                    connection.execute(
+                        """
+                        UPDATE stage_runs
+                        SET status = ?, version = ?, error_code = ?,
+                            resume_from_stage = ?, resume_eligible = ?,
+                            finished_at = ?, updated_at = ?
+                        WHERE id = ? AND version = ?
+                        """,
+                        (
+                            status,
+                            next_stage_version,
+                            error_code,
+                            resume_from_stage,
+                            int(status == "completed" and resume_from_stage is not None),
+                            now,
+                            now,
+                            existing["id"],
+                            existing["version"],
+                        ),
+                    )
+                else:
+                    connection.execute(
+                        """
+                        INSERT INTO stage_runs (
+                            job_id, stage_name, attempt, status, version,
+                            error_code, started_at, finished_at, created_at, updated_at,
+                            stage_sequence, checkpoint_version, checkpoint_path,
+                            resume_from_stage, resume_eligible, launch_token
+                        ) VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            job_id,
+                            stage_name,
+                            stage_attempt,
+                            status,
+                            error_code,
+                            now,
+                            now if status != "running" else None,
+                            now,
+                            now,
+                            stage_sequence,
+                            checkpoint_version,
+                            checkpoint_path,
+                            resume_from_stage,
+                            int(status == "completed" and resume_from_stage is not None),
+                            launch_token,
+                        ),
+                    )
+                next_job_version = int(job["version"]) + 1
+                connection.execute(
+                    """
+                    UPDATE jobs
+                    SET current_stage = ?, current_stage_attempt = ?,
+                        last_checkpoint_stage = CASE
+                            WHEN ? = 'completed' THEN ? ELSE last_checkpoint_stage END,
+                        version = ?, updated_at = ?
+                    WHERE job_id = ? AND version = ?
+                    """,
+                    (
+                        stage_name,
+                        stage_attempt,
+                        status,
+                        stage_name,
+                        next_job_version,
+                        now,
+                        job_id,
+                        job["version"],
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO job_events (
+                        job_id, event_type, source, job_version,
+                        execution_status, evaluation_status, quality_status, created_at
+                    ) VALUES (?, ?, 'pipeline_adapter', ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        job_id,
+                        f"job.stage_{status}",
+                        next_job_version,
+                        job["execution_status"],
+                        job["evaluation_status"],
+                        job["quality_status"],
+                        now,
+                    ),
+                )
+                row = connection.execute(
+                    """
+                    SELECT * FROM stage_runs
+                    WHERE job_id = ? AND stage_name = ? AND attempt = ?
+                    """,
+                    (job_id, stage_name, stage_attempt),
+                ).fetchone()
+                connection.commit()
+                return dict(row)
+            except Exception:
+                connection.rollback()
+                raise
+
+    def record_completed_checkpoint(
+        self,
+        job_id: str,
+        *,
+        worker_id: str,
+        instance_token: str,
+        launch_token: str,
+        checkpoint: Mapping[str, object],
+        checkpoint_path: str,
+    ) -> dict[str, Any]:
+        if checkpoint.get("status") != "completed":
+            raise ValueError("checkpoint must be completed.")
+        return self.record_stage_checkpoint(
+            job_id,
+            worker_id=worker_id,
+            instance_token=instance_token,
+            launch_token=launch_token,
+            checkpoint=checkpoint,
+            checkpoint_path=checkpoint_path,
+        )
+
+    def list_stage_runs(self, job_id: str) -> list[dict[str, Any]]:
+        job_id = validate_job_id(job_id)
+        with closing(connect_database(self.database_path)) as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM stage_runs
+                WHERE job_id = ?
+                ORDER BY stage_sequence ASC, attempt ASC, id ASC
+                """,
+                (job_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def prepare_recovery_attempt(
+        self,
+        job_id: str,
+        *,
+        worker_id: str,
+        instance_token: str,
+        launch_token: str,
+        new_launch_token: str,
+        resume_from_stage: str,
+        resume_stage_sequence: int,
+        resume_stage_attempt: int = 1,
+        max_recoveries: int = DEFAULT_MAX_RECOVERIES,
+        observed_exit_code: int | None = None,
+    ) -> dict[str, Any]:
+        job_id = validate_job_id(job_id)
+        worker_id = _runtime_identifier(worker_id, "worker_id")
+        instance_token = _runtime_identifier(instance_token, "instance_token")
+        launch_token = _runtime_identifier(launch_token, "launch_token")
+        new_launch_token = _runtime_identifier(new_launch_token, "new_launch_token")
+        if resume_from_stage not in CHECKPOINT_STAGES:
+            raise ValueError("resume_from_stage is not allowed.")
+        integer_values = (resume_stage_sequence, resume_stage_attempt, max_recoveries)
+        if any(
+            not isinstance(value, int) or isinstance(value, bool) or value < 1
+            for value in integer_values
+        ):
+            raise ValueError("Recovery sequence, attempt, and limit must be positive integers.")
+        if observed_exit_code is not None and (
+            not isinstance(observed_exit_code, int)
+            or isinstance(observed_exit_code, bool)
+        ):
+            raise ValueError("observed_exit_code must be an integer or None.")
+        now = utc_now()
+        with closing(connect_database(self.database_path)) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                self._assert_current_lease(
+                    connection, worker_id, instance_token, now
+                )
+                job = connection.execute(
+                    "SELECT * FROM jobs WHERE job_id = ?", (job_id,)
+                ).fetchone()
+                process = connection.execute(
+                    "SELECT * FROM job_processes WHERE job_id = ?", (job_id,)
+                ).fetchone()
+                if job is None or process is None:
+                    raise JobNotFoundError()
+                if (
+                    process["launch_token"] == new_launch_token
+                    and process["launch_state"] == "claimed"
+                    and job["execution_status"] == "running"
+                    and job["recovery_status"] == "prepared"
+                    and job["current_stage"] == resume_from_stage
+                    and job["current_stage_attempt"] == resume_stage_attempt
+                ):
+                    connection.commit()
+                    return _row_to_dict(job)
+                if (
+                    job["execution_status"] != "running"
+                    or process["launch_token"] != launch_token
+                    or process["launch_state"] != "registered"
+                    or process["pid"] is None
+                    or not process["process_create_time"]
+                    or process["process_group_id"] is None
+                ):
+                    raise OptimisticLockConflictError()
+                if int(job["recovery_count"]) >= max_recoveries:
+                    raise OptimisticLockConflictError(
+                        details={"reason": "recovery_attempts_exhausted"}
+                    )
+                pending_cancel = connection.execute(
+                    """
+                    SELECT 1 FROM job_commands
+                    WHERE job_id = ? AND command_type = 'cancel'
+                      AND status IN ('pending', 'claimed')
+                    LIMIT 1
+                    """,
+                    (job_id,),
+                ).fetchone()
+                if pending_cancel is not None:
+                    raise OptimisticLockConflictError(
+                        details={"reason": "cancel_requested"}
+                    )
+                completed = connection.execute(
+                    """
+                    SELECT 1 FROM stage_runs
+                    WHERE job_id = ? AND launch_token = ? AND status = 'completed'
+                      AND resume_from_stage = ? AND resume_eligible = 1
+                    LIMIT 1
+                    """,
+                    (job_id, launch_token, resume_from_stage),
+                ).fetchone()
+                if completed is None:
+                    raise OptimisticLockConflictError(
+                        details={"reason": "completed_checkpoint_missing"}
+                    )
+                process_attempt = int(process["process_attempt"])
+                connection.execute(
+                    """
+                    INSERT INTO job_process_history (
+                        job_id, process_attempt, worker_id, launch_token, pid,
+                        process_create_time, process_group_id, command_summary,
+                        heartbeat_at, started_at, exited_at, exit_code,
+                        launch_state, launch_error_code, archived_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                              'exited', 'checkpoint_recovery_replaced', ?)
+                    """,
+                    (
+                        job_id,
+                        process_attempt,
+                        process["worker_id"],
+                        process["launch_token"],
+                        process["pid"],
+                        process["process_create_time"],
+                        process["process_group_id"],
+                        process["command_summary"],
+                        process["heartbeat_at"],
+                        process["started_at"],
+                        now,
+                        observed_exit_code,
+                        now,
+                    ),
+                )
+                cursor = connection.execute(
+                    """
+                    UPDATE job_processes
+                    SET worker_id = ?, launch_token = ?, pid = NULL,
+                        process_create_time = NULL, process_group_id = NULL,
+                        command_summary = NULL, heartbeat_at = ?, started_at = NULL,
+                        exited_at = NULL, exit_code = NULL, launch_state = 'claimed',
+                        launch_error_code = NULL, process_attempt = ?
+                    WHERE job_id = ? AND launch_token = ? AND launch_state = 'registered'
+                    """,
+                    (
+                        worker_id,
+                        new_launch_token,
+                        now,
+                        process_attempt + 1,
+                        job_id,
+                        launch_token,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise OptimisticLockConflictError()
+                next_version = int(job["version"]) + 1
+                connection.execute(
+                    """
+                    UPDATE jobs
+                    SET recovery_count = recovery_count + 1,
+                        recovery_status = 'prepared', recovery_error_code = NULL,
+                        current_stage = ?, current_stage_attempt = ?,
+                        failure_code = NULL, version = ?, updated_at = ?
+                    WHERE job_id = ? AND version = ?
+                    """,
+                    (
+                        resume_from_stage,
+                        resume_stage_attempt,
+                        next_version,
+                        now,
+                        job_id,
+                        job["version"],
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO job_events (
+                        job_id, event_type, source, job_version,
+                        execution_status, evaluation_status, quality_status, created_at
+                    ) VALUES (?, 'job.recovery_prepared', 'recovery', ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        job_id,
+                        next_version,
+                        job["execution_status"],
+                        job["evaluation_status"],
+                        job["quality_status"],
+                        now,
+                    ),
+                )
+                updated = connection.execute(
+                    "SELECT * FROM jobs WHERE job_id = ?", (job_id,)
+                ).fetchone()
+                connection.commit()
+                return _row_to_dict(updated)
             except Exception:
                 connection.rollback()
                 raise
@@ -911,11 +1382,24 @@ class JobRepository:
                     execution_status=execution_status,
                 )
                 next_version = int(current["version"]) + 1
+                recovery_status = (
+                    "completed" if execution_status == "completed" else "failed"
+                )
+                recovery_error_code = (
+                    None
+                    if execution_status == "completed"
+                    else (failure_code or "recovery_canceled")
+                )
                 connection.execute(
                     """
                     UPDATE jobs
                     SET execution_status = ?, evaluation_status = ?,
-                        quality_status = ?, failure_code = ?, version = ?, updated_at = ?
+                        quality_status = ?, failure_code = ?,
+                        recovery_status = CASE
+                            WHEN recovery_count > 0 THEN ? ELSE recovery_status END,
+                        recovery_error_code = CASE
+                            WHEN recovery_count > 0 THEN ? ELSE recovery_error_code END,
+                        version = ?, updated_at = ?
                     WHERE job_id = ? AND version = ?
                     """,
                     (
@@ -923,6 +1407,8 @@ class JobRepository:
                         next_state.evaluation_status,
                         next_state.quality_status,
                         failure_code,
+                        recovery_status,
+                        recovery_error_code,
                         next_version,
                         now,
                         job_id,

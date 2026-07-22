@@ -12,6 +12,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, TextIO
 
+from codes.checkpoint_protocol import (
+    CheckpointProtocolError,
+    find_recovery_checkpoint,
+    latest_completed_checkpoint,
+    list_checkpoints,
+)
+from codes.task_manifest import TaskManifestError, load_task_manifest
+
 from . import job_service
 from .config import REPO_ROOT, configured_job_runtime
 from .errors import OptimisticLockConflictError, SettingsNotConfiguredError
@@ -46,10 +54,23 @@ class ManagedProcess:
 class ReconcileResult:
     safe_to_schedule: bool
     unresolved_job_ids: tuple[str, ...]
+    recovering_job_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ConfirmedExitDecision:
+    has_local_process: bool
+    observed_exit_code: int | None
+    cancel_pending: bool
+    identity_confirmed_dead: bool
+    recovery_allowed: bool
+    recovery_count: int
+    max_recoveries: int
 
 
 CommandBuilder = Callable[[dict[str, object]], LaunchSpec]
 FORCE_CANCEL_SECONDS = 5.0
+DEFAULT_MAX_RECOVERIES = 1
 
 
 def _default_worker_id() -> str:
@@ -72,8 +93,13 @@ def _pipeline_launch_spec(job: dict[str, object]) -> LaunchSpec:
         auto_refine=bool(job["auto_refine"]),
         max_repair_rounds=int(job["max_repair_rounds"]),
         console_output=str(job["console_output"]),  # type: ignore[arg-type]
-        skip_mineru=bool(job["skip_mineru"]),
+        skip_mineru=bool(job.get("_skip_mineru_for_resume", job["skip_mineru"])),
         pdf_markdown_path=str(job["pdf_markdown_path"]),
+        checkpoint_mode="sqlite",
+        resume_from_stage=str(job.get("_resume_from_stage") or ""),
+        resume_stage_sequence=int(job.get("_resume_stage_sequence") or 0),
+        resume_stage_attempt=int(job.get("_resume_stage_attempt") or 0),
+        checkpoint_recovery_count=int(job.get("_recovery_count") or 0),
     )
     summary = json.dumps(
         {
@@ -103,6 +129,7 @@ class PipelineWorker:
         poll_interval: float = 0.25,
         lease_seconds: float = 30.0,
         cancel_grace_seconds: float = 10.0,
+        max_recoveries: int = DEFAULT_MAX_RECOVERIES,
         command_builder: CommandBuilder | None = None,
     ) -> None:
         if max_concurrency != 1:
@@ -117,6 +144,12 @@ class PipelineWorker:
             raise ValueError(
                 "lease_seconds must exceed the graceful and forced cancel windows."
             )
+        if (
+            not isinstance(max_recoveries, int)
+            or isinstance(max_recoveries, bool)
+            or max_recoveries < 1
+        ):
+            raise ValueError("max_recoveries must be a positive integer.")
         self.repository = repository or JobRepository()
         self.worker_id = worker_id or _default_worker_id()
         self.instance_token = instance_token or uuid.uuid4().hex
@@ -124,10 +157,11 @@ class PipelineWorker:
         self.poll_interval = poll_interval
         self.lease_seconds = lease_seconds
         self.cancel_grace_seconds = cancel_grace_seconds
+        self.max_recoveries = max_recoveries
         self.command_builder = command_builder or _pipeline_launch_spec
         self._managed: dict[str, ManagedProcess] = {}
         self._unresolved_job_ids: tuple[str, ...] = ()
-        self._last_reconcile_result = ReconcileResult(True, ())
+        self._last_reconcile_result = ReconcileResult(True, (), ())
         self._lease_owned = False
         self._reconciled = False
 
@@ -195,9 +229,209 @@ class PipelineWorker:
             and launch.command_summary.isprintable()
         )
 
+    def _sync_process_checkpoints(self, managed: ManagedProcess) -> None:
+        run_dir = job_service.RUNS_DIR / managed.job_id
+        known_paths = {
+            str(stage_run["checkpoint_path"])
+            for stage_run in self.repository.list_stage_runs(managed.job_id)
+            if stage_run.get("checkpoint_path")
+        }
+        for checkpoint, checkpoint_path in list_checkpoints(
+            run_dir,
+            expected_job_id=managed.job_id,
+        ):
+            existing = checkpoint_path in known_paths
+            if existing:
+                matching = next(
+                    (
+                        stage_run
+                        for stage_run in self.repository.list_stage_runs(managed.job_id)
+                        if stage_run.get("checkpoint_path") == checkpoint_path
+                    ),
+                    None,
+                )
+                if matching is not None and matching.get("status") == checkpoint["status"]:
+                    continue
+            self.repository.record_stage_checkpoint(
+                managed.job_id,
+                worker_id=self.worker_id,
+                instance_token=self.instance_token,
+                launch_token=managed.launch_token,
+                checkpoint=checkpoint,
+                checkpoint_path=checkpoint_path,
+            )
+            known_paths.add(checkpoint_path)
+
+    def _complete_confirmed_dead_cancellation(self, managed: ManagedProcess) -> None:
+        """Complete cancellation only after this Worker has confirmed process death."""
+
+        self.repository.claim_cancel_command(
+            managed.job_id,
+            worker_id=self.worker_id,
+            instance_token=self.instance_token,
+        )
+        self.repository.complete_cancellation(
+            managed.job_id,
+            worker_id=self.worker_id,
+            instance_token=self.instance_token,
+            launch_token=managed.launch_token,
+            exit_code=None,
+        )
+        self._forget(managed.job_id)
+
+    def _handle_confirmed_process_exit(
+        self,
+        managed: ManagedProcess,
+        *,
+        observed_exit_code: int | None,
+        has_local_process: bool,
+        identity_confirmed_dead: bool,
+        recovery_allowed: bool = True,
+    ) -> bool:
+        """Apply one exit/cancel/recovery contract to every confirmed-dead process."""
+
+        if not identity_confirmed_dead:
+            raise ValueError("Process exit handling requires confirmed process death.")
+        cancel_command = self.repository.get_cancel_command(managed.job_id)
+        cancel_pending = bool(
+            cancel_command is not None
+            and cancel_command["status"] in {"pending", "claimed"}
+        )
+        current_job = self.repository.get_job(managed.job_id)
+        decision = ConfirmedExitDecision(
+            has_local_process=has_local_process,
+            observed_exit_code=observed_exit_code,
+            cancel_pending=cancel_pending,
+            identity_confirmed_dead=identity_confirmed_dead,
+            recovery_allowed=recovery_allowed,
+            recovery_count=int(current_job.get("recovery_count") or 0),
+            max_recoveries=self.max_recoveries,
+        )
+
+        if decision.observed_exit_code == 0:
+            self._finish_managed(managed, 0)
+            return False
+        if decision.cancel_pending:
+            if decision.has_local_process and decision.observed_exit_code is not None:
+                # A local poll is authoritative: natural exit wins over a late cancel.
+                self._finish_managed(managed, decision.observed_exit_code)
+            else:
+                self._complete_confirmed_dead_cancellation(managed)
+            return False
+        if not decision.recovery_allowed:
+            raise RuntimeError("Recovery was requested for a non-recoverable process state.")
+        if decision.recovery_count >= decision.max_recoveries:
+            self._fail_managed(
+                managed,
+                "recovery_attempts_exhausted",
+                event_type="job.recovery_exhausted",
+                exit_code=decision.observed_exit_code,
+            )
+            return False
+        try:
+            self._sync_process_checkpoints(managed)
+            latest_completed = latest_completed_checkpoint(
+                job_service.RUNS_DIR / managed.job_id,
+                expected_job_id=managed.job_id,
+            )
+            if (
+                latest_completed is not None
+                and int(latest_completed[0]["stage_sequence"]) >= 2
+            ):
+                load_task_manifest(job_service.RUNS_DIR / managed.job_id / "output")
+            if (
+                latest_completed is not None
+                and latest_completed[0]["stage_name"] == "completed"
+            ):
+                self._finish_managed(managed, 0)
+                return False
+            recovery = find_recovery_checkpoint(
+                job_service.RUNS_DIR / managed.job_id,
+                expected_job_id=managed.job_id,
+            )
+        except CheckpointProtocolError as exc:
+            self._fail_managed(
+                managed,
+                exc.code,
+                event_type="job.checkpoint_rejected",
+                exit_code=decision.observed_exit_code,
+            )
+            return False
+        except (TaskManifestError, OSError, UnicodeError, json.JSONDecodeError):
+            self._fail_managed(
+                managed,
+                "checkpoint_manifest_invalid",
+                event_type="job.checkpoint_rejected",
+                exit_code=decision.observed_exit_code,
+            )
+            return False
+        if recovery is None:
+            self._fail_managed(
+                managed,
+                (
+                    "checkpoint_resume_unavailable"
+                    if latest_completed is not None
+                    else "process_exited_without_checkpoint"
+                ),
+                event_type="job.reconciliation_failed",
+                exit_code=decision.observed_exit_code,
+            )
+            return False
+
+        if self.command_builder is _pipeline_launch_spec:
+            try:
+                if load_settings() is None:
+                    raise SettingsNotConfiguredError()
+                job_service.resolve_upload(str(current_job["upload_id"]))
+            except (SettingsNotConfiguredError, ValueError, OSError):
+                self._fail_managed(
+                    managed,
+                    "checkpoint_recovery_prerequisite_missing",
+                    event_type="job.recovery_rejected",
+                    exit_code=decision.observed_exit_code,
+                )
+                return False
+
+        new_launch_token = uuid.uuid4().hex
+        recovered_job = self.repository.prepare_recovery_attempt(
+            managed.job_id,
+            worker_id=self.worker_id,
+            instance_token=self.instance_token,
+            launch_token=managed.launch_token,
+            new_launch_token=new_launch_token,
+            resume_from_stage=recovery.resume_from_stage,
+            resume_stage_sequence=recovery.resume_sequence,
+            resume_stage_attempt=recovery.resume_attempt,
+            max_recoveries=self.max_recoveries,
+            observed_exit_code=decision.observed_exit_code,
+        )
+        self._forget(managed.job_id)
+        recovered_job.update(
+            {
+                "_resume_from_stage": recovery.resume_from_stage,
+                "_resume_stage_sequence": recovery.resume_sequence,
+                "_resume_stage_attempt": recovery.resume_attempt,
+                "_recovery_count": int(recovered_job["recovery_count"]),
+                "_skip_mineru_for_resume": False,
+            }
+        )
+        self._launch(recovered_job, new_launch_token)
+        return True
+
+    def _recover_missing_process(self, managed: ManagedProcess) -> bool:
+        """Compatibility wrapper for a registered identity confirmed missing."""
+
+        return self._handle_confirmed_process_exit(
+            managed,
+            observed_exit_code=None,
+            has_local_process=False,
+            identity_confirmed_dead=True,
+        )
+
     def _reconcile(self) -> ReconcileResult:
         self._detach_all()
         unresolved_job_ids: list[str] = []
+        recovering_job_ids: list[str] = []
         for process in self.repository.list_running_processes():
             job_id = str(process["job_id"])
             launch_token = process.get("launch_token")
@@ -231,11 +465,8 @@ class PipelineWorker:
                 )
                 continue
             if identity == "missing":
-                self._fail_managed(
-                    managed,
-                    "process_exited_without_checkpoint",
-                    event_type="job.reconciliation_failed",
-                )
+                if self._recover_missing_process(managed):
+                    recovering_job_ids.append(job_id)
                 continue
             self._managed[job_id] = managed
             self.repository.heartbeat_process(
@@ -245,8 +476,9 @@ class PipelineWorker:
                 launch_token=managed.launch_token,
             )
         result = ReconcileResult(
-            safe_to_schedule=not unresolved_job_ids,
+            safe_to_schedule=not unresolved_job_ids and not recovering_job_ids,
             unresolved_job_ids=tuple(unresolved_job_ids),
+            recovering_job_ids=tuple(recovering_job_ids),
         )
         self._unresolved_job_ids = result.unresolved_job_ids
         self._last_reconcile_result = result
@@ -260,6 +492,7 @@ class PipelineWorker:
         self._last_reconcile_result = ReconcileResult(
             safe_to_schedule=False,
             unresolved_job_ids=self._unresolved_job_ids,
+            recovering_job_ids=(),
         )
 
     def _cancel_before_launch(self, job: dict[str, object], launch_token: str) -> bool:
@@ -422,7 +655,12 @@ class PipelineWorker:
             if managed.process is not None:
                 exit_code = managed.process.poll()
                 if exit_code is not None:
-                    self._finish_managed(managed, exit_code)
+                    self._handle_confirmed_process_exit(
+                        managed,
+                        observed_exit_code=exit_code,
+                        has_local_process=True,
+                        identity_confirmed_dead=True,
+                    )
                     return
             self._fail_managed(
                 managed,
@@ -451,10 +689,16 @@ class PipelineWorker:
 
     def _monitor_managed(self) -> None:
         for managed in list(self._managed.values()):
+            self._sync_process_checkpoints(managed)
             if managed.process is not None:
                 exit_code = managed.process.poll()
                 if exit_code is not None:
-                    self._finish_managed(managed, exit_code)
+                    self._handle_confirmed_process_exit(
+                        managed,
+                        observed_exit_code=exit_code,
+                        has_local_process=True,
+                        identity_confirmed_dead=True,
+                    )
                     continue
 
             command = self.repository.get_cancel_command(managed.job_id)
@@ -475,11 +719,7 @@ class PipelineWorker:
                     )
                     continue
                 if identity == "missing":
-                    self._fail_managed(
-                        managed,
-                        "process_exited_without_checkpoint",
-                        event_type="job.reconciliation_failed",
-                    )
+                    self._recover_missing_process(managed)
                     continue
             self.repository.heartbeat_process(
                 managed.job_id,

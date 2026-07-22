@@ -94,11 +94,15 @@ $env:PAPER2CODE_DB_PATH=Join-Path (Get-Location) ".local\paper2code.db"
 
 该模式的 `POST /api/v1/jobs` 支持 `Idempotency-Key`，只写入 queued 记录，由持有全局 lease 的 Worker 使用 `BEGIN IMMEDIATE` 原子领取。`worker_id` 仅用于诊断；lease 与所有 Worker 状态写入都由 `worker_id + instance_token` 共同 fencing，同名的旧 Worker 不能继续续租、完成任务或释放新实例的 lease。queued 任务的取消命令由 Worker 直接消费且不会启动 Pipeline；running 任务的取消也是异步幂等命令，不由 FastAPI 直接 kill。Worker 验证 PID 与 create time 后先优雅终止、最多等待 10 秒，再强制终止完整进程树，确认退出后才写入 `canceled`。
 
-Worker 监控本地 `Popen` 时先读取真实退出码，再处理晚到的取消命令；自然退出会按退出码完成或失败，取消命令原子标记为 `failed/already_finished`。只有续租成功、取消命令仍有效、进程身份匹配且完整进程树已确认退出时才写入 `canceled`。Windows 强制终止使用同一已验证进程句柄校验 create time、终止并有界等待，不依赖无界 `taskkill /T /F`；POSIX 在发送进程组信号前也会重新校验根进程身份和 group id。
+Worker 监控本地 `Popen` 时先读取真实退出码，再处理晚到的取消命令：exit 0 直接 completed 且不恢复；非零退出在没有取消时先同步已原子落盘的 checkpoint，并与 Worker 重启后确认 registered 进程死亡的场景使用同一恢复资格判断；晚到 cancel 不能把自然退出改写为 canceled，也不能触发恢复，而会原子失败为 `already_finished`。只有续租成功、取消命令仍有效、进程身份匹配且完整进程树已确认退出时才写入 `canceled`。Windows 强制终止使用同一已验证进程句柄校验 create time、终止并有界等待，不依赖无界 `taskkill /T /F`；POSIX 在发送进程组信号前也会重新校验根进程身份和 group id。
 
 缺少本地设置或上传文件、命令参数无效、可预期的 `Popen` 创建失败只会把当前任务标记为 `process_launch_failed`，Worker 会继续处理后续队列。SQLite/持久化错误、lease fencing 失败、登记后无法确认进程已退出以及未知程序错误仍会 fail fast，不会被伪装成单任务失败。
 
-PR-04A 不包含阶段 checkpoint，也不保证任意崩溃点的自动恢复。Worker 重启时，已登记且存活、身份匹配的进程继续监控，已登记但死亡的进程以 `process_exited_without_checkpoint` 明确失败。如果任务已经领取但 PID/create time/process group 尚未完整登记，系统不会把“数据库中没有 PID”解释为“进程不存在”，而会进入 `identity_unresolved` 隔离态：任务保持 running、后续任务停止启动、取消不可用。此状态可能需要人工检查并重启本地环境。
+PR-04B 为 sqlite runtime 增加了阶段 checkpoint 与默认最多 1 次的受限恢复；默认 `JOB_RUNTIME=legacy` 的直接执行路径保持原样且不启用 checkpoint。`codes/run_pipeline.py` 仍是执行内核，只有 Worker 启动它时才启用 checkpoint adapter。协议使用固定阶段白名单、连续 sequence、唯一 stage-1 分支和单调无冲突 attempt，在 `runs/<job_id>/checkpoints/` 原子写入限长 JSON；checkpoint 只保存版本、阶段状态和产物的相对路径、字节数、SHA-256，不保存 API key、Prompt、完整模型响应或环境变量。恢复前会验证从可信 Markdown、Planning 输出和原 TaskManifest，一直到配置、分析结果及当前 Manifest repo 成员的完整恢复状态闭包；TaskManifest 的 size/SHA-256 必须始终匹配可信 Planning 边界，而 evaluation/repair 后可合法变化的 repo 文件以最新 completed 边界记录的当前指纹为准。
+
+恢复语义是 stage-boundary at-least-once，而不是 exactly-once：只有连续可信链上、完整状态闭包仍匹配的 `completed` 边界可用于恢复；崩溃时处于 `running`/`failed`/部分写入的当前阶段会从上一个可信 completed 边界所指向的阶段开头重跑，因此 MinerU、planning、analyzing、coding、evaluation 或 repair 可能重复产生外部调用、成本和文件写入。强制终止遗留的旧 `running` attempt 可被同 sequence 的后续连续 attempt 取代，防并发责任仍由 SQLite lease、进程身份和 launch-token fencing 承担。每次恢复使用新的 launch token，并在 SQLite 中保留旧进程身份历史；恢复次数耗尽、checkpoint 缺失或校验失败会形成稳定失败，不会继续启动第二个 Pipeline。
+
+PR-04A 的 fail-closed 进程边界保持不变：已登记且存活、身份匹配的进程继续监控；只有已登记身份被确认死亡的进程才会考虑 checkpoint 恢复。如果任务已经领取但 PID/create time/process group 尚未完整登记，系统不会把“数据库中没有 PID”解释为“进程不存在”，而会进入 `identity_unresolved` 隔离态；该状态不恢复、不猜测、不扫描或 kill 未知进程，并持续阻止后续任务。无合法边界、恢复预算耗尽或 `identity_unresolved` 仍可能需要人工检查并重启本地环境；本实现不宣称覆盖任意崩溃点的自动恢复。
 
 ## Provider 配置原则
 

@@ -110,6 +110,12 @@ class JobListItem(BaseModel):
     cancel_unavailable_reason: str = ""
     process_active: bool = False
     stage: str | None = None
+    current_stage: str | None = None
+    stage_attempt: int | None = None
+    last_checkpoint_stage: str | None = None
+    recovery_count: int = 0
+    recovery_status: str = "none"
+    recovery_error_code: str | None = None
     message: str | None = None
     updated_at: str | None = None
     repo_status: str | None = None

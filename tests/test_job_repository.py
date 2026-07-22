@@ -66,8 +66,9 @@ def test_migrations_are_repeatable_and_enable_required_pragmas(tmp_path: Path) -
         "cost_entries",
         "worker_leases",
         "job_processes",
+        "job_process_history",
     }.issubset(tables)
-    assert versions == [1, 2, 3, 4]
+    assert versions == [1, 2, 3, 4, 5]
     assert journal_mode.lower() == "wal"
     assert foreign_keys == 1
     assert busy_timeout == 5000
@@ -107,6 +108,7 @@ def test_concurrent_first_initialization_is_serialized(tmp_path: Path) -> None:
         (2, 1),
         (3, 1),
         (4, 1),
+        (5, 1),
     ]
     assert {
         "jobs",
@@ -116,6 +118,7 @@ def test_concurrent_first_initialization_is_serialized(tmp_path: Path) -> None:
         "cost_entries",
         "worker_leases",
         "job_processes",
+        "job_process_history",
     }.issubset(tables)
 
 
@@ -161,7 +164,7 @@ def test_failed_migration_rolls_back_schema_and_can_be_retried(
             for row in connection.execute(
                 "SELECT version FROM schema_migrations"
             ).fetchall()
-        ] == [1, 2, 3, 4]
+        ] == [1, 2, 3, 4, 5]
         assert connection.execute(
             "SELECT COUNT(*) FROM jobs"
         ).fetchone()[0] == 0
@@ -215,7 +218,7 @@ def test_version_2_database_upgrades_repeatably_without_trusting_legacy_lease(
         foreign_keys = connection.execute("PRAGMA foreign_keys").fetchone()[0]
         busy_timeout = connection.execute("PRAGMA busy_timeout").fetchone()[0]
 
-    assert versions == [1, 2, 3, 4]
+    assert versions == [1, 2, 3, 4, 5]
     assert "owner_token" in columns
     assert legacy_row["owner_token"] is None
     assert journal_mode.lower() == "wal"
@@ -350,7 +353,7 @@ def test_version_3_database_upgrades_launch_states_without_losing_processes(
                 "WHERE job_id = 'claimed_job'"
             )
 
-    assert versions == [1, 2, 3, 4]
+    assert versions == [1, 2, 3, 4, 5]
     assert states == {
         "claimed_job": ("claimed", None),
         "registered_job": ("registered", None),
@@ -405,7 +408,168 @@ def test_failed_migration_4_rolls_back_added_launch_state(
             for row in connection.execute(
                 "SELECT version FROM schema_migrations ORDER BY version"
             )
-        ] == [1, 2, 3, 4]
+        ] == [1, 2, 3, 4, 5]
+
+
+def test_version_4_database_upgrades_recovery_schema_without_losing_rows(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "version-4" / "paper2code.db"
+    current_migrations = database_module.MIGRATIONS
+    monkeypatch.setattr(database_module, "MIGRATIONS", current_migrations[:4])
+    initialize_database(db_path)
+    with closing(connect_database(db_path)) as connection:
+        with connection:
+            connection.execute(
+                """
+                INSERT INTO jobs (
+                    job_id, request_hash, paper_name, upload_id, domain, eval_type,
+                    generated_n, auto_refine, max_repair_rounds, console_output,
+                    skip_mineru, pdf_markdown_path, execution_status,
+                    evaluation_status, quality_status, version, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "upgrade_job",
+                    "0" * 64,
+                    "paper",
+                    "0" * 32,
+                    "statistics",
+                    "ref_free",
+                    1,
+                    0,
+                    0,
+                    "quiet",
+                    0,
+                    "",
+                    "running",
+                    "pending",
+                    "pending",
+                    2,
+                    "2026-01-01T00:00:00.000Z",
+                    "2026-01-01T00:00:00.000Z",
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO job_processes (
+                    job_id, worker_id, launch_token, pid, process_create_time,
+                    process_group_id, heartbeat_at, started_at, launch_state
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'registered')
+                """,
+                (
+                    "upgrade_job",
+                    "worker",
+                    "upgrade-launch",
+                    1234,
+                    "create-1234",
+                    1234,
+                    "2026-01-01T00:00:00.000Z",
+                    "2026-01-01T00:00:00.000Z",
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO stage_runs (
+                    job_id, stage_name, attempt, status, version,
+                    created_at, updated_at
+                ) VALUES (?, 'legacy_stage', 1, 'legacy_status', 1, ?, ?)
+                """,
+                (
+                    "upgrade_job",
+                    "2026-01-01T00:00:00.000Z",
+                    "2026-01-01T00:00:00.000Z",
+                ),
+            )
+
+    monkeypatch.setattr(database_module, "MIGRATIONS", current_migrations)
+    initialize_database(db_path)
+    initialize_database(db_path)
+
+    with closing(connect_database(db_path)) as connection:
+        job = connection.execute(
+            "SELECT * FROM jobs WHERE job_id = 'upgrade_job'"
+        ).fetchone()
+        process = connection.execute(
+            "SELECT * FROM job_processes WHERE job_id = 'upgrade_job'"
+        ).fetchone()
+        stage = connection.execute(
+            "SELECT * FROM stage_runs WHERE job_id = 'upgrade_job'"
+        ).fetchone()
+        versions = [
+            row["version"]
+            for row in connection.execute(
+                "SELECT version FROM schema_migrations ORDER BY version"
+            )
+        ]
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                INSERT INTO stage_runs (
+                    job_id, stage_name, attempt, status, created_at, updated_at
+                ) VALUES ('upgrade_job', 'unsafe', 2, 'completed', 'now', 'now')
+                """
+            )
+
+    assert versions == [1, 2, 3, 4, 5]
+    assert job["recovery_count"] == 0
+    assert job["recovery_status"] == "none"
+    assert process["process_attempt"] == 1
+    assert stage["stage_name"] == "legacy_stage"
+    assert stage["status"] == "legacy_status"
+    assert stage["stage_sequence"] is None
+    assert stage["resume_eligible"] == 0
+
+
+def test_failed_migration_5_rolls_back_recovery_columns(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "failed-version-5" / "paper2code.db"
+    current_migrations = database_module.MIGRATIONS
+    monkeypatch.setattr(database_module, "MIGRATIONS", current_migrations[:4])
+    initialize_database(db_path)
+    monkeypatch.setattr(
+        database_module,
+        "MIGRATIONS",
+        current_migrations[:4]
+        + (
+            (
+                5,
+                (
+                    "ALTER TABLE jobs ADD COLUMN recovery_count INTEGER",
+                    "CREATE TABLE broken syntax",
+                ),
+            ),
+        ),
+    )
+
+    with pytest.raises(sqlite3.OperationalError):
+        initialize_database(db_path)
+
+    with closing(connect_database(db_path)) as connection:
+        versions = [
+            row["version"]
+            for row in connection.execute(
+                "SELECT version FROM schema_migrations ORDER BY version"
+            )
+        ]
+        columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(jobs)")
+        }
+    assert versions == [1, 2, 3, 4]
+    assert "recovery_count" not in columns
+
+    monkeypatch.setattr(database_module, "MIGRATIONS", current_migrations)
+    initialize_database(db_path)
+    with closing(connect_database(db_path)) as connection:
+        assert [
+            row["version"]
+            for row in connection.execute(
+                "SELECT version FROM schema_migrations ORDER BY version"
+            )
+        ] == [1, 2, 3, 4, 5]
 
 
 def test_different_worker_ids_cannot_share_active_global_lease(tmp_path: Path) -> None:
@@ -558,6 +722,30 @@ def test_expired_takeover_fences_every_old_worker_mutation(tmp_path: Path) -> No
             instance_token="old-token",
             launch_token="old-launch",
         ),
+        lambda: repository.record_completed_checkpoint(
+            "running_job",
+            worker_id="shared-name",
+            instance_token="old-token",
+            launch_token="old-launch",
+            checkpoint={
+                "version": 1,
+                "stage_name": "planning",
+                "stage_sequence": 2,
+                "stage_attempt": 1,
+                "status": "completed",
+                "resume_from_stage": "extract_config",
+            },
+            checkpoint_path="checkpoints/checkpoint-0002-planning-001.json",
+        ),
+        lambda: repository.prepare_recovery_attempt(
+            "running_job",
+            worker_id="shared-name",
+            instance_token="old-token",
+            launch_token="old-launch",
+            new_launch_token="stale-recovery-launch",
+            resume_from_stage="extract_config",
+            resume_stage_sequence=3,
+        ),
         lambda: repository.finish_process(
             "running_job",
             worker_id="shared-name",
@@ -619,6 +807,91 @@ def test_current_lease_cannot_claim_second_job_while_one_is_running(
     assert second is None
     assert repository.get_job("job_first")["execution_status"] == "running"
     assert repository.get_job("job_second")["execution_status"] == "queued"
+
+
+def test_stage_checkpoint_transitions_are_atomic_idempotent_and_fenced(
+    tmp_path: Path,
+) -> None:
+    repository = JobRepository(tmp_path / "paper2code.db")
+    repository.create_job(job_id="stage_job", request=_request(), paper_name="paper")
+    assert repository.acquire_worker_lease("worker", "token")
+    repository.claim_next_queued_job(
+        worker_id="worker",
+        instance_token="token",
+        launch_token="stage-launch",
+    )
+    repository.record_process_started(
+        "stage_job",
+        worker_id="worker",
+        instance_token="token",
+        launch_token="stage-launch",
+        pid=1234,
+        process_create_time="create-1234",
+        process_group_id=1234,
+        command_summary="python run_pipeline.py --job-id redacted",
+    )
+    running = {
+        "version": 1,
+        "stage_name": "planning",
+        "stage_sequence": 2,
+        "stage_attempt": 2,
+        "status": "running",
+        "resume_from_stage": None,
+        "error_code": None,
+    }
+    checkpoint_path = "checkpoints/checkpoint-0002-planning-002.json"
+
+    started = repository.record_stage_checkpoint(
+        "stage_job",
+        worker_id="worker",
+        instance_token="token",
+        launch_token="stage-launch",
+        checkpoint=running,
+        checkpoint_path=checkpoint_path,
+    )
+    version_after_start = repository.get_job("stage_job")["version"]
+    repeated = repository.record_stage_checkpoint(
+        "stage_job",
+        worker_id="worker",
+        instance_token="token",
+        launch_token="stage-launch",
+        checkpoint=running,
+        checkpoint_path=checkpoint_path,
+    )
+    assert repeated["id"] == started["id"]
+    assert repository.get_job("stage_job")["version"] == version_after_start
+
+    completed = repository.record_completed_checkpoint(
+        "stage_job",
+        worker_id="worker",
+        instance_token="token",
+        launch_token="stage-launch",
+        checkpoint={
+            **running,
+            "status": "completed",
+            "resume_from_stage": "extract_config",
+        },
+        checkpoint_path=checkpoint_path,
+    )
+
+    assert completed["status"] == "completed"
+    assert completed["resume_eligible"] == 1
+    assert completed["version"] == 2
+    job = repository.get_job("stage_job")
+    assert job["current_stage"] == "planning"
+    assert job["current_stage_attempt"] == 2
+    assert job["last_checkpoint_stage"] == "planning"
+    assert job["version"] == version_after_start + 1
+    with closing(connect_database(repository.database_path)) as connection:
+        event_types = [
+            row["event_type"]
+            for row in connection.execute(
+                "SELECT event_type FROM job_events WHERE job_id = ? ORDER BY id",
+                ("stage_job",),
+            )
+        ]
+    assert event_types.count("job.stage_running") == 1
+    assert event_types.count("job.stage_completed") == 1
 
 
 def test_claim_registration_and_unresolved_launch_state_transitions(

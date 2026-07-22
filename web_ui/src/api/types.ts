@@ -64,6 +64,12 @@ export type JobListItem = {
   cancel_unavailable_reason: string;
   process_active: boolean;
   stage: string | null;
+  current_stage?: string | null;
+  stage_attempt?: number | null;
+  last_checkpoint_stage?: string | null;
+  recovery_count?: number;
+  recovery_status?: "none" | "prepared" | "running" | "completed" | "failed" | string;
+  recovery_error_code?: string | null;
   message: string | null;
   updated_at: string | null;
   repo_status: string | null;

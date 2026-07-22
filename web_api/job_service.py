@@ -272,6 +272,11 @@ def build_pipeline_command(
     console_output: ConsoleOutput,
     skip_mineru: bool,
     pdf_markdown_path: str,
+    checkpoint_mode: str = "off",
+    resume_from_stage: str = "",
+    resume_stage_sequence: int = 0,
+    resume_stage_attempt: int = 0,
+    checkpoint_recovery_count: int = 0,
 ) -> list[str]:
     cmd = [
         sys.executable,
@@ -318,6 +323,29 @@ def build_pipeline_command(
         pdf_markdown_path = str(validate_pdf_markdown_path(pdf_markdown_path))
         cmd.append("--skip_mineru")
         cmd.extend(["--pdf_markdown_path", pdf_markdown_path])
+
+    if checkpoint_mode == "sqlite":
+        cmd.extend(
+            [
+                "--checkpoint_mode",
+                "sqlite",
+                "--checkpoint_recovery_count",
+                str(checkpoint_recovery_count),
+            ]
+        )
+        if resume_from_stage:
+            cmd.extend(
+                [
+                    "--resume_from_stage",
+                    resume_from_stage,
+                    "--resume_stage_sequence",
+                    str(resume_stage_sequence),
+                    "--resume_stage_attempt",
+                    str(resume_stage_attempt),
+                ]
+            )
+    elif checkpoint_mode != "off":
+        raise ValueError("checkpoint_mode must be 'off' or 'sqlite'.")
 
     return cmd
 

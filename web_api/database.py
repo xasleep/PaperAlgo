@@ -203,6 +203,110 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             """,
         ),
     ),
+    (
+        5,
+        (
+            """
+            ALTER TABLE jobs ADD COLUMN recovery_count INTEGER NOT NULL DEFAULT 0
+                CHECK(typeof(recovery_count) = 'integer' AND recovery_count >= 0)
+            """,
+            """
+            ALTER TABLE jobs ADD COLUMN recovery_status TEXT NOT NULL DEFAULT 'none'
+                CHECK(recovery_status IN ('none', 'prepared', 'running', 'completed', 'failed'))
+            """,
+            "ALTER TABLE jobs ADD COLUMN recovery_error_code TEXT",
+            "ALTER TABLE jobs ADD COLUMN current_stage TEXT",
+            """
+            ALTER TABLE jobs ADD COLUMN current_stage_attempt INTEGER
+                CHECK(current_stage_attempt IS NULL OR (
+                    typeof(current_stage_attempt) = 'integer' AND current_stage_attempt >= 1
+                ))
+            """,
+            "ALTER TABLE jobs ADD COLUMN last_checkpoint_stage TEXT",
+            """
+            ALTER TABLE job_processes ADD COLUMN process_attempt INTEGER NOT NULL DEFAULT 1
+                CHECK(typeof(process_attempt) = 'integer' AND process_attempt >= 1)
+            """,
+            """
+            ALTER TABLE stage_runs ADD COLUMN stage_sequence INTEGER
+                CHECK(stage_sequence IS NULL OR (
+                    typeof(stage_sequence) = 'integer' AND stage_sequence >= 1
+                ))
+            """,
+            """
+            ALTER TABLE stage_runs ADD COLUMN checkpoint_version INTEGER
+                CHECK(checkpoint_version IS NULL OR (
+                    typeof(checkpoint_version) = 'integer' AND checkpoint_version >= 1
+                ))
+            """,
+            """
+            ALTER TABLE stage_runs ADD COLUMN checkpoint_path TEXT
+                CHECK(checkpoint_path IS NULL OR length(checkpoint_path) <= 512)
+            """,
+            "ALTER TABLE stage_runs ADD COLUMN resume_from_stage TEXT",
+            """
+            ALTER TABLE stage_runs ADD COLUMN resume_eligible INTEGER NOT NULL DEFAULT 0
+                CHECK(resume_eligible IN (0, 1))
+            """,
+            "ALTER TABLE stage_runs ADD COLUMN launch_token TEXT",
+            """
+            CREATE INDEX stage_runs_sequence_idx
+            ON stage_runs(job_id, stage_sequence, attempt)
+            """,
+            """
+            CREATE TRIGGER stage_runs_pr04b_insert_guard
+            BEFORE INSERT ON stage_runs
+            WHEN NEW.stage_name NOT IN (
+                'mineru_parse', 'mineru_skipped', 'planning', 'extract_config',
+                'analyzing', 'coding', 'evaluation', 'repair', 'completed'
+            ) OR NEW.status NOT IN ('running', 'completed', 'failed')
+            BEGIN
+                SELECT RAISE(ABORT, 'invalid stage_runs value');
+            END
+            """,
+            """
+            CREATE TRIGGER stage_runs_pr04b_update_guard
+            BEFORE UPDATE OF stage_name, status ON stage_runs
+            WHEN NEW.stage_name NOT IN (
+                'mineru_parse', 'mineru_skipped', 'planning', 'extract_config',
+                'analyzing', 'coding', 'evaluation', 'repair', 'completed'
+            ) OR NEW.status NOT IN ('running', 'completed', 'failed')
+            BEGIN
+                SELECT RAISE(ABORT, 'invalid stage_runs value');
+            END
+            """,
+            """
+            CREATE TABLE job_process_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+                process_attempt INTEGER NOT NULL
+                    CHECK(typeof(process_attempt) = 'integer' AND process_attempt >= 1),
+                worker_id TEXT NOT NULL,
+                launch_token TEXT NOT NULL UNIQUE,
+                pid INTEGER NOT NULL
+                    CHECK(typeof(pid) = 'integer' AND pid > 0),
+                process_create_time TEXT NOT NULL,
+                process_group_id INTEGER NOT NULL
+                    CHECK(typeof(process_group_id) = 'integer' AND process_group_id > 0),
+                command_summary TEXT
+                    CHECK(command_summary IS NULL OR length(command_summary) <= 1024),
+                heartbeat_at TEXT NOT NULL,
+                started_at TEXT,
+                exited_at TEXT NOT NULL,
+                exit_code INTEGER
+                    CHECK(exit_code IS NULL OR typeof(exit_code) = 'integer'),
+                launch_state TEXT NOT NULL CHECK(launch_state = 'exited'),
+                launch_error_code TEXT,
+                archived_at TEXT NOT NULL,
+                UNIQUE(job_id, process_attempt)
+            )
+            """,
+            """
+            CREATE INDEX job_process_history_job_idx
+            ON job_process_history(job_id, process_attempt)
+            """,
+        ),
+    ),
 )
 
 

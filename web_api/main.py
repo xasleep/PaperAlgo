@@ -245,6 +245,8 @@ def _sqlite_job_view(
         process_state = "finished"
     else:
         process_state = "none"
+    recovery_status = str(job.get("recovery_status") or "none")
+    recovery_active = recovery_status in {"prepared", "running"}
     return {
         **job,
         "status": execution_status,
@@ -256,17 +258,27 @@ def _sqlite_job_view(
             else ("already_finished" if terminal else "")
         ),
         "process_active": process_active,
-        "stage": execution_status,
+        "stage": job.get("current_stage") or execution_status,
+        "current_stage": job.get("current_stage"),
+        "stage_attempt": job.get("current_stage_attempt"),
+        "last_checkpoint_stage": job.get("last_checkpoint_stage"),
+        "recovery_count": int(job.get("recovery_count") or 0),
+        "recovery_status": recovery_status,
+        "recovery_error_code": job.get("recovery_error_code"),
         "message": (
             "Pipeline launch identity is unresolved; new work is blocked for safety."
             if identity_unresolved
             else (
+                "Pipeline recovery is starting from the last verified stage boundary."
+                if recovery_active
+                else (
                 "Cancellation requested."
                 if cancel_requested
                 else (
                     "Queued for the SQLite worker runtime."
                     if execution_status == "queued"
                     else None
+                )
                 )
             )
         ),
