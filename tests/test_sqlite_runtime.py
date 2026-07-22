@@ -170,7 +170,7 @@ def test_sqlite_runtime_is_idempotent_persistent_and_never_starts_pipeline(
             pytest.fail("SQLite files contain the evaluation API credential", pytrace=False)
 
 
-def test_sqlite_cancel_reports_worker_boundary_without_legacy_side_effects(
+def test_sqlite_cancel_is_idempotent_command_without_legacy_side_effects(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -204,7 +204,11 @@ def test_sqlite_cancel_reports_worker_boundary_without_legacy_side_effects(
         raise_server_exceptions=False,
     ) as client:
         headers = _authorize(client)
-        existing = client.post(
+        first = client.post(
+            f"{API_PREFIX}/jobs/{created['job_id']}/cancel",
+            headers=headers,
+        )
+        repeated = client.post(
             f"{API_PREFIX}/jobs/{created['job_id']}/cancel",
             headers=headers,
         )
@@ -213,13 +217,12 @@ def test_sqlite_cancel_reports_worker_boundary_without_legacy_side_effects(
             headers=headers,
         )
 
-    assert existing.status_code == 409
-    assert existing.json()["error"]["code"] == "job_not_cancelable"
-    assert (
-        existing.json()["error"]["details"]["reason"]
-        == "sqlite_worker_not_implemented"
-    )
-    assert "not found" not in existing.json()["error"]["message"].lower()
+    assert first.status_code == repeated.status_code == 200
+    assert first.json() == repeated.json() == {
+        "job_id": created["job_id"],
+        "canceled": False,
+        "message": "Cancellation requested.",
+    }
     assert missing.status_code == 404
     assert missing.json()["error"]["code"] == "job_not_found"
     assert legacy_calls == []
@@ -230,10 +233,15 @@ def test_sqlite_cancel_reports_worker_boundary_without_legacy_side_effects(
             "SELECT COUNT(*) FROM job_events WHERE job_id = ?",
             (created["job_id"],),
         ).fetchone()[0] == events_before
+        command = connection.execute(
+            "SELECT command_type, status FROM job_commands WHERE job_id = ?",
+            (created["job_id"],),
+        ).fetchone()
+        assert tuple(command) == ("cancel", "pending")
         assert connection.execute(
             "SELECT COUNT(*) FROM job_commands WHERE job_id = ?",
             (created["job_id"],),
-        ).fetchone()[0] == 0
+        ).fetchone()[0] == 1
 
 
 def test_legacy_runtime_keeps_existing_start_path(

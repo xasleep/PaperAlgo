@@ -140,6 +140,40 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             """,
         ),
     ),
+    (
+        2,
+        (
+            "ALTER TABLE jobs ADD COLUMN failure_code TEXT",
+            "ALTER TABLE job_commands ADD COLUMN claimed_by_worker_id TEXT",
+            "ALTER TABLE job_commands ADD COLUMN error_code TEXT",
+            """
+            CREATE TABLE job_processes (
+                job_id TEXT PRIMARY KEY REFERENCES jobs(job_id) ON DELETE CASCADE,
+                worker_id TEXT NOT NULL,
+                launch_token TEXT NOT NULL UNIQUE,
+                pid INTEGER
+                    CHECK(pid IS NULL OR (typeof(pid) = 'integer' AND pid > 0)),
+                process_create_time TEXT,
+                process_group_id INTEGER
+                    CHECK(process_group_id IS NULL OR (
+                        typeof(process_group_id) = 'integer' AND process_group_id > 0
+                    )),
+                command_summary TEXT
+                    CHECK(command_summary IS NULL OR length(command_summary) <= 1024),
+                heartbeat_at TEXT NOT NULL,
+                started_at TEXT,
+                exited_at TEXT,
+                exit_code INTEGER
+                    CHECK(exit_code IS NULL OR typeof(exit_code) = 'integer')
+            )
+            """,
+            "CREATE INDEX job_processes_worker_idx ON job_processes(worker_id, heartbeat_at)",
+            """
+            CREATE INDEX job_commands_pending_idx
+            ON job_commands(command_type, status, id)
+            """,
+        ),
+    ),
 )
 
 

@@ -1,6 +1,6 @@
 # ADR 0002：SQLite 与单 worker 约束
 
-- 状态：已接受（PR-03 已实现持久化控制面，完整 Worker 尚未实现）
+- 状态：已接受（PR-03 持久化控制面与 PR-04A 单 Worker 骨架已实现）
 - 日期：2026-07-14
 
 ## 背景
@@ -16,9 +16,12 @@
 - 大型 artifacts、日志和生成仓库继续保存在 `runs/<job_id>/`，不写入数据库 BLOB。
 - API key、完整 Prompt 和完整模型响应不得写入 SQLite；数据库只保存控制面所需的最小、脱敏元数据。
 - 使用标准库 `sqlite3`、编号 migration、WAL、foreign keys 和 busy timeout，不引入 ORM。
-- `JOB_RUNTIME=legacy|sqlite` 提供过渡边界：legacy 保持现有子进程行为；sqlite 只创建 queued job，不直接启动 Pipeline。
+- `JOB_RUNTIME=legacy|sqlite` 提供回滚边界：legacy 保持现有 FastAPI 子进程行为；sqlite 由 `python -m web_api.worker` 独立消费 queued job。
 - SQLite 状态拆分为 execution、evaluation、quality 三个轴；所有状态更新经统一验证入口并使用 version 乐观锁。
+- sqlite runtime 使用单一全局 lease，默认 `max_concurrency=1`；Worker 在 `BEGIN IMMEDIATE` 事务中领取最早 queued job。
+- Worker 保存 `worker_id`、`launch_token`、PID、进程 create time、命令摘要和 heartbeat。Pipeline 位于独立进程组；取消前必须验证 PID/create time，身份不匹配时不发送终止信号并写入 `process_identity_mismatch`。
+- API 取消只写入幂等 job command。Worker 先请求优雅退出，最多等待 10 秒，再终止完整进程树，确认进程树退出后才把任务置为 `canceled`。
 
 ## 后果
 
-该选择符合 Windows 本地部署并降低运维成本，但不支持横向扩展或多 worker 高可用。PR-03 仅建立持久化事实源、幂等创建和未来 Worker 所需的表；lease 获取、命令消费、阶段执行、恢复与完整 Worker 生命周期仍属于后续工作。
+该选择符合 Windows 本地部署并降低运维成本，但不支持横向扩展或多 worker 高可用。FastAPI 与 Worker 生命周期解耦，因此 API 重启不影响正在运行的 sqlite Pipeline。PR-04A 只提供进程级 reconciliation：queued 保持排队，存活且身份匹配的进程继续监控，已死亡的 running job 以 `process_exited_without_checkpoint` 失败。阶段 checkpoint、阶段级恢复和重试仍属于后续工作。

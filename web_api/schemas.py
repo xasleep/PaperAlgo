@@ -84,6 +84,7 @@ class JobCreateResponse(BaseModel):
     execution_status: str | None = None
     evaluation_status: str | None = None
     quality_status: str | None = None
+    failure_code: str | None = None
     version: int | None = None
 
 
@@ -117,6 +118,7 @@ class JobListItem(BaseModel):
     execution_status: str | None = None
     evaluation_status: str | None = None
     quality_status: str | None = None
+    failure_code: str | None = None
     version: int | None = None
 
 

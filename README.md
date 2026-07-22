@@ -22,9 +22,9 @@
 - `web_ui/` 已实现 settings、创建任务、任务列表、状态/日志/文件查看、取消任务和仓库下载。开发模式直连 FastAPI；构建后的 `web_ui/dist/` 可由 FastAPI 同源托管。
 - `web_api/` 是轻量控制面，负责输入校验、本地 settings、任务进程和 artifacts。它通过子进程调用 `codes/run_pipeline.py`，不替代执行内核。
 - `codes/run_pipeline.py` 负责 MinerU、规划、分析、编码、评测和可选自动修复的阶段编排。
-- 默认 `JOB_RUNTIME=legacy` 继续使用 `runs/` 下的 JSON/文件状态并直接启动 Pipeline；`JOB_RUNTIME=sqlite` 使用 `.local/paper2code.db` 创建持久化 queued job，但当前尚未提供消费队列的完整 Worker。
+- 默认 `JOB_RUNTIME=legacy` 继续使用 `runs/` 下的 JSON/文件状态并由 FastAPI 直接启动 Pipeline；`JOB_RUNTIME=sqlite` 使用 `.local/paper2code.db` 和独立的单并发 Worker 消费 queued job。
 - 当前 WebUI 对运行中任务每 2 秒轮询；当前 checkout **没有** SSE 或 WebSocket 事件接口。
-- 活跃进程句柄保存在单个 FastAPI 进程的内存中，因此只支持单实例、单 worker 运行。
+- legacy runtime 的活跃进程句柄仍保存在 FastAPI 内存中；sqlite runtime 由独立 Worker 保存 PID、进程 create time、launch token 和 heartbeat，FastAPI 重启不终止已运行 Pipeline。
 
 更细的模块说明见 [docs/info/全仓目录结构与模块说明.md](docs/info/全仓目录结构与模块说明.md)，工程决策见 [docs/adr/](docs/adr/)。
 
@@ -83,7 +83,15 @@ $env:JOB_RUNTIME="sqlite"
 $env:PAPER2CODE_DB_PATH=Join-Path (Get-Location) ".local\paper2code.db"
 ```
 
-该模式的 `POST /api/v1/jobs` 支持 `Idempotency-Key`，只持久化 queued 控制面记录，不直接启动子进程。需要实际执行 Pipeline 时仍应使用默认 `legacy` 模式；完整 Worker 属于后续工作。
+在第二个 PowerShell 窗口使用相同环境变量启动独立 Worker：
+
+```powershell
+$env:JOB_RUNTIME="sqlite"
+$env:PAPER2CODE_DB_PATH=Join-Path (Get-Location) ".local\paper2code.db"
+.\.venv\Scripts\python.exe -m web_api.worker
+```
+
+该模式的 `POST /api/v1/jobs` 支持 `Idempotency-Key`，只写入 queued 记录，由持有全局 lease 的 Worker 使用 `BEGIN IMMEDIATE` 原子领取。取消 API 只写入幂等命令；Worker 验证 PID 与 create time 后先优雅终止、最多等待 10 秒，再强制终止完整进程树，确认退出后才写入 `canceled`。PR-04A 不包含阶段 checkpoint；Worker 重启时，仍存活且身份匹配的进程继续监控，已死亡的 running job 会以 `process_exited_without_checkpoint` 明确失败。
 
 ## Provider 配置原则
 

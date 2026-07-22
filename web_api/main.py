@@ -210,25 +210,51 @@ def _job_request_dict(payload: JobCreateRequest) -> dict[str, object]:
     return payload.dict()
 
 
-def _sqlite_job_view(job: dict[str, object]) -> JsonDict:
+def _sqlite_job_view(
+    job: dict[str, object],
+    repository: JobRepository | None = None,
+) -> JsonDict:
+    repository = repository or _sqlite_repository()
     job_id = str(job["job_id"])
     execution_status = str(job["execution_status"])
+    process = repository.get_process(job_id)
+    cancel_command = repository.get_cancel_command(job_id)
     run_dir = job_service_module.RUNS_DIR / job_id
     terminal = execution_status in {"completed", "failed", "canceled"}
+    cancel_requested = cancel_command is not None and cancel_command["status"] in {
+        "pending",
+        "claimed",
+    }
+    process_active = bool(
+        execution_status == "running"
+        and process is not None
+        and process.get("pid")
+        and process.get("exited_at") is None
+    )
+    if process_active:
+        process_state = "active"
+    elif terminal:
+        process_state = "finished"
+    else:
+        process_state = "none"
     return {
         **job,
         "status": execution_status,
-        "process_state": "none",
-        "cancelable": False,
+        "process_state": process_state,
+        "cancelable": not terminal,
         "cancel_unavailable_reason": (
-            "already_finished" if terminal else "process_not_registered"
+            "already_finished" if terminal else ""
         ),
-        "process_active": False,
+        "process_active": process_active,
         "stage": execution_status,
         "message": (
-            "Queued for the SQLite worker runtime."
-            if execution_status == "queued"
-            else None
+            "Cancellation requested."
+            if cancel_requested
+            else (
+                "Queued for the SQLite worker runtime."
+                if execution_status == "queued"
+                else None
+            )
         ),
         "repo_status": None,
         "eval_score": None,
@@ -236,8 +262,11 @@ def _sqlite_job_view(job: dict[str, object]) -> JsonDict:
     }
 
 
-def _sqlite_create_response(job: dict[str, object]) -> JobCreateResponse:
-    view = _sqlite_job_view(job)
+def _sqlite_create_response(
+    job: dict[str, object],
+    repository: JobRepository | None = None,
+) -> JobCreateResponse:
+    view = _sqlite_job_view(job, repository)
     run_dir = job_service_module.RUNS_DIR / str(job["job_id"])
     return JobCreateResponse(
         job_id=str(job["job_id"]),
@@ -271,7 +300,7 @@ def create_job(
             idempotency_key=idempotency_key,
         )
         if replay is not None:
-            return _sqlite_create_response(replay)
+            return _sqlite_create_response(replay, repository)
 
     settings = load_settings()
     if settings is None:
@@ -287,7 +316,7 @@ def create_job(
             paper_name=resolved_paper_name,
             idempotency_key=idempotency_key,
         )
-        return _sqlite_create_response(job)
+        return _sqlite_create_response(job, repository)
 
     job = start_job(
         job_id=job_id,
@@ -315,7 +344,10 @@ def jobs(limit: int = Query(default=50, ge=1, le=200)) -> JobListResponse:
     if configured_job_runtime() == "sqlite":
         repository = _sqlite_repository()
         return JobListResponse(
-            jobs=[_sqlite_job_view(job) for job in repository.list_jobs(limit=limit)]
+            jobs=[
+                _sqlite_job_view(job, repository)
+                for job in repository.list_jobs(limit=limit)
+            ]
         )
     return JobListResponse(jobs=list_jobs(limit=limit))
 
@@ -324,7 +356,10 @@ def jobs(limit: int = Query(default=50, ge=1, le=200)) -> JobListResponse:
 def job_status(job_id: str) -> JsonDict:
     if configured_job_runtime() == "sqlite":
         repository = _sqlite_repository()
-        return _sqlite_job_view(repository.get_job(validate_job_id(job_id)))
+        return _sqlite_job_view(
+            repository.get_job(validate_job_id(job_id)),
+            repository,
+        )
     return get_job_status(job_id)
 
 
@@ -332,10 +367,18 @@ def job_status(job_id: str) -> JsonDict:
 def cancel(job_id: str) -> CancelResponse:
     if configured_job_runtime() == "sqlite":
         repository = _sqlite_repository()
-        repository.get_job(validate_job_id(job_id))
-        raise JobNotCancelableError(
-            "sqlite_worker_not_implemented",
-            "SQLite job cancellation requires worker support that is not implemented.",
+        validated_job_id = validate_job_id(job_id)
+        command = repository.request_cancel(validated_job_id)
+        job = repository.get_job(validated_job_id)
+        canceled = str(job["execution_status"]) == "canceled"
+        return CancelResponse(
+            job_id=validated_job_id,
+            canceled=canceled,
+            message=(
+                "Cancellation completed."
+                if canceled or command["status"] == "completed"
+                else "Cancellation requested."
+            ),
         )
     canceled, message = cancel_job(job_id)
     return CancelResponse(job_id=job_id, canceled=canceled, message=message)

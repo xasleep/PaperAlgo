@@ -63,8 +63,9 @@ def test_migrations_are_repeatable_and_enable_required_pragmas(tmp_path: Path) -
         "job_commands",
         "cost_entries",
         "worker_leases",
+        "job_processes",
     }.issubset(tables)
-    assert versions == [1]
+    assert versions == [1, 2]
     assert journal_mode.lower() == "wal"
     assert foreign_keys == 1
     assert busy_timeout == 5000
@@ -99,7 +100,10 @@ def test_concurrent_first_initialization_is_serialized(tmp_path: Path) -> None:
             )
         }
 
-    assert [(row["version"], row["count"]) for row in versions] == [(1, 1)]
+    assert [(row["version"], row["count"]) for row in versions] == [
+        (1, 1),
+        (2, 1),
+    ]
     assert {
         "jobs",
         "stage_runs",
@@ -107,6 +111,7 @@ def test_concurrent_first_initialization_is_serialized(tmp_path: Path) -> None:
         "job_commands",
         "cost_entries",
         "worker_leases",
+        "job_processes",
     }.issubset(tables)
 
 
@@ -152,7 +157,7 @@ def test_failed_migration_rolls_back_schema_and_can_be_retried(
             for row in connection.execute(
                 "SELECT version FROM schema_migrations"
             ).fetchall()
-        ] == [1]
+        ] == [1, 2]
         assert connection.execute(
             "SELECT COUNT(*) FROM jobs"
         ).fetchone()[0] == 0
