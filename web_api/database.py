@@ -174,6 +174,12 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             """,
         ),
     ),
+    (
+        3,
+        (
+            "ALTER TABLE worker_leases ADD COLUMN owner_token TEXT",
+        ),
+    ),
 )
 
 

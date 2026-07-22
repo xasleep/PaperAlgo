@@ -1,4 +1,5 @@
 import sqlite3
+import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from pathlib import Path
@@ -65,7 +66,7 @@ def test_migrations_are_repeatable_and_enable_required_pragmas(tmp_path: Path) -
         "worker_leases",
         "job_processes",
     }.issubset(tables)
-    assert versions == [1, 2]
+    assert versions == [1, 2, 3]
     assert journal_mode.lower() == "wal"
     assert foreign_keys == 1
     assert busy_timeout == 5000
@@ -103,6 +104,7 @@ def test_concurrent_first_initialization_is_serialized(tmp_path: Path) -> None:
     assert [(row["version"], row["count"]) for row in versions] == [
         (1, 1),
         (2, 1),
+        (3, 1),
     ]
     assert {
         "jobs",
@@ -157,10 +159,291 @@ def test_failed_migration_rolls_back_schema_and_can_be_retried(
             for row in connection.execute(
                 "SELECT version FROM schema_migrations"
             ).fetchall()
-        ] == [1, 2]
+        ] == [1, 2, 3]
         assert connection.execute(
             "SELECT COUNT(*) FROM jobs"
         ).fetchone()[0] == 0
+
+
+def test_version_2_database_upgrades_repeatably_without_trusting_legacy_lease(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "version-2" / "paper2code.db"
+    current_migrations = database_module.MIGRATIONS
+    monkeypatch.setattr(database_module, "MIGRATIONS", current_migrations[:2])
+    initialize_database(db_path)
+    with closing(connect_database(db_path)) as connection:
+        with connection:
+            connection.execute(
+                """
+                INSERT INTO worker_leases (
+                    lease_name, owner_id, expires_at, version, acquired_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "pipeline-worker",
+                    "legacy-worker",
+                    "2999-01-01T00:00:00.000Z",
+                    7,
+                    "2026-01-01T00:00:00.000Z",
+                    "2026-01-01T00:00:00.000Z",
+                ),
+            )
+
+    monkeypatch.setattr(database_module, "MIGRATIONS", current_migrations)
+    initialize_database(db_path)
+    initialize_database(db_path)
+
+    with closing(connect_database(db_path)) as connection:
+        versions = [
+            row["version"]
+            for row in connection.execute(
+                "SELECT version FROM schema_migrations ORDER BY version"
+            )
+        ]
+        columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(worker_leases)")
+        }
+        legacy_row = connection.execute(
+            "SELECT owner_token FROM worker_leases WHERE lease_name = ?",
+            ("pipeline-worker",),
+        ).fetchone()
+        journal_mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
+        foreign_keys = connection.execute("PRAGMA foreign_keys").fetchone()[0]
+        busy_timeout = connection.execute("PRAGMA busy_timeout").fetchone()[0]
+
+    assert versions == [1, 2, 3]
+    assert "owner_token" in columns
+    assert legacy_row["owner_token"] is None
+    assert journal_mode.lower() == "wal"
+    assert foreign_keys == 1
+    assert busy_timeout == 5000
+
+    repository = JobRepository(db_path)
+    assert (
+        repository.acquire_worker_lease("legacy-worker", "fresh-token") is False
+    )
+    with closing(connect_database(db_path)) as connection:
+        with connection:
+            connection.execute(
+                "UPDATE worker_leases SET expires_at = ? WHERE lease_name = ?",
+                ("2000-01-01T00:00:00.000Z", "pipeline-worker"),
+            )
+    assert repository.acquire_worker_lease("legacy-worker", "fresh-token") is True
+
+
+def test_different_worker_ids_cannot_share_active_global_lease(tmp_path: Path) -> None:
+    repository = JobRepository(tmp_path / "paper2code.db")
+
+    assert repository.acquire_worker_lease("worker-a", "token-a") is True
+    assert repository.acquire_worker_lease("worker-b", "token-b") is False
+
+
+def test_same_worker_id_with_different_tokens_is_fenced(tmp_path: Path) -> None:
+    repository = JobRepository(tmp_path / "paper2code.db")
+    repository.create_job(job_id="same_name_job", request=_request(), paper_name="paper")
+
+    assert repository.acquire_worker_lease("shared-name", "token-a") is True
+    assert repository.acquire_worker_lease("shared-name", "token-b") is False
+    with pytest.raises(RuntimeError, match="lease"):
+        repository.claim_next_queued_job(
+            worker_id="shared-name",
+            instance_token="token-b",
+            launch_token="loser-launch",
+        )
+    assert repository.get_job("same_name_job")["execution_status"] == "queued"
+
+
+def test_concurrent_same_name_lease_acquire_has_exactly_one_winner(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "paper2code.db"
+    JobRepository(db_path)
+    barrier = Barrier(2)
+
+    def acquire(instance_token: str) -> bool:
+        repository = JobRepository(db_path)
+        barrier.wait()
+        return repository.acquire_worker_lease("shared-name", instance_token)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(acquire, ("token-a", "token-b")))
+
+    assert sorted(results) == [False, True]
+
+
+def test_concurrent_same_name_workers_can_claim_at_most_one_job(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "paper2code.db"
+    repository = JobRepository(db_path)
+    repository.create_job(job_id="job_a", request=_request(), paper_name="paper")
+    repository.create_job(job_id="job_b", request=_request(), paper_name="paper")
+    barrier = Barrier(2)
+
+    def acquire_and_claim(instance_token: str) -> str | None:
+        contender = JobRepository(db_path)
+        barrier.wait()
+        if not contender.acquire_worker_lease("shared-name", instance_token):
+            return None
+        claimed = contender.claim_next_queued_job(
+            worker_id="shared-name",
+            instance_token=instance_token,
+            launch_token=f"launch-{instance_token}",
+        )
+        return None if claimed is None else str(claimed["job_id"])
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        claimed_job_ids = list(
+            executor.map(acquire_and_claim, ("token-a", "token-b"))
+        )
+
+    assert sum(job_id is not None for job_id in claimed_job_ids) == 1
+    statuses = [job["execution_status"] for job in repository.list_jobs(limit=10)]
+    assert statuses.count("running") == 1
+    assert statuses.count("queued") == 1
+
+
+def test_same_worker_instance_renews_lease_without_resetting_acquired_at(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "paper2code.db"
+    repository = JobRepository(db_path)
+    assert repository.acquire_worker_lease("worker", "stable-token") is True
+    with closing(connect_database(db_path)) as connection:
+        first = dict(
+            connection.execute(
+                "SELECT * FROM worker_leases WHERE lease_name = ?",
+                ("pipeline-worker",),
+            ).fetchone()
+        )
+
+    time.sleep(0.02)
+    assert repository.acquire_worker_lease("worker", "stable-token") is True
+    with closing(connect_database(db_path)) as connection:
+        renewed = dict(
+            connection.execute(
+                "SELECT * FROM worker_leases WHERE lease_name = ?",
+                ("pipeline-worker",),
+            ).fetchone()
+        )
+
+    assert renewed["version"] == first["version"] + 1
+    assert renewed["updated_at"] > first["updated_at"]
+    assert renewed["acquired_at"] == first["acquired_at"]
+
+
+def test_expired_takeover_fences_every_old_worker_mutation(tmp_path: Path) -> None:
+    db_path = tmp_path / "paper2code.db"
+    repository = JobRepository(db_path)
+    repository.create_job(job_id="running_job", request=_request(), paper_name="paper")
+    repository.create_job(job_id="queued_job", request=_request(), paper_name="paper")
+    assert repository.acquire_worker_lease("shared-name", "old-token") is True
+    claimed = repository.claim_next_queued_job(
+        worker_id="shared-name",
+        instance_token="old-token",
+        launch_token="old-launch",
+    )
+    assert claimed is not None
+    repository.request_cancel("running_job")
+    repository.request_cancel("queued_job")
+    with closing(connect_database(db_path)) as connection:
+        with connection:
+            connection.execute(
+                "UPDATE worker_leases SET expires_at = ? WHERE lease_name = ?",
+                ("2000-01-01T00:00:00.000Z", "pipeline-worker"),
+            )
+
+    assert repository.acquire_worker_lease("shared-name", "new-token") is True
+
+    fenced_calls = (
+        lambda: repository.claim_next_queued_job(
+            worker_id="shared-name",
+            instance_token="old-token",
+            launch_token="stale-claim",
+        ),
+        lambda: repository.cancel_next_queued_job("shared-name", "old-token"),
+        lambda: repository.claim_cancel_command(
+            "running_job", worker_id="shared-name", instance_token="old-token"
+        ),
+        lambda: repository.record_process_started(
+            "running_job",
+            worker_id="shared-name",
+            instance_token="old-token",
+            launch_token="old-launch",
+            pid=1234,
+            process_create_time="2026-01-01T00:00:00.000Z",
+            process_group_id=1234,
+            command_summary="python fake_pipeline.py --job-id running_job",
+        ),
+        lambda: repository.heartbeat_process(
+            "running_job",
+            worker_id="shared-name",
+            instance_token="old-token",
+            launch_token="old-launch",
+        ),
+        lambda: repository.finish_process(
+            "running_job",
+            worker_id="shared-name",
+            instance_token="old-token",
+            launch_token="old-launch",
+            exit_code=0,
+        ),
+        lambda: repository.complete_cancellation(
+            "running_job",
+            worker_id="shared-name",
+            instance_token="old-token",
+            launch_token="old-launch",
+            exit_code=-1,
+        ),
+        lambda: repository.fail_process(
+            "running_job",
+            worker_id="shared-name",
+            instance_token="old-token",
+            launch_token="old-launch",
+            failure_code="stale-worker",
+        ),
+    )
+    for fenced_call in fenced_calls:
+        with pytest.raises(RuntimeError, match="lease"):
+            fenced_call()
+
+    assert repository.release_worker_lease("shared-name", "old-token") is False
+    with closing(connect_database(db_path)) as connection:
+        current = connection.execute(
+            "SELECT owner_id, owner_token FROM worker_leases WHERE lease_name = ?",
+            ("pipeline-worker",),
+        ).fetchone()
+    assert (current["owner_id"], current["owner_token"]) == (
+        "shared-name",
+        "new-token",
+    )
+
+
+def test_current_lease_cannot_claim_second_job_while_one_is_running(
+    tmp_path: Path,
+) -> None:
+    repository = JobRepository(tmp_path / "paper2code.db")
+    repository.create_job(job_id="job_first", request=_request(), paper_name="paper")
+    repository.create_job(job_id="job_second", request=_request(), paper_name="paper")
+    assert repository.acquire_worker_lease("worker", "token") is True
+
+    first = repository.claim_next_queued_job(
+        worker_id="worker",
+        instance_token="token",
+        launch_token="launch-first",
+    )
+    second = repository.claim_next_queued_job(
+        worker_id="worker",
+        instance_token="token",
+        launch_token="launch-second",
+    )
+
+    assert first is not None
+    assert second is None
+    assert repository.get_job("job_first")["execution_status"] == "running"
+    assert repository.get_job("job_second")["execution_status"] == "queued"
 
 
 def test_connection_configuration_failure_closes_connection(

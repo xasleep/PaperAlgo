@@ -18,7 +18,8 @@
 - 使用标准库 `sqlite3`、编号 migration、WAL、foreign keys 和 busy timeout，不引入 ORM。
 - `JOB_RUNTIME=legacy|sqlite` 提供回滚边界：legacy 保持现有 FastAPI 子进程行为；sqlite 由 `python -m web_api.worker` 独立消费 queued job。
 - SQLite 状态拆分为 execution、evaluation、quality 三个轴；所有状态更新经统一验证入口并使用 version 乐观锁。
-- sqlite runtime 使用单一全局 lease，默认 `max_concurrency=1`；Worker 在 `BEGIN IMMEDIATE` 事务中领取最早 queued job。
+- sqlite runtime 使用单一全局 lease，默认 `max_concurrency=1`；`worker_id` 只用于可读诊断，每个 Worker 实例另生成不经 API 暴露的 `instance_token`。lease 的获取、续租、释放和所有 Worker 写入都在同一 `BEGIN IMMEDIATE` 事务中同时校验 `worker_id`、`instance_token` 与过期时间；升级前没有 token 的 lease 仅能在过期后被接管。
+- Worker 领取最早 queued job 前，在同一事务中确认不存在其他 running job，作为 `max_concurrency=1` 的数据库级保护。
 - Worker 保存 `worker_id`、`launch_token`、PID、进程 create time、命令摘要和 heartbeat。Pipeline 位于独立进程组；取消前必须验证 PID/create time，身份不匹配时不发送终止信号并写入 `process_identity_mismatch`。
 - API 取消只写入幂等 job command。Worker 先请求优雅退出，最多等待 10 秒，再终止完整进程树，确认进程树退出后才把任务置为 `canceled`。
 

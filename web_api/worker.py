@@ -91,6 +91,7 @@ class PipelineWorker:
         *,
         repository: JobRepository | None = None,
         worker_id: str | None = None,
+        instance_token: str | None = None,
         max_concurrency: int = 1,
         poll_interval: float = 0.25,
         lease_seconds: float = 30.0,
@@ -111,6 +112,7 @@ class PipelineWorker:
             )
         self.repository = repository or JobRepository()
         self.worker_id = worker_id or _default_worker_id()
+        self.instance_token = instance_token or uuid.uuid4().hex
         self.max_concurrency = max_concurrency
         self.poll_interval = poll_interval
         self.lease_seconds = lease_seconds
@@ -139,6 +141,8 @@ class PipelineWorker:
     ) -> None:
         self.repository.fail_process(
             managed.job_id,
+            worker_id=self.worker_id,
+            instance_token=self.instance_token,
             launch_token=managed.launch_token,
             failure_code=failure_code,
             event_type=event_type,
@@ -188,6 +192,8 @@ class PipelineWorker:
             self._managed[job_id] = managed
             self.repository.heartbeat_process(
                 job_id,
+                worker_id=self.worker_id,
+                instance_token=self.instance_token,
                 launch_token=managed.launch_token,
             )
         self._reconciled = True
@@ -199,9 +205,12 @@ class PipelineWorker:
         self.repository.claim_cancel_command(
             str(job["job_id"]),
             worker_id=self.worker_id,
+            instance_token=self.instance_token,
         )
         self.repository.complete_cancellation(
             str(job["job_id"]),
+            worker_id=self.worker_id,
+            instance_token=self.instance_token,
             launch_token=launch_token,
             exit_code=None,
         )
@@ -216,6 +225,8 @@ class PipelineWorker:
         except (FileNotFoundError, SettingsNotConfiguredError, ValueError, OSError):
             self.repository.fail_process(
                 job_id,
+                worker_id=self.worker_id,
+                instance_token=self.instance_token,
                 launch_token=launch_token,
                 failure_code="process_launch_failed",
                 event_type="job.process_launch_failed",
@@ -224,6 +235,8 @@ class PipelineWorker:
         if not launch.command or not launch.command_summary:
             self.repository.fail_process(
                 job_id,
+                worker_id=self.worker_id,
+                instance_token=self.instance_token,
                 launch_token=launch_token,
                 failure_code="process_launch_failed",
                 event_type="job.process_launch_failed",
@@ -252,6 +265,8 @@ class PipelineWorker:
             log_file.close()
             self.repository.fail_process(
                 job_id,
+                worker_id=self.worker_id,
+                instance_token=self.instance_token,
                 launch_token=launch_token,
                 failure_code="process_launch_failed",
                 event_type="job.process_launch_failed",
@@ -264,6 +279,8 @@ class PipelineWorker:
             log_file.close()
             self.repository.fail_process(
                 job_id,
+                worker_id=self.worker_id,
+                instance_token=self.instance_token,
                 launch_token=launch_token,
                 failure_code="process_identity_unavailable",
                 event_type="job.process_launch_failed",
@@ -283,6 +300,8 @@ class PipelineWorker:
         try:
             self.repository.record_process_started(
                 job_id,
+                worker_id=self.worker_id,
+                instance_token=self.instance_token,
                 launch_token=launch_token,
                 pid=managed.pid,
                 process_create_time=managed.process_create_time,
@@ -299,6 +318,7 @@ class PipelineWorker:
         self.repository.claim_cancel_command(
             managed.job_id,
             worker_id=self.worker_id,
+            instance_token=self.instance_token,
         )
         result = terminate_verified_process_tree(
             pid=managed.pid,
@@ -332,6 +352,8 @@ class PipelineWorker:
                 exit_code = managed.process.poll()
         self.repository.complete_cancellation(
             managed.job_id,
+            worker_id=self.worker_id,
+            instance_token=self.instance_token,
             launch_token=managed.launch_token,
             exit_code=exit_code,
         )
@@ -349,6 +371,8 @@ class PipelineWorker:
                 if exit_code is not None:
                     self.repository.finish_process(
                         managed.job_id,
+                        worker_id=self.worker_id,
+                        instance_token=self.instance_token,
                         launch_token=managed.launch_token,
                         exit_code=exit_code,
                     )
@@ -375,12 +399,15 @@ class PipelineWorker:
                     continue
             self.repository.heartbeat_process(
                 managed.job_id,
+                worker_id=self.worker_id,
+                instance_token=self.instance_token,
                 launch_token=managed.launch_token,
             )
 
     def run_once(self) -> bool:
         lease_owned = self.repository.acquire_worker_lease(
             self.worker_id,
+            self.instance_token,
             lease_seconds=self.lease_seconds,
         )
         if not lease_owned:
@@ -392,13 +419,19 @@ class PipelineWorker:
         if not self._reconciled:
             self._reconcile()
 
-        while self.repository.cancel_next_queued_job(self.worker_id) is not None:
+        while (
+            self.repository.cancel_next_queued_job(
+                self.worker_id, self.instance_token
+            )
+            is not None
+        ):
             pass
         self._monitor_managed()
         if len(self._managed) < self.max_concurrency:
             launch_token = uuid.uuid4().hex
             job = self.repository.claim_next_queued_job(
                 worker_id=self.worker_id,
+                instance_token=self.instance_token,
                 launch_token=launch_token,
             )
             if job is not None:
@@ -416,7 +449,9 @@ class PipelineWorker:
 
     def close(self) -> None:
         if self._lease_owned:
-            self.repository.release_worker_lease(self.worker_id)
+            self.repository.release_worker_lease(
+                self.worker_id, self.instance_token
+            )
         self._lease_owned = False
         self._reconciled = False
         for job_id in list(self._managed):

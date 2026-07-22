@@ -238,10 +238,12 @@ class JobRepository:
     def acquire_worker_lease(
         self,
         worker_id: str,
+        instance_token: str,
         *,
         lease_seconds: float = 15.0,
     ) -> bool:
         worker_id = _runtime_identifier(worker_id, "worker_id")
+        instance_token = _runtime_identifier(instance_token, "instance_token")
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive.")
         now = utc_now()
@@ -257,29 +259,44 @@ class JobRepository:
                     connection.execute(
                         """
                         INSERT INTO worker_leases (
-                            lease_name, owner_id, expires_at, version,
+                            lease_name, owner_id, owner_token, expires_at, version,
                             acquired_at, updated_at
-                        ) VALUES (?, ?, ?, 1, ?, ?)
+                        ) VALUES (?, ?, ?, ?, 1, ?, ?)
                         """,
-                        (GLOBAL_WORKER_LEASE, worker_id, expires_at, now, now),
+                        (
+                            GLOBAL_WORKER_LEASE,
+                            worker_id,
+                            instance_token,
+                            expires_at,
+                            now,
+                            now,
+                        ),
                     )
                     connection.commit()
                     return True
-                if lease["owner_id"] != worker_id and lease["expires_at"] > now:
+                same_instance = (
+                    lease["owner_id"] == worker_id
+                    and lease["owner_token"] == instance_token
+                )
+                if not same_instance and lease["expires_at"] > now:
                     connection.rollback()
                     return False
                 acquired_at = (
-                    lease["acquired_at"] if lease["owner_id"] == worker_id else now
+                    lease["acquired_at"]
+                    if same_instance and lease["expires_at"] > now
+                    else now
                 )
                 connection.execute(
                     """
                     UPDATE worker_leases
-                    SET owner_id = ?, expires_at = ?, version = version + 1,
+                    SET owner_id = ?, owner_token = ?, expires_at = ?,
+                        version = version + 1,
                         acquired_at = ?, updated_at = ?
                     WHERE lease_name = ?
                     """,
                     (
                         worker_id,
+                        instance_token,
                         expires_at,
                         acquired_at,
                         now,
@@ -292,13 +309,17 @@ class JobRepository:
                 connection.rollback()
                 raise
 
-    def release_worker_lease(self, worker_id: str) -> bool:
+    def release_worker_lease(self, worker_id: str, instance_token: str) -> bool:
         worker_id = _runtime_identifier(worker_id, "worker_id")
+        instance_token = _runtime_identifier(instance_token, "instance_token")
         with closing(connect_database(self.database_path)) as connection:
             with connection:
                 cursor = connection.execute(
-                    "DELETE FROM worker_leases WHERE lease_name = ? AND owner_id = ?",
-                    (GLOBAL_WORKER_LEASE, worker_id),
+                    """
+                    DELETE FROM worker_leases
+                    WHERE lease_name = ? AND owner_id = ? AND owner_token = ?
+                    """,
+                    (GLOBAL_WORKER_LEASE, worker_id, instance_token),
                 )
         return cursor.rowcount == 1
 
@@ -306,14 +327,16 @@ class JobRepository:
     def _assert_current_lease(
         connection: sqlite3.Connection,
         worker_id: str,
+        instance_token: str,
         now: str,
     ) -> None:
         lease = connection.execute(
             """
             SELECT 1 FROM worker_leases
-            WHERE lease_name = ? AND owner_id = ? AND expires_at > ?
+            WHERE lease_name = ? AND owner_id = ? AND owner_token = ?
+              AND expires_at > ?
             """,
-            (GLOBAL_WORKER_LEASE, worker_id, now),
+            (GLOBAL_WORKER_LEASE, worker_id, instance_token, now),
         ).fetchone()
         if lease is None:
             raise RuntimeError("The worker does not hold the global lease.")
@@ -322,15 +345,25 @@ class JobRepository:
         self,
         *,
         worker_id: str,
+        instance_token: str,
         launch_token: str,
     ) -> dict[str, Any] | None:
         worker_id = _runtime_identifier(worker_id, "worker_id")
+        instance_token = _runtime_identifier(instance_token, "instance_token")
         launch_token = _runtime_identifier(launch_token, "launch_token")
         now = utc_now()
         with closing(connect_database(self.database_path)) as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
-                self._assert_current_lease(connection, worker_id, now)
+                self._assert_current_lease(
+                    connection, worker_id, instance_token, now
+                )
+                running = connection.execute(
+                    "SELECT 1 FROM jobs WHERE execution_status = 'running' LIMIT 1"
+                ).fetchone()
+                if running is not None:
+                    connection.commit()
+                    return None
                 current = connection.execute(
                     """
                     SELECT * FROM jobs
@@ -450,13 +483,20 @@ class JobRepository:
             ).fetchone()
         return dict(row) if row is not None else None
 
-    def cancel_next_queued_job(self, worker_id: str) -> dict[str, Any] | None:
+    def cancel_next_queued_job(
+        self,
+        worker_id: str,
+        instance_token: str,
+    ) -> dict[str, Any] | None:
         worker_id = _runtime_identifier(worker_id, "worker_id")
+        instance_token = _runtime_identifier(instance_token, "instance_token")
         now = utc_now()
         with closing(connect_database(self.database_path)) as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
-                self._assert_current_lease(connection, worker_id, now)
+                self._assert_current_lease(
+                    connection, worker_id, instance_token, now
+                )
                 row = connection.execute(
                     """
                     SELECT c.id AS command_id, j.*
@@ -520,14 +560,18 @@ class JobRepository:
         job_id: str,
         *,
         worker_id: str,
+        instance_token: str,
     ) -> dict[str, Any] | None:
         job_id = validate_job_id(job_id)
         worker_id = _runtime_identifier(worker_id, "worker_id")
+        instance_token = _runtime_identifier(instance_token, "instance_token")
         now = utc_now()
         with closing(connect_database(self.database_path)) as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
-                self._assert_current_lease(connection, worker_id, now)
+                self._assert_current_lease(
+                    connection, worker_id, instance_token, now
+                )
                 command = connection.execute(
                     """
                     SELECT * FROM job_commands
@@ -562,6 +606,8 @@ class JobRepository:
         self,
         job_id: str,
         *,
+        worker_id: str,
+        instance_token: str,
         launch_token: str,
         pid: int,
         process_create_time: str,
@@ -569,6 +615,8 @@ class JobRepository:
         command_summary: str,
     ) -> dict[str, Any]:
         job_id = validate_job_id(job_id)
+        worker_id = _runtime_identifier(worker_id, "worker_id")
+        instance_token = _runtime_identifier(instance_token, "instance_token")
         launch_token = _runtime_identifier(launch_token, "launch_token")
         if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
             raise ValueError("pid must be a positive integer.")
@@ -587,7 +635,11 @@ class JobRepository:
             raise ValueError("command_summary must be printable and at most 1024 characters.")
         now = utc_now()
         with closing(connect_database(self.database_path)) as connection:
-            with connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                self._assert_current_lease(
+                    connection, worker_id, instance_token, now
+                )
                 running = connection.execute(
                     "SELECT 1 FROM jobs WHERE job_id = ? AND execution_status = 'running'",
                     (job_id,),
@@ -614,23 +666,48 @@ class JobRepository:
                 )
                 if cursor.rowcount != 1:
                     raise OptimisticLockConflictError()
-        process = self.get_process(job_id)
-        if process is None:
-            raise OptimisticLockConflictError()
-        return process
+                process = connection.execute(
+                    "SELECT * FROM job_processes WHERE job_id = ?", (job_id,)
+                ).fetchone()
+                if process is None:
+                    raise OptimisticLockConflictError()
+                connection.commit()
+                return dict(process)
+            except Exception:
+                connection.rollback()
+                raise
 
-    def heartbeat_process(self, job_id: str, *, launch_token: str) -> bool:
+    def heartbeat_process(
+        self,
+        job_id: str,
+        *,
+        worker_id: str,
+        instance_token: str,
+        launch_token: str,
+    ) -> bool:
         job_id = validate_job_id(job_id)
+        worker_id = _runtime_identifier(worker_id, "worker_id")
+        instance_token = _runtime_identifier(instance_token, "instance_token")
+        launch_token = _runtime_identifier(launch_token, "launch_token")
+        now = utc_now()
         with closing(connect_database(self.database_path)) as connection:
-            with connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                self._assert_current_lease(
+                    connection, worker_id, instance_token, now
+                )
                 cursor = connection.execute(
                     """
                     UPDATE job_processes
                     SET heartbeat_at = ?
                     WHERE job_id = ? AND launch_token = ? AND exited_at IS NULL
                     """,
-                    (utc_now(), job_id, launch_token),
+                    (now, job_id, launch_token),
                 )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
         return cursor.rowcount == 1
 
     def get_process(self, job_id: str) -> dict[str, Any] | None:
@@ -661,6 +738,8 @@ class JobRepository:
         self,
         job_id: str,
         *,
+        worker_id: str,
+        instance_token: str,
         launch_token: str,
         execution_status: str,
         event_type: str,
@@ -669,10 +748,16 @@ class JobRepository:
         cancel_command_status: str | None = None,
     ) -> dict[str, Any]:
         job_id = validate_job_id(job_id)
+        worker_id = _runtime_identifier(worker_id, "worker_id")
+        instance_token = _runtime_identifier(instance_token, "instance_token")
+        launch_token = _runtime_identifier(launch_token, "launch_token")
         now = utc_now()
         with closing(connect_database(self.database_path)) as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
+                self._assert_current_lease(
+                    connection, worker_id, instance_token, now
+                )
                 current = connection.execute(
                     "SELECT * FROM jobs WHERE job_id = ?", (job_id,)
                 ).fetchone()
@@ -778,6 +863,8 @@ class JobRepository:
         self,
         job_id: str,
         *,
+        worker_id: str,
+        instance_token: str,
         launch_token: str,
         exit_code: int,
     ) -> dict[str, Any]:
@@ -786,6 +873,8 @@ class JobRepository:
         if exit_code == 0:
             return self._finish_running_process(
                 job_id,
+                worker_id=worker_id,
+                instance_token=instance_token,
                 launch_token=launch_token,
                 execution_status="completed",
                 event_type="job.process_completed",
@@ -794,6 +883,8 @@ class JobRepository:
             )
         return self._finish_running_process(
             job_id,
+            worker_id=worker_id,
+            instance_token=instance_token,
             launch_token=launch_token,
             execution_status="failed",
             event_type="job.process_failed",
@@ -805,11 +896,15 @@ class JobRepository:
         self,
         job_id: str,
         *,
+        worker_id: str,
+        instance_token: str,
         launch_token: str,
         exit_code: int | None,
     ) -> dict[str, Any]:
         return self._finish_running_process(
             job_id,
+            worker_id=worker_id,
+            instance_token=instance_token,
             launch_token=launch_token,
             execution_status="canceled",
             event_type="job.canceled",
@@ -822,6 +917,8 @@ class JobRepository:
         self,
         job_id: str,
         *,
+        worker_id: str,
+        instance_token: str,
         launch_token: str,
         failure_code: str,
         event_type: str = "job.process_failed",
@@ -831,6 +928,8 @@ class JobRepository:
         event_type = _runtime_identifier(event_type, "event_type")
         return self._finish_running_process(
             job_id,
+            worker_id=worker_id,
+            instance_token=instance_token,
             launch_token=launch_token,
             execution_status="failed",
             event_type=event_type,

@@ -148,6 +148,30 @@ def test_worker_entrypoint_help_is_available() -> None:
     assert "max-concurrency" in result.stdout
 
 
+def test_pipeline_worker_instances_have_unique_tokens_even_with_same_worker_id(
+    tmp_path: Path,
+) -> None:
+    repository = JobRepository(tmp_path / "paper2code.db")
+    first = PipelineWorker(repository=repository, worker_id="shared-name")
+    second = PipelineWorker(repository=repository, worker_id="shared-name")
+
+    try:
+        assert first.worker_id == second.worker_id == "shared-name"
+        assert first.instance_token != second.instance_token
+        explicit = PipelineWorker(
+            repository=repository,
+            worker_id="shared-name",
+            instance_token="deterministic-token",
+        )
+        try:
+            assert explicit.instance_token == "deterministic-token"
+        finally:
+            explicit.close()
+    finally:
+        first.close()
+        second.close()
+
+
 def test_single_worker_claims_fifo_and_never_runs_two_jobs(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -233,6 +257,39 @@ def test_only_global_lease_holder_can_claim(
         assert contender.run_once() is False
         assert _wait_until(lambda: (started_dir / "leased_job").exists())
         assert repository.get_process("leased_job")["worker_id"] == "lease-owner"
+    finally:
+        contender.close()
+        _stop_worker_jobs(owner, repository)
+
+
+def test_same_worker_id_does_not_allow_two_pipeline_workers_to_claim(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(job_service, "RUNS_DIR", tmp_path / "runs")
+    repository = JobRepository(tmp_path / "paper2code.db")
+    _create(repository, "leased_job")
+    builder, started_dir, _, _ = _fake_builder(tmp_path)
+    owner = PipelineWorker(
+        repository=repository,
+        worker_id="shared-name",
+        instance_token="owner-token",
+        command_builder=builder,
+        cancel_grace_seconds=0.2,
+    )
+    contender = PipelineWorker(
+        repository=repository,
+        worker_id="shared-name",
+        instance_token="contender-token",
+        command_builder=builder,
+        cancel_grace_seconds=0.2,
+    )
+
+    try:
+        assert owner.run_once() is True
+        assert contender.run_once() is False
+        assert _wait_until(lambda: (started_dir / "leased_job").exists())
+        assert repository.get_process("leased_job")["worker_id"] == "shared-name"
     finally:
         contender.close()
         _stop_worker_jobs(owner, repository)
@@ -325,21 +382,24 @@ def test_process_identity_mismatch_never_kills_unrelated_process(
     )
 
     try:
-        assert repository.acquire_worker_lease("old-worker") is True
+        assert repository.acquire_worker_lease("old-worker", "old-token") is True
         claimed = repository.claim_next_queued_job(
             worker_id="old-worker",
+            instance_token="old-token",
             launch_token="old-launch-token",
         )
         assert claimed is not None
-        assert repository.release_worker_lease("old-worker") is True
         repository.record_process_started(
             "identity_attack",
+            worker_id="old-worker",
+            instance_token="old-token",
             launch_token="old-launch-token",
             pid=unrelated.pid,
             process_create_time="definitely-not-the-real-create-time",
             process_group_id=unrelated.pid,
             command_summary="python fake_pipeline.py --job-id identity_attack",
         )
+        assert repository.release_worker_lease("old-worker", "old-token") is True
         repository.request_cancel("identity_attack")
 
         assert worker.run_once() is True
@@ -377,21 +437,24 @@ def test_startup_reconciliation_monitors_matching_process_and_leaves_queue(
     )
     create_time = get_process_create_time(process.pid, process)
     assert create_time is not None
-    assert repository.acquire_worker_lease("old-worker") is True
+    assert repository.acquire_worker_lease("old-worker", "old-token") is True
     claimed = repository.claim_next_queued_job(
         worker_id="old-worker",
+        instance_token="old-token",
         launch_token="reconcile-launch-token",
     )
     assert claimed is not None
     repository.record_process_started(
         "reconcile_running",
+        worker_id="old-worker",
+        instance_token="old-token",
         launch_token="reconcile-launch-token",
         pid=process.pid,
         process_create_time=create_time,
         process_group_id=job_service.process_group_id(process),
         command_summary="python fake_pipeline.py --job-id reconcile_running",
     )
-    assert repository.release_worker_lease("old-worker") is True
+    assert repository.release_worker_lease("old-worker", "old-token") is True
     worker = PipelineWorker(
         repository=repository,
         worker_id="recovery-worker",
@@ -424,20 +487,23 @@ def test_startup_reconciliation_marks_dead_process_as_explainable_failure(
     )
     create_time = get_process_create_time(process.pid, process)
     assert create_time is not None
-    assert repository.acquire_worker_lease("old-worker") is True
+    assert repository.acquire_worker_lease("old-worker", "old-token") is True
     repository.claim_next_queued_job(
         worker_id="old-worker",
+        instance_token="old-token",
         launch_token="dead-launch-token",
     )
     repository.record_process_started(
         "reconcile_dead",
+        worker_id="old-worker",
+        instance_token="old-token",
         launch_token="dead-launch-token",
         pid=process.pid,
         process_create_time=create_time,
         process_group_id=job_service.process_group_id(process),
         command_summary="python fake_pipeline.py --job-id reconcile_dead",
     )
-    assert repository.release_worker_lease("old-worker") is True
+    assert repository.release_worker_lease("old-worker", "old-token") is True
     assert job_service.terminate_process_tree(process.pid, process, timeout=3)[0]
     worker = PipelineWorker(
         repository=repository,
