@@ -1,5 +1,7 @@
 # 001 Provider API And Kimi Pricing
 
+> Historical note: PR-05 supersedes the prefix-based routing and undated price tables described below. Current remote calls use the explicit versioned Provider/Model Registry, and unknown prices remain unavailable.
+
 - 修改时间：2026-07-08 19:33
 - 简要总结：为 Paper2Code 增加多 Provider OpenAI-compatible API 路由，并补充 Kimi / DeepSeek 的 token 成本统计能力。
 

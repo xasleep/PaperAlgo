@@ -71,3 +71,20 @@ def test_spa_jobs_is_independent_of_accept_and_api_remains_json(
     assert '<div id="root"></div>' in alternate_accept.text
     assert api_response.status_code == 200
     assert api_response.json() == {"jobs": []}
+
+
+def test_settings_ui_uses_registry_discovery_without_provider_or_model_allowlists() -> None:
+    web_ui = Path(__file__).resolve().parents[1] / "web_ui" / "src"
+    settings_source = (web_ui / "pages" / "SettingsPage.tsx").read_text(
+        encoding="utf-8"
+    )
+    types_source = (web_ui / "api" / "types.ts").read_text(encoding="utf-8")
+    client_source = (web_ui / "api" / "client.ts").read_text(encoding="utf-8")
+
+    assert "const PROVIDERS" not in settings_source
+    assert "getProviders" in settings_source
+    assert "getProviders" in client_source
+    assert "ProviderRegistryResponse" in types_source
+    assert "ProviderName = string" in types_source
+    for hard_coded_provider in ('"openai" |', '"deepseek" |', '"claude"'):
+        assert hard_coded_provider not in types_source

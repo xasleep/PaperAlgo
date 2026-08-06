@@ -46,6 +46,17 @@ EVENT_SOURCES = frozenset({"control_plane", "pipeline_adapter", "recovery", "wor
 GLOBAL_WORKER_LEASE = "pipeline-worker"
 CANCEL_DEDUPE_HASH = hashlib.sha256(b"cancel:v1").hexdigest()
 DEFAULT_MAX_RECOVERIES = 1
+PROVIDER_SNAPSHOT_FIELDS = frozenset(
+    {
+        "reproduce_provider",
+        "reproduce_model",
+        "evaluation_provider",
+        "evaluation_model",
+        "evaluation_fallback_models",
+        "provider_registry_version",
+        "provider_contract_fingerprint",
+    }
+)
 
 
 def _future_utc(seconds: float) -> str:
@@ -121,6 +132,56 @@ def _idempotency_hash(value: str | None) -> str | None:
     return hashlib.sha256(value.encode("ascii")).hexdigest()
 
 
+def _normalize_provider_snapshot(
+    snapshot: Mapping[str, object] | None,
+) -> dict[str, object | None]:
+    if snapshot is None:
+        return {field: None for field in PROVIDER_SNAPSHOT_FIELDS}
+    if not isinstance(snapshot, Mapping) or set(snapshot) != PROVIDER_SNAPSHOT_FIELDS:
+        raise ValueError("Provider selection snapshot has invalid fields.")
+    normalized = dict(snapshot)
+    for field in (
+        "reproduce_provider",
+        "reproduce_model",
+        "evaluation_provider",
+        "evaluation_model",
+    ):
+        value = normalized[field]
+        if (
+            not isinstance(value, str)
+            or not 1 <= len(value) <= 128
+            or not value.isascii()
+            or not value.isprintable()
+        ):
+            raise ValueError("Provider selection IDs must be printable ASCII strings.")
+    fallbacks = normalized["evaluation_fallback_models"]
+    if (
+        not isinstance(fallbacks, (list, tuple))
+        or len(fallbacks) > 32
+        or not all(
+            isinstance(model_id, str)
+            and 1 <= len(model_id) <= 128
+            and model_id.isascii()
+            and model_id.isprintable()
+            for model_id in fallbacks
+        )
+        or len(set(fallbacks)) != len(fallbacks)
+    ):
+        raise ValueError("Evaluation fallback model IDs are invalid.")
+    version = normalized["provider_registry_version"]
+    if isinstance(version, bool) or not isinstance(version, int) or version < 1:
+        raise ValueError("Provider registry version must be a positive integer.")
+    fingerprint = normalized["provider_contract_fingerprint"]
+    if (
+        not isinstance(fingerprint, str)
+        or len(fingerprint) != 64
+        or any(character not in "0123456789abcdef" for character in fingerprint)
+    ):
+        raise ValueError("Provider contract fingerprint must be lowercase SHA-256.")
+    normalized["evaluation_fallback_models"] = list(fallbacks)
+    return normalized
+
+
 def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     result = dict(row)
     for field in ("auto_refine", "skip_mineru"):
@@ -128,6 +189,11 @@ def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
             result[field] = bool(result[field])
     result.pop("idempotency_key_hash", None)
     result.pop("request_hash", None)
+    if "evaluation_fallback_models_json" in result:
+        encoded_fallbacks = result.pop("evaluation_fallback_models_json")
+        result["evaluation_fallback_models"] = (
+            None if encoded_fallbacks is None else json.loads(encoded_fallbacks)
+        )
     return result
 
 
@@ -142,6 +208,7 @@ class JobRepository:
         request: Mapping[str, object],
         paper_name: str,
         idempotency_key: str | None = None,
+        provider_snapshot: Mapping[str, object] | None = None,
     ) -> tuple[dict[str, Any], bool]:
         job_id = validate_job_id(job_id)
         normalized, request_hash = _canonical_request(request)
@@ -163,6 +230,17 @@ class JobRepository:
                         connection.commit()
                         return _row_to_dict(existing), False
 
+                snapshot = _normalize_provider_snapshot(provider_snapshot)
+                fallback_models_json = (
+                    None
+                    if snapshot["evaluation_fallback_models"] is None
+                    else json.dumps(
+                        snapshot["evaluation_fallback_models"],
+                        ensure_ascii=True,
+                        separators=(",", ":"),
+                    )
+                )
+
                 connection.execute(
                     """
                     INSERT INTO jobs (
@@ -170,8 +248,11 @@ class JobRepository:
                         upload_id, domain, eval_type, generated_n, auto_refine,
                         max_repair_rounds, console_output, skip_mineru,
                         pdf_markdown_path, execution_status, evaluation_status,
-                        quality_status, version, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        quality_status, version, created_at, updated_at,
+                        reproduce_provider, reproduce_model, evaluation_provider,
+                        evaluation_model, evaluation_fallback_models_json,
+                        provider_registry_version, provider_contract_fingerprint
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         job_id,
@@ -193,6 +274,13 @@ class JobRepository:
                         1,
                         now,
                         now,
+                        snapshot["reproduce_provider"],
+                        snapshot["reproduce_model"],
+                        snapshot["evaluation_provider"],
+                        snapshot["evaluation_model"],
+                        fallback_models_json,
+                        snapshot["provider_registry_version"],
+                        snapshot["provider_contract_fingerprint"],
                     ),
                 )
                 connection.execute(

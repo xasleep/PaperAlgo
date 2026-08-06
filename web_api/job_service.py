@@ -9,7 +9,14 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import BinaryIO, TextIO
+from typing import BinaryIO, Mapping, TextIO
+
+from codes.provider_registry import (
+    REGISTRY_PATH_ENV,
+    ProviderContractError,
+    ProviderRegistry,
+    get_provider_registry,
+)
 
 from .config import CODES_DIR, MAX_PDF_UPLOAD_BYTES, REPO_ROOT, RUNS_DIR, UPLOADS_DIR
 from .errors import (
@@ -51,6 +58,7 @@ SYSTEM_ENV_ALLOWLIST = {
     "LANG",
     "LOCALAPPDATA",
     "NUMBER_OF_PROCESSORS",
+    "PAPER2CODE_PROVIDER_REGISTRY_PATH",
     "PATH",
     "PATHEXT",
     "PROCESSOR_ARCHITECTURE",
@@ -76,6 +84,123 @@ PROVIDER_ENV_NAMES = {
     "OPENAI_API_KEY",
     "OPENAI_BASE_URL",
 }
+
+
+class ProviderSettingsChangedError(ValueError):
+    """Queued provider selection no longer matches current local credentials."""
+
+
+def _provider_selections(settings: WebSettings) -> list[tuple[str, str, str]]:
+    selections = [
+        ("reproduce", settings.reproduce.provider, settings.reproduce.model),
+        ("evaluation", settings.evaluation.provider, settings.evaluation.model),
+    ]
+    selections.extend(
+        (
+            f"evaluation_fallback:{index}",
+            settings.evaluation.provider,
+            model_id,
+        )
+        for index, model_id in enumerate(settings.evaluation.fallback_models)
+    )
+    return selections
+
+
+def validate_provider_settings_contract(
+    settings: WebSettings,
+    *,
+    registry: ProviderRegistry | None = None,
+) -> None:
+    active_registry = registry or get_provider_registry()
+    fallback_models = list(settings.evaluation.fallback_models)
+    active_registry.validate_fallback_chain(
+        settings.evaluation.provider,
+        settings.evaluation.model,
+        fallback_models,
+    )
+    selections = [
+        (
+            settings.reproduce.provider,
+            settings.reproduce.model,
+            settings.reproduce.api_key,
+            settings.reproduce.base_url,
+        ),
+        (
+            settings.evaluation.provider,
+            settings.evaluation.model,
+            settings.evaluation.api_key,
+            settings.evaluation.base_url,
+        ),
+    ]
+    selections.extend(
+        (
+            settings.evaluation.provider,
+            model_id,
+            settings.evaluation.api_key,
+            settings.evaluation.base_url,
+        )
+        for model_id in fallback_models
+    )
+    for provider_id, model_id, api_key, base_url in selections:
+        active_registry.resolve(
+            provider_id,
+            model_id,
+            api_key=api_key,
+            base_url=base_url,
+            environ={},
+        )
+
+
+def build_provider_selection_snapshot(
+    settings: WebSettings,
+    *,
+    registry: ProviderRegistry | None = None,
+) -> dict[str, object]:
+    active_registry = registry or get_provider_registry()
+    selections = _provider_selections(settings)
+    for _, provider_id, model_id in selections:
+        active_registry.get(provider_id, model_id)
+    return {
+        "reproduce_provider": settings.reproduce.provider,
+        "reproduce_model": settings.reproduce.model,
+        "evaluation_provider": settings.evaluation.provider,
+        "evaluation_model": settings.evaluation.model,
+        "evaluation_fallback_models": list(settings.evaluation.fallback_models),
+        "provider_registry_version": active_registry.version,
+        "provider_contract_fingerprint": active_registry.selection_fingerprint(selections),
+    }
+
+
+def validate_provider_selection_snapshot(
+    job: Mapping[str, object],
+    settings: WebSettings,
+    *,
+    registry: ProviderRegistry | None = None,
+) -> None:
+    expected_fields = {
+        "reproduce_provider",
+        "reproduce_model",
+        "evaluation_provider",
+        "evaluation_model",
+        "evaluation_fallback_models",
+        "provider_registry_version",
+        "provider_contract_fingerprint",
+    }
+    if any(job.get(field) is None for field in expected_fields):
+        raise ProviderSettingsChangedError(
+            "Queued job has no trusted provider selection snapshot."
+        )
+    try:
+        validate_provider_settings_contract(settings, registry=registry)
+        current = build_provider_selection_snapshot(settings, registry=registry)
+    except (ProviderContractError, ValueError) as exc:
+        raise ProviderSettingsChangedError(
+            "Current provider settings do not satisfy the queued selection snapshot."
+        ) from exc
+    if any(job.get(field) != current[field] for field in expected_fields):
+        raise ProviderSettingsChangedError(
+            "Current provider settings do not match the queued selection snapshot."
+        )
 
 
 def compact_now_str() -> str:
@@ -356,6 +481,9 @@ def build_pipeline_env(settings: WebSettings) -> dict[str, str]:
         for name, value in os.environ.items()
         if name.upper() in SYSTEM_ENV_ALLOWLIST and name.upper() not in PROVIDER_ENV_NAMES
     }
+    registry_path = env.get(REGISTRY_PATH_ENV)
+    if registry_path and not os.path.isabs(registry_path):
+        env[REGISTRY_PATH_ENV] = os.path.abspath(registry_path)
     env.update(
         {
             "PYTHONIOENCODING": "utf-8",

@@ -59,16 +59,41 @@ def _settings() -> WebSettings:
     return WebSettings(
         reproduce={
             "provider": "openai",
-            "model": "fake-model",
+            "model": "gpt-4.1-mini",
             "api_key": "fake-reproduce-key",
+            "base_url": "https://reproduce.invalid/v1",
         },
         evaluation={
             "provider": "openai",
-            "model": "fake-model",
+            "model": "gpt-4.1-mini",
             "api_key": "fake-evaluation-key",
+            "base_url": "https://evaluation.invalid/v1",
             "fallback_models": [],
         },
     )
+
+
+def _settings_for(provider: str, model: str, *, key_suffix: str) -> WebSettings:
+    return WebSettings(
+        reproduce={
+            "provider": provider,
+            "model": model,
+            "api_key": f"fake-reproduce-{key_suffix}",
+            "base_url": f"https://reproduce-{key_suffix}.invalid/v1",
+        },
+        evaluation={
+            "provider": provider,
+            "model": model,
+            "api_key": f"fake-evaluation-{key_suffix}",
+            "base_url": f"https://evaluation-{key_suffix}.invalid/v1",
+            "fallback_models": [],
+        },
+    )
+
+
+def _selection_snapshot(settings: WebSettings | None = None) -> dict[str, object]:
+    builder = getattr(job_service, "build_provider_selection_snapshot")
+    return builder(settings or _settings())
 
 
 def _fake_pipeline_script(tmp_path: Path) -> Path:
@@ -500,6 +525,151 @@ def test_missing_settings_is_job_launch_failure_not_worker_failure(
         worker.close()
 
 
+def test_worker_fails_closed_before_popen_when_queued_selection_changed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    repository = JobRepository(tmp_path / "paper2code.db")
+    repository.create_job(
+        job_id="provider_selection_changed",
+        request=_request(),
+        paper_name="paper",
+        provider_snapshot=_selection_snapshot(),
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "load_settings",
+        lambda: _settings_for("deepseek", "deepseek-v4-pro", key_suffix="changed"),
+    )
+    monkeypatch.setattr(job_service, "resolve_upload", lambda upload_id: tmp_path / "paper.pdf")
+    popen_calls: list[str] = []
+
+    def forbidden_popen(*args, **kwargs):
+        popen_calls.append("called")
+        raise AssertionError("provider settings mismatch must fail before Popen")
+
+    monkeypatch.setattr(worker_module.subprocess, "Popen", forbidden_popen)
+    worker = PipelineWorker(
+        repository=repository,
+        worker_id="provider-selection-worker",
+        instance_token="provider-selection-token",
+    )
+
+    try:
+        assert worker.run_once() is True
+        job = repository.get_job("provider_selection_changed")
+        assert job["execution_status"] == "failed"
+        assert job["failure_code"] == "provider_settings_changed"
+        assert popen_calls == []
+    finally:
+        worker.close()
+
+
+@pytest.mark.parametrize("snapshot_mode", ["missing", "fingerprint_changed"])
+def test_worker_fails_closed_before_popen_for_untrusted_queued_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    snapshot_mode: str,
+) -> None:
+    repository = JobRepository(tmp_path / f"{snapshot_mode}.db")
+    snapshot = None
+    if snapshot_mode == "fingerprint_changed":
+        snapshot = {
+            **_selection_snapshot(),
+            "provider_contract_fingerprint": "f" * 64,
+        }
+    repository.create_job(
+        job_id=f"snapshot_{snapshot_mode}",
+        request=_request(),
+        paper_name="paper",
+        provider_snapshot=snapshot,
+    )
+    monkeypatch.setattr(worker_module, "load_settings", _settings)
+    monkeypatch.setattr(job_service, "resolve_upload", lambda upload_id: tmp_path / "paper.pdf")
+    popen_calls: list[str] = []
+    monkeypatch.setattr(
+        worker_module.subprocess,
+        "Popen",
+        lambda *args, **kwargs: popen_calls.append("called"),
+    )
+    worker = PipelineWorker(
+        repository=repository,
+        worker_id=f"worker-{snapshot_mode}",
+        instance_token=f"token-{snapshot_mode}",
+    )
+
+    try:
+        assert worker.run_once() is True
+        job = repository.get_job(f"snapshot_{snapshot_mode}")
+        assert job["execution_status"] == "failed"
+        assert job["failure_code"] == "provider_settings_changed"
+        assert popen_calls == []
+    finally:
+        worker.close()
+
+
+def test_worker_uses_rotated_credentials_for_same_queued_selection(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    repository = JobRepository(tmp_path / "paper2code.db")
+    repository.create_job(
+        job_id="rotated_credentials",
+        request=_request(),
+        paper_name="paper",
+        provider_snapshot=_selection_snapshot(),
+    )
+    job = repository.get_job("rotated_credentials")
+    rotated = _settings_for("openai", "gpt-4.1-mini", key_suffix="rotated")
+    monkeypatch.setattr(worker_module, "load_settings", lambda: rotated)
+    monkeypatch.setattr(job_service, "resolve_upload", lambda upload_id: tmp_path / "paper.pdf")
+
+    launch = worker_module._pipeline_launch_spec(job)
+
+    assert launch.environment["REPRODUCE_API_KEY"] == "fake-reproduce-rotated"
+    assert launch.environment["EVAL_API_KEY"] == "fake-evaluation-rotated"
+    assert "fake-reproduce-key" not in repr(launch)
+    assert "fake-evaluation-key" not in repr(launch)
+
+
+def test_worker_fails_closed_before_popen_when_rotated_credentials_are_invalid(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    repository = JobRepository(tmp_path / "paper2code.db")
+    repository.create_job(
+        job_id="rotated_invalid_credentials",
+        request=_request(),
+        paper_name="paper",
+        provider_snapshot=_selection_snapshot(),
+    )
+    invalid_rotated = _settings_for("openai", "gpt-4.1-mini", key_suffix="rotated")
+    invalid_rotated.reproduce.base_url = ""
+    monkeypatch.setattr(worker_module, "load_settings", lambda: invalid_rotated)
+    monkeypatch.setattr(job_service, "resolve_upload", lambda upload_id: tmp_path / "paper.pdf")
+    popen_calls: list[str] = []
+
+    def forbidden_popen(*args, **kwargs):
+        popen_calls.append("called")
+        raise AssertionError("invalid rotated credentials must fail before Popen")
+
+    monkeypatch.setattr(worker_module.subprocess, "Popen", forbidden_popen)
+    worker = PipelineWorker(
+        repository=repository,
+        worker_id="invalid-rotated-worker",
+        instance_token="invalid-rotated-token",
+    )
+
+    try:
+        assert worker.run_once() is True
+        job = repository.get_job("rotated_invalid_credentials")
+        assert job["execution_status"] == "failed"
+        assert job["failure_code"] == "provider_settings_changed"
+        assert popen_calls == []
+    finally:
+        worker.close()
+
+
 def test_missing_uploaded_pdf_is_job_launch_failure_not_worker_failure(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -507,7 +677,12 @@ def test_missing_uploaded_pdf_is_job_launch_failure_not_worker_failure(
     monkeypatch.setattr(job_service, "UPLOADS_DIR", tmp_path / "uploads")
     monkeypatch.setattr(worker_module, "load_settings", _settings)
     repository = JobRepository(tmp_path / "paper2code.db")
-    _create(repository, "upload_missing", upload_id="1" * 32)
+    repository.create_job(
+        job_id="upload_missing",
+        request=_request(upload_id="1" * 32),
+        paper_name="paper",
+        provider_snapshot=_selection_snapshot(),
+    )
     worker = PipelineWorker(
         repository=repository,
         worker_id="upload-worker",

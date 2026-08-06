@@ -1,10 +1,12 @@
 from pathlib import Path
 from threading import Lock
 
-from fastapi import APIRouter, FastAPI, File, Header, Query, Request, UploadFile
+from fastapi import APIRouter, FastAPI, File, Header, Query, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from starlette.concurrency import run_in_threadpool
+
+from codes.provider_registry import ProviderContractError, get_provider_registry
 
 from .artifact_service import (
     artifact_summary,
@@ -27,6 +29,7 @@ from .errors import (
     InternalApiError,
     InvalidParameterError,
     JobNotCancelableError,
+    ProviderConfigurationError,
     SettingsNotConfiguredError,
     install_exception_handlers,
 )
@@ -52,6 +55,9 @@ from .schemas import (
     JobListResponse,
     JsonDict,
     LogsResponse,
+    ProviderDiscovery,
+    ProviderModelDiscovery,
+    ProviderRegistryResponse,
     RepoFileResponse,
     RepoTreeResponse,
     SessionResponse,
@@ -143,6 +149,7 @@ async def set_session_cookie(request: Request, call_next):
 
 @api.post("/settings", response_model=SettingsStatus)
 def update_settings(settings: WebSettings) -> SettingsStatus:
+    _validate_provider_settings(settings)
     try:
         save_settings(settings)
     except LocalStorageSecurityError as exc:
@@ -153,6 +160,51 @@ def update_settings(settings: WebSettings) -> SettingsStatus:
 @api.get("/settings/status", response_model=SettingsStatus)
 def settings_status() -> SettingsStatus:
     return get_settings_status()
+
+
+@api.get("/providers", response_model=ProviderRegistryResponse)
+def provider_discovery(response: Response) -> ProviderRegistryResponse:
+    registry = get_provider_registry()
+    providers: list[ProviderDiscovery] = []
+    for provider_id in registry.provider_ids:
+        models = [
+            ProviderModelDiscovery(
+                model_id=contract.model_id,
+                max_n=contract.max_n,
+                context_window=contract.context_window,
+                max_output_tokens=contract.max_output_tokens,
+                json_schema_support=contract.json_schema_support,
+                usage_support=contract.usage_support,
+                cache_token_support=contract.cache_token_support,
+            )
+            for model_id in registry.model_ids(provider_id)
+            for contract in (registry.get(provider_id, model_id),)
+        ]
+        if models:
+            providers.append(ProviderDiscovery(provider_id=provider_id, models=models))
+    response.headers["Cache-Control"] = "no-store"
+    return ProviderRegistryResponse(
+        registry_version=registry.version,
+        providers=providers,
+    )
+
+
+def _raise_provider_configuration_error(exc: ProviderContractError) -> None:
+    raise ProviderConfigurationError(
+        exc.code,
+        str(exc),
+        details=exc.safe_details,
+    ) from exc
+
+
+def _validate_provider_settings(settings: WebSettings) -> None:
+    try:
+        job_service_module.validate_provider_settings_contract(
+            settings,
+            registry=get_provider_registry(),
+        )
+    except ProviderContractError as exc:
+        _raise_provider_configuration_error(exc)
 
 
 @api.post("/uploads", response_model=UploadResponse)
@@ -304,6 +356,13 @@ def _sqlite_create_response(
         evaluation_status=str(job["evaluation_status"]),
         quality_status=str(job["quality_status"]),
         version=int(job["version"]),
+        reproduce_provider=job.get("reproduce_provider"),
+        reproduce_model=job.get("reproduce_model"),
+        evaluation_provider=job.get("evaluation_provider"),
+        evaluation_model=job.get("evaluation_model"),
+        evaluation_fallback_models=job.get("evaluation_fallback_models"),
+        provider_registry_version=job.get("provider_registry_version"),
+        provider_contract_fingerprint=job.get("provider_contract_fingerprint"),
     )
 
 
@@ -331,16 +390,21 @@ def create_job(
     settings = load_settings()
     if settings is None:
         raise SettingsNotConfiguredError()
+    _validate_provider_settings(settings)
 
     pdf_path = resolve_upload(payload.upload_id)
     resolved_paper_name = sanitize_name(payload.paper_name, "paper")
     job_id = make_job_id(resolved_paper_name)
     if repository is not None:
+        provider_snapshot = job_service_module.build_provider_selection_snapshot(
+            settings
+        )
         job, _ = repository.create_job(
             job_id=job_id,
             request=request_data,
             paper_name=resolved_paper_name,
             idempotency_key=idempotency_key,
+            provider_snapshot=provider_snapshot,
         )
         return _sqlite_create_response(job, repository)
 

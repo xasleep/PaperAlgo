@@ -8,6 +8,8 @@
 
 当前提供标准库 SQLite 持久化控制面，但默认 `JOB_RUNTIME=legacy` 仍保持既有子进程行为；`JOB_RUNTIME=sqlite` 由 `python -m web_api.worker` 启动独立单并发 Worker，并提供 PID/create-time 进程级 reconciliation、固定阶段 checkpoint 与默认最多 1 次的受限恢复。checkpoint adapter 只由 SQLite Worker 启用，legacy runtime 不获得阶段恢复。当前没有任意语句级 checkpoint、exactly-once、SSE、WebSocket、Celery、Redis、PostgreSQL、Kubernetes 或 LangGraph。WebUI 对活跃任务每 2 秒轮询，FastAPI 只支持单实例。
 
+PR-05 的 Provider Registry v1 是封闭且深度不可变的显式契约；未知 schema 字段、非法 request options、非有限/越界数字和不可信 fallback 直接以脱敏错误拒绝。`GET /api/v1/providers` 从当前 Registry 动态生成 WebUI 可选项，只返回非敏感 ID/能力并使用 `no-store`；`settings/status` 仍只返回布尔状态。SQLite queued job 固定 Provider/Model/fallback、Registry version 和 Contract SHA-256，不保存 key 或 base URL。Worker 只允许同一选择下轮换凭据，不匹配或缺少快照时在 `Popen` 前以 `provider_settings_changed` fail closed；legacy runtime 不变。API key 仍是本地明文 settings 与临时子进程环境数据，不是加密存储。PR-06 cost ledger 和 PR-07 SSE 尚未实现。
+
 SQLite Worker 对本地进程先观察真实退出码，再消费取消命令：exit 0 直接 completed；在线非零退出与 Worker 重启后 confirmed-missing 使用同一恢复资格判断；晚到 cancel 失败为 `already_finished`，不会把自然退出误记为 canceled 或触发恢复。取消前续租并重新验证 PID/create time/process group，Windows 强制终止绑定到同一进程句柄并有界等待，只有完整树已确认退出才持久化 canceled。单 job 的设置、输入、命令或进程创建错误记录为 `process_launch_failed` 后继续轮询；SQLite、fencing、持久化、乐观冲突和未知错误保持 fail fast。
 
 PR-04B checkpoint 采用固定 schema、64 KiB 上限、原子替换、连续 stage chain 和相对路径/size/SHA-256 产物指纹。completed checkpoint 验证完整恢复状态闭包：可信 Markdown、Planning 输出和与 Planning 指纹一致的 TaskManifest、配置、分析结果，以及当前 Manifest repo 成员和必要状态结果；不会只复核最新 JSON 的少量本阶段产物。running/failed/部分阶段从上一个可信 completed 边界指向的阶段开头重跑，语义为 stage-boundary at-least-once。只有完整登记身份且已确认死亡的进程可恢复；`identity_unresolved` 永不恢复并继续占用唯一槽位。默认最多恢复 1 次，恢复使用新 launch token、保留旧进程历史，并在同一 lease-fenced 事务中持久化恢复计数。legacy runtime 不启用 checkpoint，系统不保证任意语句级恢复或 exactly-once。
@@ -61,6 +63,20 @@ Set-Location ..
 - 测试不得依赖开发者机器的绝对路径、真实 API key 或既有运行目录。
 - 涉及输入、路径、导出、环境变量或敏感数据的新安全逻辑，先增加失败/攻击测试，再实现修复。
 - 不允许通过捕获所有异常、返回空结果或强制成功退出掩盖错误。
+
+## Provider/Model 契约基线（PR-05）
+
+- 远程 LLM 调用以 `provider_id + model_id` 为唯一选择键；禁止模型前缀猜测、密钥兜底猜测或隐式 OpenAI endpoint。
+- `codes/providers.v1.json` 是默认版本化清单，`codes/provider_registry.py` 负责结构校验、运行时凭据/base URL 解析、请求 `max_n`/context/output/JSON Schema 门禁，以及 timeout/retry/concurrency 约束。
+- 未验证的 context window、output 上限、能力或价格必须保持 `null`/`unknown`。只有同时记录币种、输入/输出单价和生效日期的价格才可用于成本计算。
+- Web Settings 保存和 job 入队前均复核 Registry；未知 Provider/模型、空白密钥或必要 base URL 缺失返回脱敏 422，且不会创建队列记录或启动 Pipeline。
+- `max_n=1` 时，应用层按 `generated_n` 拆分独立单候选请求；`generated_n=1` 不显式发送 `n`，总候选数仍限制为 1–32，请求还受模型并发上限约束。fallback model 必须按字面值解析并注册在同一显式 Provider 下，非法链在客户端创建前失败。
+- fake provider 测试覆盖正常响应、`max_n=1`、未知模型、缺少 key/base URL、429、timeout、部分 usage 与 context 超限；自动化测试不发出真实付费请求。
+- CLI 阶段环境是最小投影：角色变量优先，缺失时读取所选模型契约声明的 Provider 原生变量；不复制父进程完整环境，不携带未选 Provider 或另一角色的凭据。
+- 默认模型清单是项目当前支持清单，不是官方模型全集镜像。2026-08-06 依据 DeepSeek、Alibaba Cloud Model Studio、Kimi 与 OpenAI 官方文档复核：OpenAI active 仅保留 `gpt-4.1-mini`、`gpt-4o-mini`，`o3-mini`/`o4-mini` 因 Deprecated 不进入新任务；DeepSeek 仅保留 V4 Pro/Flash；Qwen 保留官方 `qwen3.8-max` 与 `qwen3.7-*` 拼写；Kimi 保留 `kimi-k3`、`kimi-k2.7-code`、`kimi-k2.7-code-highspeed`、`kimi-k2.6`，其中 K3 通过省略固定参数支持。
+- 默认 `base_url=null` 表示要求用户显式配置 endpoint/地域，并非官方 endpoint 未知；JSON Output/Structured Output 不自动等价为 JSON Schema 支持。
+
+PR-05 本地验收快照（2026-08-06）：定向 Provider Registry 验收 `199 passed, 1 warning`；Python 全量测试 `567 passed, 1 warning`；WebUI `npm.cmd ci`、`typecheck`、`build`、`verify:same-origin`、`smoke`、`smoke:prod` 均 exit 0。沙箱身份下曾因 Windows ACL/进程树权限出现假失败，以上通过数来自仓库所有者身份复跑。
 
 ## 版本管理基线
 

@@ -15,15 +15,15 @@ def _settings_payload() -> dict[str, object]:
     return {
         "reproduce": {
             "provider": "deepseek",
-            "model": "deepseek-test",
+            "model": "deepseek-v4-pro",
             "api_key": "super-secret-reproduce",
-            "base_url": "",
+            "base_url": "https://reproduce.invalid/v1",
         },
         "evaluation": {
             "provider": "qwen",
-            "model": "qwen-test",
+            "model": "qwen3.7-max",
             "api_key": "super-secret-eval",
-            "base_url": "",
+            "base_url": "https://evaluation.invalid/v1",
             "fallback_models": [],
         },
     }

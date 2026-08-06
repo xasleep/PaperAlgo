@@ -81,6 +81,7 @@ def _pipeline_launch_spec(job: dict[str, object]) -> LaunchSpec:
     settings = load_settings()
     if settings is None:
         raise SettingsNotConfiguredError()
+    job_service.validate_provider_selection_snapshot(job, settings)
     pdf_path = job_service.resolve_upload(str(job["upload_id"]))
     command = job_service.build_pipeline_command(
         pdf_path=pdf_path,
@@ -207,14 +208,21 @@ class PipelineWorker:
         )
         self._forget(managed.job_id)
 
-    def _record_launch_failure(self, job_id: str, launch_token: str) -> None:
+    def _record_launch_failure(
+        self,
+        job_id: str,
+        launch_token: str,
+        *,
+        failure_code: str = "process_launch_failed",
+        event_type: str = "job.process_launch_failed",
+    ) -> None:
         self.repository.fail_process(
             job_id,
             worker_id=self.worker_id,
             instance_token=self.instance_token,
             launch_token=launch_token,
-            failure_code="process_launch_failed",
-            event_type="job.process_launch_failed",
+            failure_code=failure_code,
+            event_type=event_type,
         )
 
     @staticmethod
@@ -519,6 +527,14 @@ class PipelineWorker:
         job_id = str(job["job_id"])
         try:
             launch = self.command_builder(job)
+        except job_service.ProviderSettingsChangedError:
+            self._record_launch_failure(
+                job_id,
+                launch_token,
+                failure_code="provider_settings_changed",
+                event_type="job.provider_settings_changed",
+            )
+            return
         except (SettingsNotConfiguredError, ValueError, OSError):
             self._record_launch_failure(job_id, launch_token)
             return

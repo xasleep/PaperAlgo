@@ -194,7 +194,9 @@ def test_fake_pipeline_resumes_at_previous_completed_boundary_without_rerunning(
     pdf = tmp_path / "paper.pdf"
     pdf.write_bytes(b"%PDF-fake")
     monkeypatch.setenv("REPRODUCE_API_KEY", "fake")
+    monkeypatch.setenv("REPRODUCE_BASE_URL", "https://reproduce.invalid/v1")
     monkeypatch.setenv("EVAL_API_KEY", "fake")
+    monkeypatch.setenv("EVAL_BASE_URL", "https://evaluation.invalid/v1")
     calls: list[str] = []
     fail_analyzing = {"value": True}
 
@@ -250,9 +252,9 @@ def test_fake_pipeline_resumes_at_previous_completed_boundary_without_rerunning(
         "paper_name": "paper",
         "domain": "statistics",
         "reproduce_provider": "openai",
-        "reproduce_gpt_version": "fake",
+        "reproduce_gpt_version": "gpt-4.1-mini",
         "eval_provider": "openai",
-        "eval_gpt_version": "fake",
+        "eval_gpt_version": "gpt-4.1-mini",
         "eval_fallback_gpt_versions": "",
         "runs_dir": str(runs_dir),
         "job_id": "resume_job",

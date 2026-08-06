@@ -24,7 +24,8 @@ from task_manifest import (
 parser = argparse.ArgumentParser()
 
 parser.add_argument('--paper_name',type=str)
-parser.add_argument('--gpt_version',type=str)
+parser.add_argument('--provider',type=str, required=True)
+parser.add_argument('--gpt_version',type=str, required=True)
 parser.add_argument('--paper_format',type=str, default="JSON", choices=["JSON", "LaTeX", "Markdown"])
 parser.add_argument('--pdf_json_path', type=str) # json format
 parser.add_argument('--pdf_latex_path', type=str) # latex format
@@ -36,13 +37,14 @@ args    = parser.parse_args()
 
 paper_name = args.paper_name
 gpt_version = args.gpt_version
+provider_id = args.provider
 paper_format = args.paper_format
 pdf_json_path = args.pdf_json_path
 pdf_latex_path = args.pdf_latex_path
 pdf_markdown_path = args.pdf_markdown_path
 domain = args.domain
 output_dir = args.output_dir
-client = make_openai_client(gpt_version)
+client = make_openai_client(provider_id, gpt_version)
 os.makedirs(output_dir, exist_ok=True)
 
 paper_content = load_paper_content(
@@ -415,19 +417,8 @@ outputs:
     ]
 
 def api_call(msg, gpt_version):
-    if "o3-mini" in gpt_version:
-        completion = client.chat.completions.create(
-            model=gpt_version, 
-            reasoning_effort="high",
-            messages=msg
-        )
-    else:
-        completion = client.chat.completions.create(
-            model=gpt_version, 
-            messages=msg
-        )
-
-    return completion 
+    request = {"model": gpt_version, "messages": msg, **client.contract.request_options}
+    return client.chat.completions.create(**request)
 
 responses = []
 trajectories = []
@@ -455,7 +446,7 @@ for idx, instruction_msg in enumerate([plan_msg, file_list_msg, task_list_msg, c
 
     # print and logging
     print_response(completion_json)
-    temp_total_accumulated_cost = print_log_cost(completion_json, gpt_version, current_stage, output_dir, total_accumulated_cost)
+    temp_total_accumulated_cost = print_log_cost(completion_json, gpt_version, current_stage, output_dir, total_accumulated_cost, provider_id)
     total_accumulated_cost = temp_total_accumulated_cost
 
     responses.append(completion_json)

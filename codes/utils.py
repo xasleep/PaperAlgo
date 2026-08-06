@@ -3,6 +3,7 @@ import re
 import os
 import sys
 import uuid
+from collections.abc import Mapping
 from datetime import datetime
 
 for _stream in (sys.stdout, sys.stderr):
@@ -152,69 +153,14 @@ def summarize_eval_feedback(rationales):
         "has_high_severity": has_high_severity,
     }
 
-def make_openai_client(model_name=None):
-    """Create an OpenAI-compatible client from environment variables."""
-    from openai import OpenAI
+def make_openai_client(provider_id, model_id):
+    """Create a client bound to one explicit registry provider/model pair."""
+    try:
+        from provider_registry import create_registered_client
+    except ModuleNotFoundError:
+        from codes.provider_registry import create_registered_client
 
-    model_name = (model_name or os.environ.get("GPT_VERSION") or "").lower()
-
-    if model_name.startswith("claude-"):
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
-        base_url = os.environ.get("ANTHROPIC_BASE_URL") or "https://api.anthropic.com/v1"
-    elif model_name.startswith("kimi-"):
-        api_key = os.environ.get("MOONSHOT_API_KEY") or os.environ.get("KIMI_API_KEY")
-        base_url = (
-            os.environ.get("MOONSHOT_BASE_URL")
-            or os.environ.get("KIMI_BASE_URL")
-            or "https://api.moonshot.cn/v1"
-        )
-    elif model_name.startswith("deepseek-"):
-        api_key = os.environ.get("DEEPSEEK_API_KEY")
-        base_url = os.environ.get("DEEPSEEK_BASE_URL")
-    else:
-        api_key = (
-            os.environ.get("OPENAI_API_KEY")
-            or os.environ.get("DEEPSEEK_API_KEY")
-            or os.environ.get("MOONSHOT_API_KEY")
-            or os.environ.get("KIMI_API_KEY")
-            or os.environ.get("ANTHROPIC_API_KEY")
-        )
-        base_url = (
-            os.environ.get("OPENAI_BASE_URL")
-            or os.environ.get("DEEPSEEK_BASE_URL")
-            or os.environ.get("MOONSHOT_BASE_URL")
-            or os.environ.get("KIMI_BASE_URL")
-            or os.environ.get("ANTHROPIC_BASE_URL")
-        )
-        if (
-            base_url is None
-            and (os.environ.get("MOONSHOT_API_KEY") or os.environ.get("KIMI_API_KEY"))
-            and not (os.environ.get("OPENAI_API_KEY") or os.environ.get("DEEPSEEK_API_KEY"))
-        ):
-            base_url = "https://api.moonshot.cn/v1"
-        elif (
-            base_url is None
-            and os.environ.get("ANTHROPIC_API_KEY")
-            and not (
-                os.environ.get("OPENAI_API_KEY")
-                or os.environ.get("DEEPSEEK_API_KEY")
-                or os.environ.get("MOONSHOT_API_KEY")
-                or os.environ.get("KIMI_API_KEY")
-            )
-        ):
-            base_url = "https://api.anthropic.com/v1"
-
-    if not api_key:
-        raise RuntimeError(
-            "Set OPENAI_API_KEY, DEEPSEEK_API_KEY, MOONSHOT_API_KEY, "
-            "KIMI_API_KEY, or ANTHROPIC_API_KEY before running PaperAlgo."
-        )
-
-    kwargs = {"api_key": api_key}
-    if base_url:
-        kwargs["base_url"] = base_url.rstrip("/")
-
-    return OpenAI(**kwargs)
+    return create_registered_client(provider_id, model_id)
 
 
 def normalize_completion(completion, model_name):
@@ -282,65 +228,6 @@ def load_paper_content(paper_format, json_path=None, latex_path=None, markdown_p
     raise ValueError(
         "Invalid paper format. Please select 'JSON', 'LaTeX', or 'Markdown'."
     )
-
-
-DEEPSEEK_MODEL_COST = {
-    # Prices are CNY per 1M tokens from DeepSeek pricing docs.
-    "deepseek-v4-flash": {
-        "input": 1.00,
-        "cached_input": 0.02,
-        "output": 2.00,
-        "currency": "CNY",
-    },
-    "deepseek-v4-pro": {
-        "input": 3.00,
-        "cached_input": 0.025,
-        "output": 6.00,
-        "currency": "CNY",
-    },
-    # Deprecated compatibility model names map to DeepSeek-V4-Flash.
-    "deepseek-chat": {
-        "input": 1.00,
-        "cached_input": 0.02,
-        "output": 2.00,
-        "currency": "CNY",
-    },
-    "deepseek-reasoner": {
-        "input": 1.00,
-        "cached_input": 0.02,
-        "output": 2.00,
-        "currency": "CNY",
-    },
-}
-
-
-KIMI_MODEL_COST = {
-    # Prices are CNY per 1M tokens from Kimi pricing docs.
-    "kimi-k2.6": {
-        "input": 6.50,
-        "cached_input": 1.10,
-        "output": 27.00,
-        "currency": "CNY",
-    },
-    "kimi-k2.7-code": {
-        "input": 6.50,
-        "cached_input": 1.30,
-        "output": 27.00,
-        "currency": "CNY",
-    },
-    "kimi-k2.7-code-highspeed": {
-        "input": 13.00,
-        "cached_input": 2.60,
-        "output": 54.00,
-        "currency": "CNY",
-    },
-}
-
-
-CNY_MODEL_COST = {
-    **DEEPSEEK_MODEL_COST,
-    **KIMI_MODEL_COST,
-}
 
 
 def format_cost(cost, currency):
@@ -514,136 +401,53 @@ def format_json_data(data):
     return formatted_text
 
 
-def cal_cost(response_json, model_name):
-    model_cost = {
-        # gpt-4.1
-        "gpt-4.1": {"input": 2.00, "cached_input": 0.50, "output": 8.00},
-        "gpt-4.1-2025-04-14": {"input": 2.00, "cached_input": 0.50, "output": 8.00},
-
-        # gpt-4.1-mini
-        "gpt-4.1-mini": {"input": 0.40, "cached_input": 0.10, "output": 1.60},
-        "gpt-4.1-mini-2025-04-14": {"input": 0.40, "cached_input": 0.10, "output": 1.60},
-
-        # gpt-4.1-nano
-        "gpt-4.1-nano": {"input": 0.10, "cached_input": 0.025, "output": 0.40},
-        "gpt-4.1-nano-2025-04-14": {"input": 0.10, "cached_input": 0.025, "output": 0.40},
-
-        # gpt-4.5-preview
-        "gpt-4.5-preview": {"input": 75.00, "cached_input": 37.50, "output": 150.00},
-        "gpt-4.5-preview-2025-02-27": {"input": 75.00, "cached_input": 37.50, "output": 150.00},
-
-        # gpt-4o
-        "gpt-4o": {"input": 2.50, "cached_input": 1.25, "output": 10.00},
-        "gpt-4o-2024-08-06": {"input": 2.50, "cached_input": 1.25, "output": 10.00},
-        "gpt-4o-2024-11-20": {"input": 2.50, "cached_input": 1.25, "output": 10.00},
-        "gpt-4o-2024-05-13": {"input": 5.00, "cached_input": None, "output": 15.00},
-
-        # gpt-4o-audio-preview
-        "gpt-4o-audio-preview": {"input": 2.50, "cached_input": None, "output": 10.00},
-        "gpt-4o-audio-preview-2024-12-17": {"input": 2.50, "cached_input": None, "output": 10.00},
-        "gpt-4o-audio-preview-2024-10-01": {"input": 2.50, "cached_input": None, "output": 10.00},
-
-        # gpt-4o-realtime-preview
-        "gpt-4o-realtime-preview": {"input": 5.00, "cached_input": 2.50, "output": 20.00},
-        "gpt-4o-realtime-preview-2024-12-17": {"input": 5.00, "cached_input": 2.50, "output": 20.00},
-        "gpt-4o-realtime-preview-2024-10-01": {"input": 5.00, "cached_input": 2.50, "output": 20.00},
-
-        # gpt-4o-mini
-        "gpt-4o-mini": {"input": 0.15, "cached_input": 0.075, "output": 0.60},
-        "gpt-4o-mini-2024-07-18": {"input": 0.15, "cached_input": 0.075, "output": 0.60},
-
-        # gpt-4o-mini-audio-preview
-        "gpt-4o-mini-audio-preview": {"input": 0.15, "cached_input": None, "output": 0.60},
-        "gpt-4o-mini-audio-preview-2024-12-17": {"input": 0.15, "cached_input": None, "output": 0.60},
-
-        # gpt-4o-mini-realtime-preview
-        "gpt-4o-mini-realtime-preview": {"input": 0.60, "cached_input": 0.30, "output": 2.40},
-        "gpt-4o-mini-realtime-preview-2024-12-17": {"input": 0.60, "cached_input": 0.30, "output": 2.40},
-
-        # o1
-        "o1": {"input": 15.00, "cached_input": 7.50, "output": 60.00},
-        "o1-2024-12-17": {"input": 15.00, "cached_input": 7.50, "output": 60.00},
-        "o1-preview-2024-09-12": {"input": 15.00, "cached_input": 7.50, "output": 60.00},
-
-        # o1-pro
-        "o1-pro": {"input": 150.00, "cached_input": None, "output": 600.00},
-        "o1-pro-2025-03-19": {"input": 150.00, "cached_input": None, "output": 600.00},
-
-        # o3
-        "o3": {"input": 10.00, "cached_input": 2.50, "output": 40.00},
-        "o3-2025-04-16": {"input": 10.00, "cached_input": 2.50, "output": 40.00},
-
-        # o4-mini
-        "o4-mini": {"input": 1.10, "cached_input": 0.275, "output": 4.40},
-        "o4-mini-2025-04-16": {"input": 1.10, "cached_input": 0.275, "output": 4.40},
-
-        # o3-mini
-        "o3-mini": {"input": 1.10, "cached_input": 0.55, "output": 4.40},
-        "o3-mini-2025-01-31": {"input": 1.10, "cached_input": 0.55, "output": 4.40},
-
-        # o1-mini
-        "o1-mini": {"input": 1.10, "cached_input": 0.55, "output": 4.40},
-        "o1-mini-2024-09-12": {"input": 1.10, "cached_input": 0.55, "output": 4.40},
-
-        # gpt-4o-mini-search-preview
-        "gpt-4o-mini-search-preview": {"input": 0.15, "cached_input": None, "output": 0.60},
-        "gpt-4o-mini-search-preview-2025-03-11": {"input": 0.15, "cached_input": None, "output": 0.60},
-
-        # gpt-4o-search-preview
-        "gpt-4o-search-preview": {"input": 2.50, "cached_input": None, "output": 10.00},
-        "gpt-4o-search-preview-2025-03-11": {"input": 2.50, "cached_input": None, "output": 10.00},
-
-        # computer-use-preview
-        "computer-use-preview": {"input": 3.00, "cached_input": None, "output": 12.00},
-        "computer-use-preview-2025-03-11": {"input": 3.00, "cached_input": None, "output": 12.00},
-
-        # gpt-image-1
-        "gpt-image-1": {"input": 5.00, "cached_input": None, "output": None},
-    }
-
-    
-    usage = response_json["usage"]
-    prompt_tokens = usage["prompt_tokens"]
-    completion_tokens = usage["completion_tokens"]
+def cal_cost(response_json, model_name, provider_id=None):
+    """Calculate cost only from dated prices in the explicit registry contract."""
+    usage = response_json.get("usage")
+    if not isinstance(usage, Mapping) or not usage:
+        return {
+            'model_name': model_name,
+            'actual_input_tokens': None,
+            'input_cost': None,
+            'cached_tokens': None,
+            'cached_input_cost': None,
+            'output_tokens': None,
+            'output_cost': None,
+            'total_cost': None,
+            'currency': None,
+            'prompt_tokens': None,
+        }
+    prompt_tokens = int(usage.get("prompt_tokens") or 0)
+    completion_tokens = int(usage.get("completion_tokens") or 0)
     prompt_token_details = usage.get("prompt_tokens_details") or {}
-    cached_tokens = usage.get(
-        "cached_tokens",
-        prompt_token_details.get("cached_tokens", 0),
+    cached_tokens = int(
+        usage.get(
+            "cached_tokens",
+            prompt_token_details.get(
+                "cached_tokens",
+                usage.get("prompt_cache_hit_tokens", 0),
+            ),
+        )
+        or 0
     )
+    cached_tokens = min(max(cached_tokens, 0), prompt_tokens)
 
     # input token = (prompt_tokens - cached_tokens)
     actual_input_tokens = prompt_tokens - cached_tokens
     output_tokens = completion_tokens
 
-    cny_cost_info = CNY_MODEL_COST.get(model_name.lower())
-    if cny_cost_info is not None:
-        cache_hit_tokens = usage.get("prompt_cache_hit_tokens", cached_tokens)
-        cache_miss_tokens = usage.get(
-            "prompt_cache_miss_tokens",
-            max(prompt_tokens - cache_hit_tokens, 0),
-        )
-        input_cost = (cache_miss_tokens / 1_000_000) * cny_cost_info["input"]
-        cached_input_cost = (
-            cache_hit_tokens / 1_000_000
-        ) * cny_cost_info["cached_input"]
-        output_cost = (output_tokens / 1_000_000) * cny_cost_info["output"]
-        total_cost = input_cost + cached_input_cost + output_cost
+    pricing = None
+    if provider_id:
+        try:
+            from provider_registry import get_provider_registry
+        except ModuleNotFoundError:
+            from codes.provider_registry import get_provider_registry
 
-        return {
-            'model_name': model_name,
-            'actual_input_tokens': cache_miss_tokens,
-            'input_cost': input_cost,
-            'cached_tokens': cache_hit_tokens,
-            'cached_input_cost': cached_input_cost,
-            'output_tokens': output_tokens,
-            'output_cost': output_cost,
-            'total_cost': total_cost,
-            'currency': cny_cost_info["currency"],
-            'prompt_tokens': prompt_tokens,
-        }
+        candidate = get_provider_registry().get(provider_id, model_name).pricing
+        if candidate is not None and candidate.status == "configured":
+            pricing = candidate
 
-    cost_info = model_cost.get(model_name)
-    if cost_info is None:
+    if pricing is None:
         return {
             'model_name': model_name,
             'actual_input_tokens': actual_input_tokens,
@@ -657,9 +461,13 @@ def cal_cost(response_json, model_name):
             'prompt_tokens': prompt_tokens,
         }
 
-    input_cost = (actual_input_tokens / 1_000_000) * cost_info['input']
-    cached_input_cost = 0 if cost_info['cached_input'] is None else (cached_tokens / 1_000_000) * cost_info['cached_input']
-    output_cost = (output_tokens / 1_000_000) * cost_info['output']
+    input_cost = (actual_input_tokens / 1_000_000) * pricing.input_per_million
+    cached_input_cost = (
+        0
+        if pricing.cached_input_per_million is None
+        else (cached_tokens / 1_000_000) * pricing.cached_input_per_million
+    )
+    output_cost = (output_tokens / 1_000_000) * pricing.output_per_million
 
     total_cost = input_cost + cached_input_cost + output_cost
 
@@ -672,7 +480,7 @@ def cal_cost(response_json, model_name):
         'output_tokens': output_tokens,
         'output_cost': output_cost,
         'total_cost': total_cost,
-        'currency': 'USD',
+        'currency': pricing.currency,
         'prompt_tokens': prompt_tokens,
     }
 
@@ -696,8 +504,15 @@ def print_response(completion_json, is_llm=False):
         print(completion_json['choices'][0]['message']['content'])
     print("============================================\n")
 
-def _legacy_print_log_cost(completion_json, gpt_version, current_stage, output_dir, total_accumulated_cost):
-    usage_info = cal_cost(completion_json, gpt_version)
+def _legacy_print_log_cost(
+    completion_json,
+    gpt_version,
+    current_stage,
+    output_dir,
+    total_accumulated_cost,
+    provider_id=None,
+):
+    usage_info = cal_cost(completion_json, gpt_version, provider_id)
 
     current_cost = usage_info['total_cost']
     currency = usage_info.get('currency') or 'USD'
@@ -731,8 +546,15 @@ def _legacy_print_log_cost(completion_json, gpt_version, current_stage, output_d
     return total_accumulated_cost
 
 
-def print_log_cost(completion_json, gpt_version, current_stage, output_dir, total_accumulated_cost):
-    usage_info = cal_cost(completion_json, gpt_version)
+def print_log_cost(
+    completion_json,
+    gpt_version,
+    current_stage,
+    output_dir,
+    total_accumulated_cost,
+    provider_id=None,
+):
+    usage_info = cal_cost(completion_json, gpt_version, provider_id)
 
     current_cost = usage_info['total_cost']
     currency = usage_info.get('currency') or 'USD'
@@ -745,7 +567,13 @@ def print_log_cost(completion_json, gpt_version, current_stage, output_dir, tota
         f"Model: {usage_info['model_name']}",
     ]
 
-    if current_cost is None:
+    usage_unknown = usage_info['prompt_tokens'] is None
+    if usage_unknown:
+        output_lines.extend([
+            "Token usage: unavailable",
+            "Current total cost: unavailable for this model",
+        ])
+    elif current_cost is None:
         output_lines.extend([
             f"Input cache miss tokens: {usage_info['actual_input_tokens']} (Cost: unavailable)",
             f"Input cache hit tokens: {usage_info['cached_tokens']} (Cost: unavailable)",

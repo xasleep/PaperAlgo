@@ -27,13 +27,15 @@ def _settings(reproduce_secret: str, evaluation_secret: str) -> WebSettings:
     return WebSettings(
         reproduce={
             "provider": "openai",
-            "model": "fake-model",
+            "model": "gpt-4.1-mini",
             "api_key": reproduce_secret,
+            "base_url": "https://reproduce.invalid/v1",
         },
         evaluation={
             "provider": "openai",
-            "model": "fake-model",
+            "model": "gpt-4.1-mini",
             "api_key": evaluation_secret,
+            "base_url": "https://evaluation.invalid/v1",
             "fallback_models": [],
         },
     )
@@ -135,6 +137,16 @@ def test_sqlite_runtime_is_idempotent_persistent_and_never_starts_pipeline(
     assert first.json()["execution_status"] == "queued"
     assert first.json()["evaluation_status"] == "pending"
     assert first.json()["quality_status"] == "pending"
+    assert first.json()["reproduce_provider"] == "openai"
+    assert first.json()["reproduce_model"] == "gpt-4.1-mini"
+    assert first.json()["evaluation_provider"] == "openai"
+    assert first.json()["evaluation_model"] == "gpt-4.1-mini"
+    assert first.json()["evaluation_fallback_models"] == []
+    assert first.json()["provider_registry_version"] == 1
+    assert len(first.json()["provider_contract_fingerprint"]) == 64
+    assert replay.json()["provider_contract_fingerprint"] == first.json()[
+        "provider_contract_fingerprint"
+    ]
     assert start_calls == []
     assert not runs_dir.exists()
 
@@ -154,7 +166,16 @@ def test_sqlite_runtime_is_idempotent_persistent_and_never_starts_pipeline(
     assert detail.json()["job_id"] == first.json()["job_id"]
     assert detail.json()["execution_status"] == "queued"
     assert detail.json()["version"] == 1
+    assert detail.json()["provider_contract_fingerprint"] == first.json()[
+        "provider_contract_fingerprint"
+    ]
     assert repository_constructions == [normalize_database_path(db_path)]
+
+    serialized_responses = first.text + replay.text + listed.text + detail.text
+    assert reproduce_secret not in serialized_responses
+    assert evaluation_secret not in serialized_responses
+    assert "https://reproduce.invalid/v1" not in serialized_responses
+    assert "https://evaluation.invalid/v1" not in serialized_responses
 
     with closing(connect_database(db_path)) as connection:
         assert connection.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 1
@@ -168,6 +189,10 @@ def test_sqlite_runtime_is_idempotent_persistent_and_never_starts_pipeline(
             pytest.fail("SQLite files contain the reproduce API credential", pytrace=False)
         if evaluation_secret.encode() in contents:
             pytest.fail("SQLite files contain the evaluation API credential", pytrace=False)
+        if b"https://reproduce.invalid/v1" in contents:
+            pytest.fail("SQLite files contain the reproduce base URL", pytrace=False)
+        if b"https://evaluation.invalid/v1" in contents:
+            pytest.fail("SQLite files contain the evaluation base URL", pytrace=False)
 
 
 def test_sqlite_cancel_is_idempotent_command_without_legacy_side_effects(

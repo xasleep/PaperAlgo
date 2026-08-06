@@ -15,6 +15,7 @@ from starlette.responses import JSONResponse
 from web_api import artifact_service, job_service, log_service, main as main_module
 from web_api import settings_store, web_security
 from web_api.errors import FileTooLargeError
+from web_api.schemas import WebSettings
 
 
 LOCAL_ORIGIN = "http://localhost"
@@ -27,15 +28,15 @@ def _settings_payload() -> dict[str, object]:
     return {
         "reproduce": {
             "provider": "openai",
-            "model": "test-model",
+            "model": "gpt-4.1-mini",
             "api_key": "reproduce-secret",
-            "base_url": "",
+            "base_url": "https://reproduce.invalid/v1",
         },
         "evaluation": {
             "provider": "openai",
-            "model": "test-model",
+            "model": "gpt-4.1-mini",
             "api_key": "evaluation-secret",
-            "base_url": "",
+            "base_url": "https://evaluation.invalid/v1",
             "fallback_models": [],
         },
     }
@@ -737,7 +738,11 @@ def test_production_same_origin_upload_and_explicit_vite_origin_work(
     vite_headers = _session_headers(client, VITE_ORIGIN)
     vite_upload = _upload_pdf(client, vite_headers)
     calls: list[tuple[str, str]] = []
-    monkeypatch.setattr(main_module, "load_settings", lambda: object())
+    monkeypatch.setattr(
+        main_module,
+        "load_settings",
+        lambda: WebSettings(**_settings_payload()),
+    )
 
     def fake_start_job(**kwargs):
         calls.append(("start", kwargs["job_id"]))

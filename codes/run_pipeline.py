@@ -18,6 +18,7 @@ try:
         running_checkpoint,
         write_checkpoint,
     )
+    from provider_registry import REGISTRY_PATH_ENV, get_provider_registry
     from task_manifest import (
         load_task_manifest,
         safe_join,
@@ -42,6 +43,7 @@ except ModuleNotFoundError:
         running_checkpoint,
         write_checkpoint,
     )
+    from codes.provider_registry import REGISTRY_PATH_ENV, get_provider_registry
     from codes.task_manifest import (
         load_task_manifest,
         safe_join,
@@ -58,28 +60,7 @@ except ModuleNotFoundError:
     )
 
 
-PROVIDER_ENV = {
-    "deepseek": {
-        "api_keys": ["DEEPSEEK_API_KEY"],
-        "base_urls": ["DEEPSEEK_BASE_URL"],
-    },
-    "kimi": {
-        "api_keys": ["MOONSHOT_API_KEY", "KIMI_API_KEY"],
-        "base_urls": ["MOONSHOT_BASE_URL", "KIMI_BASE_URL"],
-    },
-    "qwen": {
-        "api_keys": ["OPENAI_API_KEY"],
-        "base_urls": ["OPENAI_BASE_URL"],
-    },
-    "claude": {
-        "api_keys": ["ANTHROPIC_API_KEY"],
-        "base_urls": ["ANTHROPIC_BASE_URL"],
-    },
-    "openai": {
-        "api_keys": ["OPENAI_API_KEY"],
-        "base_urls": ["OPENAI_BASE_URL"],
-    },
-}
+PROVIDER_REGISTRY = get_provider_registry()
 
 SYSTEM_ENV_ALLOWLIST = {
     "APPDATA",
@@ -90,6 +71,7 @@ SYSTEM_ENV_ALLOWLIST = {
     "LANG",
     "LOCALAPPDATA",
     "NUMBER_OF_PROCESSORS",
+    "PAPER2CODE_PROVIDER_REGISTRY_PATH",
     "PATH",
     "PATHEXT",
     "PROCESSOR_ARCHITECTURE",
@@ -103,11 +85,11 @@ SYSTEM_ENV_ALLOWLIST = {
     "VIRTUAL_ENV",
     "WINDIR",
 }
-PROVIDER_ENV_NAMES = {
-    item
-    for env_info in PROVIDER_ENV.values()
-    for names in env_info.values()
-    for item in names
+PROVIDER_ENV_NAMES = PROVIDER_REGISTRY.environment_names() | {
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_BASE_URL",
+    "MOONSHOT_API_KEY",
+    "MOONSHOT_BASE_URL",
 }
 ROLE_ENV_NAMES = {
     "EVAL_API_KEY",
@@ -137,56 +119,48 @@ def get_workspace_root(script_dir):
 
 
 def build_clean_env():
-    return {
+    env = {
         name: value
         for name, value in os.environ.items()
         if name.upper() in SYSTEM_ENV_ALLOWLIST
         and name.upper() not in PROVIDER_ENV_NAMES
         and name.upper() not in ROLE_ENV_NAMES
     }
+    registry_path = env.get(REGISTRY_PATH_ENV)
+    if registry_path and not os.path.isabs(registry_path):
+        env[REGISTRY_PATH_ENV] = os.path.abspath(registry_path)
+    return env
 
 
-def get_role_env(provider, role_prefix):
+def get_role_env(provider, model_id, role_prefix, additional_model_ids=()):
     env = build_clean_env()
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"
-    env_info = PROVIDER_ENV[provider]
+    contracts = [
+        PROVIDER_REGISTRY.get(provider, candidate_model_id)
+        for candidate_model_id in (model_id, *additional_model_ids)
+    ]
 
     role_api_key = os.environ.get(f"{role_prefix}_API_KEY")
     role_base_url = os.environ.get(f"{role_prefix}_BASE_URL")
 
-    if role_api_key:
-        env[env_info["api_keys"][0]] = role_api_key
-    if role_base_url:
-        env[env_info["base_urls"][0]] = role_base_url
+    for contract in contracts:
+        api_key = role_api_key or os.environ.get(contract.api_key_env)
+        base_url = (
+            role_base_url
+            or os.environ.get(contract.base_url_env)
+            or contract.base_url
+        )
+        if api_key:
+            env[contract.api_key_env] = api_key
+        if base_url:
+            env[contract.base_url_env] = base_url
 
     return env
 
 
-def validate_provider_env(provider, role, env):
-    env_info = PROVIDER_ENV[provider]
-    has_key = any(env.get(name) for name in env_info["api_keys"])
-    if not has_key:
-        role_prefix = role.upper()
-        expected = " or ".join(
-            [f"{role_prefix}_API_KEY"] + env_info["api_keys"]
-        )
-        raise RuntimeError(
-            f"Missing API key for {role} provider '{provider}'. "
-            f"Set {expected} in the environment before running the pipeline."
-        )
-
-    if provider in {"qwen", "deepseek", "kimi", "claude"}:
-        has_base_url = any(env.get(name) for name in env_info["base_urls"])
-        if not has_base_url:
-            role_prefix = role.upper()
-            expected = " or ".join(
-                [f"{role_prefix}_BASE_URL"] + env_info["base_urls"]
-            )
-            print(
-                f"[WARNING] No base URL set for {role} provider '{provider}'. "
-                f"Expected {expected}. The client may use provider defaults if available."
-            )
+def validate_provider_env(provider, model_id, env):
+    PROVIDER_REGISTRY.resolve(provider, model_id, environ=env)
 
 
 def update_status(status_path, **updates):
@@ -522,6 +496,13 @@ def validate_runtime_args(args):
         raise ValueError(
             f"max_repair_rounds must be between 0 and {MAX_REPAIR_ROUNDS_LIMIT}."
         )
+    eval_fallback_models = parse_eval_fallback_versions(args.eval_fallback_gpt_versions)
+    PROVIDER_REGISTRY.get(args.reproduce_provider, args.reproduce_gpt_version)
+    PROVIDER_REGISTRY.validate_fallback_chain(
+        args.eval_provider,
+        args.eval_gpt_version,
+        eval_fallback_models,
+    )
     checkpoint_mode = getattr(args, "checkpoint_mode", "off")
     resume_from_stage = getattr(args, "resume_from_stage", "")
     resume_stage_sequence = int(getattr(args, "resume_stage_sequence", 0) or 0)
@@ -580,11 +561,13 @@ def validate_markdown_path(markdown_path, runs_dir):
 
 
 def parse_eval_fallback_versions(value):
-    if isinstance(value, list):
-        return [str(item).strip() for item in value if str(item).strip()]
-    if not value:
+    if value == "":
         return []
-    return [item.strip() for item in str(value).split(",") if item.strip()]
+    if isinstance(value, list):
+        return list(value)
+    if isinstance(value, str):
+        return value.split(",")
+    raise ValueError("eval_fallback_gpt_versions must be a string or list.")
 
 
 def format_eval_fallback_versions(models):
@@ -695,6 +678,8 @@ def build_eval_cmd(args, script_dir, paper_name, markdown_path, output_dir, repo
         args.eval_type,
         "--generated_n",
         str(args.generated_n),
+        "--provider",
+        args.eval_provider,
         "--gpt_version",
         eval_model,
         "--max_repair_rounds",
@@ -715,6 +700,8 @@ def build_repair_cmd(args, script_dir, paper_name, markdown_path, output_dir, re
         markdown_path,
         "--domain",
         args.domain,
+        "--provider",
+        args.reproduce_provider,
         "--gpt_version",
         args.reproduce_gpt_version,
         "--output_dir",
@@ -732,11 +719,25 @@ def main(args):
     repo_root = get_repo_root(script_dir)
     validate_runtime_args(args)
 
-    reproduce_env = get_role_env(args.reproduce_provider, "REPRODUCE")
-    eval_env = get_role_env(args.eval_provider, "EVAL")
+    reproduce_env = get_role_env(
+        args.reproduce_provider, args.reproduce_gpt_version, "REPRODUCE"
+    )
+    eval_fallback_models = parse_eval_fallback_versions(
+        args.eval_fallback_gpt_versions
+    )
+    eval_env = get_role_env(
+        args.eval_provider,
+        args.eval_gpt_version,
+        "EVAL",
+        eval_fallback_models,
+    )
 
-    validate_provider_env(args.reproduce_provider, "reproduce", reproduce_env)
-    validate_provider_env(args.eval_provider, "eval", eval_env)
+    validate_provider_env(
+        args.reproduce_provider, args.reproduce_gpt_version, reproduce_env
+    )
+    validate_provider_env(args.eval_provider, args.eval_gpt_version, eval_env)
+    for fallback_model in eval_fallback_models:
+        validate_provider_env(args.eval_provider, fallback_model, eval_env)
 
     paper_pdf_path = os.path.abspath(args.paper_pdf_path)
     if not os.path.exists(paper_pdf_path):
@@ -878,6 +879,8 @@ def main(args):
         markdown_path,
         "--domain",
         args.domain,
+        "--provider",
+        args.reproduce_provider,
         "--gpt_version",
         args.reproduce_gpt_version,
         "--output_dir",
@@ -938,6 +941,8 @@ def main(args):
         markdown_path,
         "--domain",
         args.domain,
+        "--provider",
+        args.reproduce_provider,
         "--gpt_version",
         args.reproduce_gpt_version,
         "--output_dir",
@@ -981,6 +986,8 @@ def main(args):
         markdown_path,
         "--domain",
         args.domain,
+        "--provider",
+        args.reproduce_provider,
         "--gpt_version",
         args.reproduce_gpt_version,
         "--output_dir",
@@ -1216,14 +1223,14 @@ if __name__ == "__main__":
         "--reproduce_provider",
         type=str,
         required=True,
-        choices=sorted(PROVIDER_ENV.keys()),
+        choices=PROVIDER_REGISTRY.provider_ids,
     )
     parser.add_argument("--reproduce_gpt_version", type=str, required=True)
     parser.add_argument(
         "--eval_provider",
         type=str,
         required=True,
-        choices=sorted(PROVIDER_ENV.keys()),
+        choices=PROVIDER_REGISTRY.provider_ids,
     )
     parser.add_argument("--eval_gpt_version", type=str, required=True)
     parser.add_argument("--eval_fallback_gpt_versions", type=str, default="")
