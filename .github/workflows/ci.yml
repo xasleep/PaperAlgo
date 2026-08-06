@@ -73,15 +73,6 @@ jobs:
             "paper2code-pycache"
           python -m compileall -q codes web_api tests
 
-      - name: Run Python tests
-        run: |
-          $pytestBase = Join-Path `
-            $env:RUNNER_TEMP `
-            ("paper2code-pytest-" + [guid]::NewGuid().ToString("N"))
-          python -m pytest tests -q -rs `
-            -p no:cacheprovider `
-            --basetemp $pytestBase
-
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -103,6 +94,15 @@ jobs:
       - name: Verify same-origin bundle
         working-directory: web_ui
         run: npm.cmd run verify:same-origin
+
+      - name: Run Python tests
+        run: |
+          $pytestBase = Join-Path `
+            $env:RUNNER_TEMP `
+            ("paper2code-pytest-" + [guid]::NewGuid().ToString("N"))
+          python -m pytest tests -q -rs `
+            -p no:cacheprovider `
+            --basetemp $pytestBase
 
       - name: Run WebUI development smoke
         working-directory: web_ui
