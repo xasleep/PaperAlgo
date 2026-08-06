@@ -1,3 +1,5 @@
+import os
+import re
 from pathlib import Path
 
 
@@ -7,11 +9,50 @@ RUNS_DIR = REPO_ROOT / "runs"
 LOCAL_DIR = REPO_ROOT / ".local"
 UPLOADS_DIR = LOCAL_DIR / "uploads"
 SETTINGS_PATH = LOCAL_DIR / "web_settings.json"
+DEFAULT_DB_PATH = LOCAL_DIR / "paper2code.db"
+API_PREFIX = "/api/v1"
+MAX_PDF_UPLOAD_BYTES = 100 * 1024 * 1024
+MAX_MULTIPART_OVERHEAD_BYTES = 1 * 1024 * 1024
+MAX_UPLOAD_REQUEST_BYTES = MAX_PDF_UPLOAD_BYTES + MAX_MULTIPART_OVERHEAD_BYTES
 
 LOCAL_DEV_CORS_ORIGINS = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
 ]
+
+_TRUSTED_HOST_RE = re.compile(r"^(?:[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?|\[[0-9A-Fa-f:]+\])$")
+
+
+def configured_trusted_hosts() -> list[str]:
+    """Return exact local hosts plus explicitly configured host names."""
+
+    configured = []
+    for value in os.environ.get("PAPER2CODE_TRUSTED_HOSTS", "").split(","):
+        host = value.strip().lower()
+        if not host:
+            continue
+        if "*" in host or not _TRUSTED_HOST_RE.fullmatch(host):
+            raise ValueError(
+                "PAPER2CODE_TRUSTED_HOSTS must contain exact host names without ports or wildcards."
+            )
+        configured.append(host)
+    return list(dict.fromkeys(["localhost", "127.0.0.1", "[::1]", *configured]))
+
+
+TRUSTED_HOSTS = configured_trusted_hosts()
+
+
+def configured_database_path() -> Path:
+    configured = os.environ.get("PAPER2CODE_DB_PATH", "").strip()
+    return Path(configured) if configured else DEFAULT_DB_PATH
+
+
+def configured_job_runtime() -> str:
+    runtime = os.environ.get("JOB_RUNTIME", "legacy").strip().lower()
+    if runtime not in {"legacy", "sqlite"}:
+        raise ValueError("JOB_RUNTIME must be either 'legacy' or 'sqlite'.")
+    return runtime
+
 
 PROVIDERS = {"deepseek", "kimi", "qwen", "claude", "openai"}
 DOMAINS = {"general", "statistics"}

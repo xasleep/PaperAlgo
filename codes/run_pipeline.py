@@ -4,22 +4,58 @@ import shutil
 import subprocess
 import sys
 import uuid
+from contextlib import contextmanager
 from datetime import datetime
+from pathlib import Path
 
-from utils import (
-    MAX_REPAIR_ROUNDS,
-    STATUS_EVAL_FAILED,
-    STATUS_EVAL_PASSED,
-    load_json_file,
-    repo_status_path,
-    save_json_file,
-)
-from task_manifest import (
-    load_task_manifest,
-    safe_join,
-    safe_write_text,
-    validate_task_path,
-)
+try:
+    from checkpoint_protocol import (
+        CHECKPOINT_STAGES,
+        completed_checkpoint,
+        failed_checkpoint,
+        list_checkpoints,
+        read_checkpoint,
+        running_checkpoint,
+        write_checkpoint,
+    )
+    from task_manifest import (
+        load_task_manifest,
+        safe_join,
+        safe_write_text,
+        validate_task_path,
+    )
+    from utils import (
+        MAX_REPAIR_ROUNDS,
+        STATUS_EVAL_FAILED,
+        STATUS_EVAL_PASSED,
+        load_json_file,
+        repo_status_path,
+        save_json_file,
+    )
+except ModuleNotFoundError:
+    from codes.checkpoint_protocol import (
+        CHECKPOINT_STAGES,
+        completed_checkpoint,
+        failed_checkpoint,
+        list_checkpoints,
+        read_checkpoint,
+        running_checkpoint,
+        write_checkpoint,
+    )
+    from codes.task_manifest import (
+        load_task_manifest,
+        safe_join,
+        safe_write_text,
+        validate_task_path,
+    )
+    from codes.utils import (
+        MAX_REPAIR_ROUNDS,
+        STATUS_EVAL_FAILED,
+        STATUS_EVAL_PASSED,
+        load_json_file,
+        repo_status_path,
+        save_json_file,
+    )
 
 
 PROVIDER_ENV = {
@@ -169,6 +205,180 @@ def write_summary(summary_path, **updates):
     return current
 
 
+class PipelineCheckpointAdapter:
+    """Optional filesystem adapter used only by the SQLite Worker runtime."""
+
+    def __init__(self, args, run_dir, job_id):
+        self.enabled = args.checkpoint_mode == "sqlite"
+        self.run_dir = Path(run_dir)
+        self.job_id = job_id
+        self.resume_from_stage = args.resume_from_stage or None
+        self.resume_sequence = int(args.resume_stage_sequence or 0)
+        self.resume_attempt = int(args.resume_stage_attempt or 0)
+        self.recovery_count = int(args.checkpoint_recovery_count or 0)
+
+    def should_run(self, stage_sequence):
+        return not self.enabled or not self.resume_sequence or stage_sequence >= self.resume_sequence
+
+    def attempt_for(self, stage_sequence):
+        if self.resume_sequence == stage_sequence and self.resume_attempt:
+            return self.resume_attempt
+        return 1
+
+    @contextmanager
+    def stage(
+        self,
+        stage_name,
+        stage_sequence,
+        *,
+        artifact_paths,
+        resume_from_stage,
+    ):
+        if not self.enabled:
+            yield
+            return
+        stage_attempt = self.attempt_for(stage_sequence)
+        started_at = now_str()
+        write_checkpoint(
+            self.run_dir,
+            running_checkpoint(
+                job_id=self.job_id,
+                stage_name=stage_name,
+                stage_sequence=stage_sequence,
+                stage_attempt=stage_attempt,
+                started_at=started_at,
+            ),
+        )
+        try:
+            yield
+            paths = artifact_paths() if callable(artifact_paths) else artifact_paths
+            write_checkpoint(
+                self.run_dir,
+                completed_checkpoint(
+                    self.run_dir,
+                    job_id=self.job_id,
+                    stage_name=stage_name,
+                    stage_sequence=stage_sequence,
+                    stage_attempt=stage_attempt,
+                    started_at=started_at,
+                    completed_at=now_str(),
+                    artifact_paths=paths,
+                    resume_from_stage=(
+                        resume_from_stage()
+                        if callable(resume_from_stage)
+                        else resume_from_stage
+                    ),
+                ),
+            )
+        except Exception:
+            write_checkpoint(
+                self.run_dir,
+                failed_checkpoint(
+                    job_id=self.job_id,
+                    stage_name=stage_name,
+                    stage_sequence=stage_sequence,
+                    stage_attempt=stage_attempt,
+                    started_at=started_at,
+                    completed_at=now_str(),
+                    error_code="stage_execution_failed",
+                ),
+            )
+            raise
+
+
+def relative_run_path(run_dir, path):
+    return Path(path).relative_to(Path(run_dir)).as_posix()
+
+
+def existing_artifact_paths(run_dir, paths):
+    return [relative_run_path(run_dir, path) for path in paths if Path(path).is_file()]
+
+
+def glob_artifact_paths(run_dir, *patterns):
+    root = Path(run_dir)
+    paths = []
+    for pattern in patterns:
+        paths.extend(path for path in root.glob(pattern) if path.is_file())
+    return sorted({relative_run_path(root, path) for path in paths})
+
+
+def checkpoint_state_artifact_paths(run_dir, stage_name):
+    """Return the complete current state needed beyond a completed boundary."""
+
+    ordered_stages = [
+        "mineru_parse",
+        "mineru_skipped",
+        "planning",
+        "extract_config",
+        "analyzing",
+        "coding",
+        "evaluation",
+        "repair",
+        "completed",
+    ]
+    if stage_name not in CHECKPOINT_STAGES:
+        raise ValueError("Checkpoint stage is not allowed.")
+    if stage_name in {"mineru_parse", "mineru_skipped"}:
+        rank = 0
+    else:
+        rank = ordered_stages.index(stage_name)
+    patterns = ["input/source_markdown.md", "input/source_markdown.markdown"]
+    if rank >= ordered_stages.index("planning"):
+        patterns.extend(
+            [
+                "output/task_manifest.json",
+                "output/planning_response.json",
+                "output/planning_trajectories.json",
+            ]
+        )
+    if rank >= ordered_stages.index("extract_config"):
+        patterns.extend(
+            ["output/planning_config.yaml", "output/planning_artifacts/**/*"]
+        )
+    if rank >= ordered_stages.index("analyzing"):
+        patterns.extend(
+            [
+                "output/analyzing_artifacts/**/*",
+                "output/*_simple_analysis_response.json",
+                "output/*_simple_analysis_trajectories.json",
+            ]
+        )
+    if rank >= ordered_stages.index("coding"):
+        patterns.append("repo/**/*")
+    if stage_name in {"evaluation", "repair", "completed"}:
+        patterns.extend(["output/repo_status.json", "output/eval_feedback.json"])
+    if stage_name == "completed":
+        patterns.extend(["run_status.json", "run_summary.json"])
+    return glob_artifact_paths(run_dir, *patterns)
+
+
+def resume_markdown_path(run_dir, job_id):
+    entries = list_checkpoints(Path(run_dir), expected_job_id=job_id)
+    input_entries = [
+        (checkpoint, path)
+        for checkpoint, path in entries
+        if checkpoint["stage_sequence"] == 1 and checkpoint["status"] == "completed"
+    ]
+    if not input_entries:
+        raise RuntimeError("A completed input checkpoint is required for recovery.")
+    checkpoint, relative_checkpoint = max(
+        input_entries, key=lambda item: int(item[0]["stage_attempt"])
+    )
+    checkpoint = read_checkpoint(
+        Path(run_dir) / Path(*relative_checkpoint.split("/")),
+        run_dir=Path(run_dir),
+        expected_job_id=job_id,
+    )
+    markdown_artifacts = [
+        artifact
+        for artifact in checkpoint["artifacts"]
+        if str(artifact["path"]).lower().endswith((".md", ".markdown"))
+    ]
+    if len(markdown_artifacts) != 1:
+        raise RuntimeError("The input checkpoint must identify one Markdown artifact.")
+    return str(Path(run_dir) / Path(*str(markdown_artifacts[0]["path"]).split("/")))
+
+
 def should_echo_line(line, console_output):
     if console_output == "full":
         return True
@@ -312,6 +522,33 @@ def validate_runtime_args(args):
         raise ValueError(
             f"max_repair_rounds must be between 0 and {MAX_REPAIR_ROUNDS_LIMIT}."
         )
+    checkpoint_mode = getattr(args, "checkpoint_mode", "off")
+    resume_from_stage = getattr(args, "resume_from_stage", "")
+    resume_stage_sequence = int(getattr(args, "resume_stage_sequence", 0) or 0)
+    resume_stage_attempt = int(getattr(args, "resume_stage_attempt", 0) or 0)
+    recovery_count = int(getattr(args, "checkpoint_recovery_count", 0) or 0)
+    if checkpoint_mode == "off":
+        if (
+            resume_from_stage
+            or resume_stage_sequence
+            or resume_stage_attempt
+            or recovery_count
+        ):
+            raise ValueError("Checkpoint recovery arguments require --checkpoint_mode sqlite.")
+        return
+    if checkpoint_mode != "sqlite":
+        raise ValueError("checkpoint_mode must be 'off' or 'sqlite'.")
+    if not getattr(args, "job_id", ""):
+        raise ValueError("--job_id is required when checkpoint mode is enabled.")
+    if resume_from_stage:
+        if resume_from_stage not in CHECKPOINT_STAGES:
+            raise ValueError("--resume_from_stage is not an allowed pipeline stage.")
+        if resume_stage_sequence < 1 or resume_stage_attempt < 1:
+            raise ValueError("Resume sequence and attempt must be positive.")
+    elif resume_stage_sequence or resume_stage_attempt:
+        raise ValueError("Resume stage, sequence, and attempt must be provided together.")
+    if recovery_count < 0:
+        raise ValueError("--checkpoint_recovery_count must not be negative.")
 
 
 def build_python_cmd(script_dir, script_name):
@@ -525,6 +762,8 @@ def main(args):
     for directory in [input_dir, mineru_dir, output_dir, repo_dir, results_dir, logs_dir]:
         os.makedirs(directory, exist_ok=True)
 
+    checkpoint_adapter = PipelineCheckpointAdapter(args, run_dir, job_id)
+
     copied_pdf_path = os.path.join(input_dir, os.path.basename(paper_pdf_path))
     shutil.copy2(paper_pdf_path, copied_pdf_path)
 
@@ -554,6 +793,9 @@ def main(args):
             if args.max_repair_rounds == 0
             else "auto_refine"
         ),
+        checkpoint_mode=args.checkpoint_mode,
+        recovery_count=args.checkpoint_recovery_count,
+        resume_from_stage=args.resume_from_stage or None,
     )
     write_summary(
         summary_path,
@@ -568,44 +810,63 @@ def main(args):
         status="running",
     )
 
-    if args.skip_mineru:
-        markdown_path = validate_markdown_path(args.pdf_markdown_path, runs_dir)
-        update_status(
-            status_path,
-            status="running",
-            stage="mineru_skipped",
-            message="Skipped MinerU and reused existing Markdown.",
-            markdown_path=markdown_path,
-        )
-        print("=" * 80)
-        print("[PIPELINE] mineru_skipped")
-        print(f"Markdown: {markdown_path}")
-        print("=" * 80)
+    if checkpoint_adapter.should_run(1):
+        input_stage = "mineru_skipped" if args.skip_mineru else "mineru_parse"
+        with checkpoint_adapter.stage(
+            input_stage,
+            1,
+            artifact_paths=lambda: checkpoint_state_artifact_paths(
+                run_dir, input_stage
+            ),
+            resume_from_stage="planning",
+        ):
+            if args.skip_mineru:
+                markdown_path = validate_markdown_path(args.pdf_markdown_path, runs_dir)
+                update_status(
+                    status_path,
+                    status="running",
+                    stage="mineru_skipped",
+                    message="Skipped MinerU and reused existing Markdown.",
+                    markdown_path=markdown_path,
+                )
+                print("=" * 80)
+                print("[PIPELINE] mineru_skipped")
+                print(f"Markdown: {markdown_path}")
+                print("=" * 80)
+            else:
+                mineru_executable = args.mineru_executable or default_mineru_executable(script_dir)
+                mineru_cmd = [
+                    mineru_executable,
+                    "-p",
+                    copied_pdf_path,
+                    "-o",
+                    mineru_dir,
+                    "-b",
+                    args.mineru_backend,
+                    "-f",
+                    "true" if args.mineru_formula else "false",
+                    "-t",
+                    "true" if args.mineru_table else "false",
+                ]
+                run_command(
+                    "mineru_parse",
+                    mineru_cmd,
+                    script_dir,
+                    os.path.join(logs_dir, "01_mineru_parse.log"),
+                    status_path,
+                    console_output=args.console_output,
+                )
+                markdown_path = discover_markdown(mineru_dir, paper_name)
+            if checkpoint_adapter.enabled:
+                suffix = Path(markdown_path).suffix.lower()
+                checkpoint_markdown = os.path.join(
+                    input_dir, f"source_markdown{suffix}"
+                )
+                if os.path.abspath(markdown_path) != os.path.abspath(checkpoint_markdown):
+                    shutil.copy2(markdown_path, checkpoint_markdown)
+                markdown_path = checkpoint_markdown
     else:
-        mineru_executable = args.mineru_executable or default_mineru_executable(script_dir)
-        mineru_cmd = [
-            mineru_executable,
-            "-p",
-            copied_pdf_path,
-            "-o",
-            mineru_dir,
-            "-b",
-            args.mineru_backend,
-            "-f",
-            "true" if args.mineru_formula else "false",
-            "-t",
-            "true" if args.mineru_table else "false",
-        ]
-        run_command(
-            "mineru_parse",
-            mineru_cmd,
-            script_dir,
-            os.path.join(logs_dir, "01_mineru_parse.log"),
-            status_path,
-            console_output=args.console_output,
-        )
-
-        markdown_path = discover_markdown(mineru_dir, paper_name)
+        markdown_path = resume_markdown_path(run_dir, job_id)
     write_summary(summary_path, markdown_path=markdown_path)
 
     planning_cmd = build_python_cmd(script_dir, "1_planning.py") + [
@@ -622,16 +883,27 @@ def main(args):
         "--output_dir",
         output_dir,
     ]
-    run_command(
-        "planning",
-        planning_cmd,
-        script_dir,
-        os.path.join(logs_dir, "02_planning.log"),
-        status_path,
-        env=reproduce_env,
-        console_output=args.console_output,
-    )
-    load_task_manifest(output_dir)
+    if checkpoint_adapter.should_run(2):
+        with checkpoint_adapter.stage(
+            "planning",
+            2,
+            artifact_paths=lambda: checkpoint_state_artifact_paths(
+                run_dir, "planning"
+            ),
+            resume_from_stage="extract_config",
+        ):
+            run_command(
+                "planning",
+                planning_cmd,
+                script_dir,
+                os.path.join(logs_dir, "02_planning.log"),
+                status_path,
+                env=reproduce_env,
+                console_output=args.console_output,
+            )
+            load_task_manifest(output_dir)
+    else:
+        load_task_manifest(output_dir)
 
     extract_config_cmd = build_python_cmd(script_dir, "1.1_extract_config.py") + [
         "--paper_name",
@@ -639,14 +911,23 @@ def main(args):
         "--output_dir",
         output_dir,
     ]
-    run_command(
-        "extract_config",
-        extract_config_cmd,
-        script_dir,
-        os.path.join(logs_dir, "03_extract_config.log"),
-        status_path,
-        console_output=args.console_output,
-    )
+    if checkpoint_adapter.should_run(3):
+        with checkpoint_adapter.stage(
+            "extract_config",
+            3,
+            artifact_paths=lambda: checkpoint_state_artifact_paths(
+                run_dir, "extract_config"
+            ),
+            resume_from_stage="analyzing",
+        ):
+            run_command(
+                "extract_config",
+                extract_config_cmd,
+                script_dir,
+                os.path.join(logs_dir, "03_extract_config.log"),
+                status_path,
+                console_output=args.console_output,
+            )
 
     analyzing_cmd = build_python_cmd(script_dir, "2_analyzing.py") + [
         "--paper_name",
@@ -662,15 +943,24 @@ def main(args):
         "--output_dir",
         output_dir,
     ]
-    run_command(
-        "analyzing",
-        analyzing_cmd,
-        script_dir,
-        os.path.join(logs_dir, "04_analyzing.log"),
-        status_path,
-        env=reproduce_env,
-        console_output=args.console_output,
-    )
+    if checkpoint_adapter.should_run(4):
+        with checkpoint_adapter.stage(
+            "analyzing",
+            4,
+            artifact_paths=lambda: checkpoint_state_artifact_paths(
+                run_dir, "analyzing"
+            ),
+            resume_from_stage="coding",
+        ):
+            run_command(
+                "analyzing",
+                analyzing_cmd,
+                script_dir,
+                os.path.join(logs_dir, "04_analyzing.log"),
+                status_path,
+                env=reproduce_env,
+                console_output=args.console_output,
+            )
 
     planning_config_file = validate_task_path("planning_config.yaml")
     planning_config = safe_join(output_dir, planning_config_file)
@@ -698,20 +988,76 @@ def main(args):
         "--output_repo_dir",
         repo_dir,
     ]
-    run_command(
-        "coding",
-        coding_cmd,
-        script_dir,
-        os.path.join(logs_dir, "05_coding.log"),
-        status_path,
-        env=reproduce_env,
-        console_output=args.console_output,
-    )
+    if checkpoint_adapter.should_run(5):
+        with checkpoint_adapter.stage(
+            "coding",
+            5,
+            artifact_paths=lambda: checkpoint_state_artifact_paths(
+                run_dir, "coding"
+            ),
+            resume_from_stage="evaluation",
+        ):
+            run_command(
+                "coding",
+                coding_cmd,
+                script_dir,
+                os.path.join(logs_dir, "05_coding.log"),
+                status_path,
+                env=reproduce_env,
+                console_output=args.console_output,
+            )
 
-    if args.auto_refine:
+    if checkpoint_adapter.enabled and checkpoint_adapter.resume_sequence > 6:
+        previous_repo_status = load_json_file(
+            repo_status_path(output_dir), default={}
+        ) or {}
+        remember_fallback_eval_model(
+            args, previous_repo_status, status_path
+        )
+
+    resume_completed = (
+        checkpoint_adapter.enabled
+        and checkpoint_adapter.resume_from_stage == "completed"
+    )
+    last_stage_sequence = 5
+    if args.auto_refine and not resume_completed:
+        stage_sequence = (
+            checkpoint_adapter.resume_sequence
+            if checkpoint_adapter.resume_sequence > 5
+            else 6
+        )
         while True:
-            repo_status = load_json_file(repo_status_path(output_dir), default={}) or {}
-            repair_round = int(repo_status.get("repair_round", 0) or 0)
+            if stage_sequence % 2 == 1:
+                repair_round = (stage_sequence - 5) // 2
+                repair_cmd = build_repair_cmd(
+                    args,
+                    script_dir,
+                    paper_name,
+                    markdown_path,
+                    output_dir,
+                    repo_dir,
+                )
+                with checkpoint_adapter.stage(
+                    "repair",
+                    stage_sequence,
+                    artifact_paths=lambda: checkpoint_state_artifact_paths(
+                        run_dir, "repair"
+                    ),
+                    resume_from_stage="evaluation",
+                ):
+                    run_command(
+                        f"repair_round_{repair_round}",
+                        repair_cmd,
+                        script_dir,
+                        os.path.join(logs_dir, f"07_repair_round_{repair_round}.log"),
+                        status_path,
+                        env=reproduce_env,
+                        console_output=args.console_output,
+                    )
+                last_stage_sequence = stage_sequence
+                stage_sequence += 1
+
+            eval_round = (stage_sequence - 6) // 2
             eval_cmd = build_eval_cmd(
                 args,
                 script_dir,
@@ -721,30 +1067,47 @@ def main(args):
                 repo_dir,
                 results_dir,
             )
-            run_command(
-                f"evaluation_round_{repair_round}",
-                eval_cmd,
-                script_dir,
-                os.path.join(logs_dir, f"06_eval_round_{repair_round}.log"),
-                status_path,
-                env=eval_env,
-                console_output=args.console_output,
-            )
-
-            repo_status = load_json_file(repo_status_path(output_dir), default={}) or {}
-            remember_fallback_eval_model(args, repo_status, status_path)
-            if repo_status.get("status") == STATUS_EVAL_PASSED:
-                break
-
-            if repo_status.get("status") != STATUS_EVAL_FAILED:
-                raise RuntimeError(
-                    "Evaluation did not produce a recognized repository status. "
-                    f"Found: {repo_status.get('status')!r}"
+            evaluation_next = {"stage": None}
+            evaluation_limit_message = {"message": None}
+            with checkpoint_adapter.stage(
+                "evaluation",
+                stage_sequence,
+                artifact_paths=lambda: checkpoint_state_artifact_paths(
+                    run_dir, "evaluation"
+                ),
+                resume_from_stage=lambda: evaluation_next["stage"],
+            ):
+                run_command(
+                    f"evaluation_round_{eval_round}",
+                    eval_cmd,
+                    script_dir,
+                    os.path.join(logs_dir, f"06_eval_round_{eval_round}.log"),
+                    status_path,
+                    env=eval_env,
+                    console_output=args.console_output,
                 )
-
-            repair_round = int(repo_status.get("repair_round", 0) or 0)
-            if repair_round >= args.max_repair_rounds:
-                message = repair_limit_message(repair_round, args.max_repair_rounds)
+                repo_status = load_json_file(repo_status_path(output_dir), default={}) or {}
+                remember_fallback_eval_model(args, repo_status, status_path)
+                if repo_status.get("status") == STATUS_EVAL_PASSED:
+                    evaluation_next["stage"] = "completed"
+                elif repo_status.get("status") == STATUS_EVAL_FAILED:
+                    repair_round = int(repo_status.get("repair_round", 0) or 0)
+                    if repair_round < args.max_repair_rounds:
+                        evaluation_next["stage"] = "repair"
+                    else:
+                        evaluation_limit_message["message"] = repair_limit_message(
+                            repair_round, args.max_repair_rounds
+                        )
+                else:
+                    raise RuntimeError(
+                        "Evaluation did not produce a recognized repository status. "
+                        f"Found: {repo_status.get('status')!r}"
+                    )
+            last_stage_sequence = stage_sequence
+            if evaluation_next["stage"] == "completed":
+                break
+            if evaluation_limit_message["message"]:
+                message = evaluation_limit_message["message"]
                 if args.max_repair_rounds == 0:
                     update_status(
                         status_path,
@@ -753,27 +1116,10 @@ def main(args):
                         message=message,
                         repo_status=repo_status,
                     )
-                    raise RuntimeError(message)
                 raise RuntimeError(message)
-
-            repair_cmd = build_repair_cmd(
-                args,
-                script_dir,
-                paper_name,
-                markdown_path,
-                output_dir,
-                repo_dir,
-            )
-            run_command(
-                f"repair_round_{repair_round + 1}",
-                repair_cmd,
-                script_dir,
-                os.path.join(logs_dir, f"07_repair_round_{repair_round + 1}.log"),
-                status_path,
-                env=reproduce_env,
-                console_output=args.console_output,
-            )
-    else:
+            stage_sequence += 1
+    elif not args.auto_refine and not resume_completed:
+        stage_sequence = 6
         eval_cmd = build_eval_cmd(
             args,
             script_dir,
@@ -783,44 +1129,67 @@ def main(args):
             repo_dir,
             results_dir,
         )
-        run_command(
+        with checkpoint_adapter.stage(
             "evaluation",
-            eval_cmd,
-            script_dir,
-            os.path.join(logs_dir, "06_evaluation.log"),
-            status_path,
-            env=eval_env,
-            console_output=args.console_output,
-        )
-        repo_status = load_json_file(repo_status_path(output_dir), default={}) or {}
-        remember_fallback_eval_model(args, repo_status, status_path)
+            stage_sequence,
+            artifact_paths=lambda: checkpoint_state_artifact_paths(
+                run_dir, "evaluation"
+            ),
+            resume_from_stage="completed",
+        ):
+            run_command(
+                "evaluation",
+                eval_cmd,
+                script_dir,
+                os.path.join(logs_dir, "06_evaluation.log"),
+                status_path,
+                env=eval_env,
+                console_output=args.console_output,
+            )
+            repo_status = load_json_file(repo_status_path(output_dir), default={}) or {}
+            remember_fallback_eval_model(args, repo_status, status_path)
+        last_stage_sequence = stage_sequence
 
-    repo_status = load_json_file(repo_status_path(output_dir), default={}) or {}
-    final_status = repo_status.get("status", "unknown")
-    update_status(
-        status_path,
-        status="completed",
-        stage="completed",
-        message=f"Pipeline completed with repository status: {final_status}",
-        repo_status=repo_status,
-        completed_at=now_str(),
+    completion_sequence = (
+        checkpoint_adapter.resume_sequence
+        if resume_completed
+        else last_stage_sequence + 1
     )
-    write_summary(
-        summary_path,
-        status=final_status,
-        repo_status=repo_status,
-        eval_score=repo_status.get("eval_score"),
-        repair_round=repo_status.get("repair_round"),
-        latest_eval_result=repo_status.get("eval_result_file"),
-        feedback_file=repo_status.get("feedback_file"),
-        files=sorted(
-            [
-                file_name
-                for file_name in os.listdir(repo_dir)
-                if os.path.isfile(os.path.join(repo_dir, file_name))
-            ]
+
+    with checkpoint_adapter.stage(
+        "completed",
+        completion_sequence,
+        artifact_paths=lambda: checkpoint_state_artifact_paths(
+            run_dir, "completed"
         ),
-    )
+        resume_from_stage=None,
+    ):
+        repo_status = load_json_file(repo_status_path(output_dir), default={}) or {}
+        final_status = repo_status.get("status", "unknown")
+        update_status(
+            status_path,
+            status="completed",
+            stage="completed",
+            message=f"Pipeline completed with repository status: {final_status}",
+            repo_status=repo_status,
+            completed_at=now_str(),
+        )
+        write_summary(
+            summary_path,
+            status=final_status,
+            repo_status=repo_status,
+            eval_score=repo_status.get("eval_score"),
+            repair_round=repo_status.get("repair_round"),
+            latest_eval_result=repo_status.get("eval_result_file"),
+            feedback_file=repo_status.get("feedback_file"),
+            files=sorted(
+                [
+                    file_name
+                    for file_name in os.listdir(repo_dir)
+                    if os.path.isfile(os.path.join(repo_dir, file_name))
+                ]
+            ),
+        )
 
     print("=" * 80)
     print("[PIPELINE] Completed")
@@ -860,6 +1229,16 @@ if __name__ == "__main__":
     parser.add_argument("--eval_fallback_gpt_versions", type=str, default="")
     parser.add_argument("--runs_dir", type=str, default="runs")
     parser.add_argument("--job_id", type=str, default="")
+    parser.add_argument(
+        "--checkpoint_mode",
+        type=str,
+        default="off",
+        choices=["off", "sqlite"],
+    )
+    parser.add_argument("--resume_from_stage", type=str, default="")
+    parser.add_argument("--resume_stage_sequence", type=int, default=0)
+    parser.add_argument("--resume_stage_attempt", type=int, default=0)
+    parser.add_argument("--checkpoint_recovery_count", type=int, default=0)
     parser.add_argument("--mineru_executable", type=str, default="")
     parser.add_argument("--mineru_backend", type=str, default="pipeline")
     parser.add_argument("--mineru_formula", type=parse_bool, default=True)

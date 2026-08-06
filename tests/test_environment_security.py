@@ -8,6 +8,10 @@ from web_api import job_service, main as main_module, settings_store
 from web_api.schemas import WebSettings
 
 
+API_PREFIX = "/api/v1"
+LOCAL_ORIGIN = "http://localhost"
+
+
 def _settings(**overrides: object) -> WebSettings:
     data = {
         "reproduce": {
@@ -152,7 +156,11 @@ def test_settings_endpoints_do_not_echo_api_keys(monkeypatch, tmp_path: Path) ->
     settings_path = tmp_path / "web_settings.json"
     monkeypatch.setattr(settings_store, "LOCAL_DIR", tmp_path)
     monkeypatch.setattr(settings_store, "SETTINGS_PATH", settings_path)
-    client = TestClient(main_module.app)
+    client = TestClient(main_module.app, base_url=LOCAL_ORIGIN)
+    session = client.get(f"{API_PREFIX}/session", headers={"Origin": LOCAL_ORIGIN})
+    client.headers.update(
+        {"Origin": LOCAL_ORIGIN, "X-CSRF-Token": session.json()["csrf_token"]}
+    )
     payload = {
         "reproduce": {
             "provider": "deepseek",
@@ -169,8 +177,8 @@ def test_settings_endpoints_do_not_echo_api_keys(monkeypatch, tmp_path: Path) ->
         },
     }
 
-    post_response = client.post("/settings", json=payload)
-    status_response = client.get("/settings/status")
+    post_response = client.post(f"{API_PREFIX}/settings", json=payload)
+    status_response = client.get(f"{API_PREFIX}/settings/status")
 
     assert post_response.status_code == 200
     assert status_response.status_code == 200

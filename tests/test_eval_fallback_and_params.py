@@ -11,6 +11,10 @@ from web_api import main as main_module
 from web_api.schemas import WebSettings
 
 
+API_PREFIX = "/api/v1"
+LOCAL_ORIGIN = "http://localhost"
+
+
 def _load_code_module(module_name: str, file_name: str):
     codes_dir = Path(__file__).resolve().parents[1] / "codes"
     sys.path.insert(0, str(codes_dir))
@@ -527,8 +531,13 @@ def test_web_create_job_rejects_out_of_range_parameters(
     expected_detail: str,
 ) -> None:
     monkeypatch.setattr(main_module, "load_settings", _web_settings)
-    client = TestClient(main_module.app)
-    form = {
+    client = TestClient(main_module.app, base_url=LOCAL_ORIGIN)
+    session = client.get(f"{API_PREFIX}/session", headers={"Origin": LOCAL_ORIGIN})
+    client.headers.update(
+        {"Origin": LOCAL_ORIGIN, "X-CSRF-Token": session.json()["csrf_token"]}
+    )
+    payload = {
+        "upload_id": "0" * 32,
         "paper_name": "paper",
         "domain": "statistics",
         "eval_type": "ref_free",
@@ -541,11 +550,7 @@ def test_web_create_job_rejects_out_of_range_parameters(
         **form_override,
     }
 
-    response = client.post(
-        "/jobs",
-        data=form,
-        files={"file": ("paper.pdf", b"%PDF-1.7\nbody", "application/pdf")},
-    )
+    response = client.post(f"{API_PREFIX}/jobs", json=payload)
 
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "invalid_parameter"

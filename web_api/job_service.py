@@ -1,6 +1,7 @@
 import os
 import re
 import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -10,8 +11,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import BinaryIO, TextIO
 
-from .config import CODES_DIR, REPO_ROOT, RUNS_DIR, UPLOADS_DIR
+from .config import CODES_DIR, MAX_PDF_UPLOAD_BYTES, REPO_ROOT, RUNS_DIR, UPLOADS_DIR
 from .errors import (
+    FileTooLargeError,
     InvalidParameterError,
     InvalidUploadError,
     JobNotCancelableError,
@@ -26,6 +28,9 @@ from .schemas import ConsoleOutput, DomainName, EvalType, WebSettings
 ACTIVE_PROCESSES: dict[str, subprocess.Popen] = {}
 ACTIVE_LOG_FILES: dict[str, TextIO] = {}
 PDF_MAGIC = b"%PDF-"
+UPLOAD_CHUNK_BYTES = 1024 * 1024
+UPLOAD_FILE_NAME = "document.pdf"
+UPLOAD_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 MARKDOWN_EXTENSIONS = {".md", ".markdown"}
 TERMINAL_STATUSES = {"completed", "failed", "canceled"}
 ACTIVE_STATUSES = {"starting", "queued", "running"}
@@ -105,27 +110,111 @@ def make_job_id(paper_name: str) -> str:
     return f"{compact_now_str()}_{paper_name}_{uuid.uuid4().hex[:8]}"
 
 
-def save_upload(job_id: str, filename: str, source: BinaryIO) -> Path:
-    job_id = validate_job_id(job_id)
+def make_upload_id() -> str:
+    return uuid.uuid4().hex
+
+
+def validate_upload_id(upload_id: str) -> str:
+    if not isinstance(upload_id, str) or not UPLOAD_ID_RE.fullmatch(upload_id):
+        raise InvalidParameterError(
+            "upload_id is invalid.",
+            details={"parameter": "upload_id"},
+        )
+    return upload_id
+
+
+def upload_path(upload_id: str) -> Path:
+    upload_id = validate_upload_id(upload_id)
+    root = UPLOADS_DIR.resolve(strict=False)
+    candidate = (UPLOADS_DIR / upload_id / UPLOAD_FILE_NAME).resolve(strict=False)
+    try:
+        candidate.relative_to(root)
+    except ValueError as exc:
+        raise InvalidParameterError(
+            "upload_id is invalid.",
+            details={"parameter": "upload_id"},
+        ) from exc
+    return candidate
+
+
+def resolve_upload(upload_id: str) -> Path:
+    candidate = upload_path(upload_id)
+    try:
+        path_stat = candidate.lstat()
+    except FileNotFoundError as exc:
+        raise InvalidParameterError(
+            "upload_id does not reference an available PDF.",
+            details={"parameter": "upload_id"},
+        ) from exc
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    if (
+        not stat.S_ISREG(path_stat.st_mode)
+        or stat.S_ISLNK(path_stat.st_mode)
+        or path_stat.st_nlink > 1
+        or getattr(path_stat, "st_file_attributes", 0) & reparse_flag
+    ):
+        raise InvalidParameterError(
+            "upload_id does not reference a safe PDF.",
+            details={"parameter": "upload_id"},
+        )
+    return candidate
+
+
+def save_upload(
+    upload_id: str,
+    filename: str,
+    source: BinaryIO,
+    *,
+    max_bytes: int | None = None,
+) -> Path:
+    upload_id = validate_upload_id(upload_id)
     if not filename or not filename.lower().endswith(".pdf"):
         raise UnsupportedFileTypeError("Only PDF uploads are supported.")
+    limit = MAX_PDF_UPLOAD_BYTES if max_bytes is None else max_bytes
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit < len(PDF_MAGIC):
+        raise ValueError("PDF upload limit must be a positive integer large enough for the header.")
 
-    first_chunk = source.read(1024 * 1024)
-    if not first_chunk.startswith(PDF_MAGIC):
-        raise InvalidUploadError("Upload content is not a valid PDF file.")
-
-    safe_filename = sanitize_name(filename, "paper") + ".pdf"
-    upload_dir = UPLOADS_DIR / job_id
+    upload_dir = UPLOADS_DIR / upload_id
     upload_dir.mkdir(parents=True, exist_ok=True)
-    target_path = upload_dir / safe_filename
-    with open(target_path, "wb") as out:
-        out.write(first_chunk)
-        while True:
-            chunk = source.read(1024 * 1024)
-            if not chunk:
-                break
-            out.write(chunk)
-    return target_path
+    target_path = upload_path(upload_id)
+    temp_path = upload_dir / f".{uuid.uuid4().hex}.tmp"
+    total_bytes = 0
+    header = b""
+    try:
+        with open(temp_path, "xb") as out:
+            while True:
+                chunk = source.read(UPLOAD_CHUNK_BYTES)
+                if not chunk:
+                    break
+                if not isinstance(chunk, bytes):
+                    raise InvalidUploadError("Upload stream did not return bytes.")
+                if len(header) < len(PDF_MAGIC):
+                    needed = len(PDF_MAGIC) - len(header)
+                    header += chunk[:needed]
+                    if len(header) == len(PDF_MAGIC) and header != PDF_MAGIC:
+                        raise InvalidUploadError("Upload content is not a valid PDF file.")
+                total_bytes += len(chunk)
+                if total_bytes > limit:
+                    raise FileTooLargeError(
+                        f"PDF upload exceeds the configured limit of {limit} bytes."
+                    )
+                out.write(chunk)
+            if header != PDF_MAGIC:
+                raise InvalidUploadError("Upload content is not a valid PDF file.")
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(temp_path, target_path)
+        return target_path
+    finally:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        try:
+            if upload_dir.exists() and not any(upload_dir.iterdir()):
+                upload_dir.rmdir()
+        except OSError:
+            pass
 
 
 def validate_pdf_markdown_path(pdf_markdown_path: str) -> Path:
@@ -183,6 +272,11 @@ def build_pipeline_command(
     console_output: ConsoleOutput,
     skip_mineru: bool,
     pdf_markdown_path: str,
+    checkpoint_mode: str = "off",
+    resume_from_stage: str = "",
+    resume_stage_sequence: int = 0,
+    resume_stage_attempt: int = 0,
+    checkpoint_recovery_count: int = 0,
 ) -> list[str]:
     cmd = [
         sys.executable,
@@ -229,6 +323,29 @@ def build_pipeline_command(
         pdf_markdown_path = str(validate_pdf_markdown_path(pdf_markdown_path))
         cmd.append("--skip_mineru")
         cmd.extend(["--pdf_markdown_path", pdf_markdown_path])
+
+    if checkpoint_mode == "sqlite":
+        cmd.extend(
+            [
+                "--checkpoint_mode",
+                "sqlite",
+                "--checkpoint_recovery_count",
+                str(checkpoint_recovery_count),
+            ]
+        )
+        if resume_from_stage:
+            cmd.extend(
+                [
+                    "--resume_from_stage",
+                    resume_from_stage,
+                    "--resume_stage_sequence",
+                    str(resume_stage_sequence),
+                    "--resume_stage_attempt",
+                    str(resume_stage_attempt),
+                ]
+            )
+    elif checkpoint_mode != "off":
+        raise ValueError("checkpoint_mode must be 'off' or 'sqlite'.")
 
     return cmd
 

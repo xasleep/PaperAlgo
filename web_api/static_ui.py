@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -9,37 +10,40 @@ from starlette.staticfiles import StaticFiles
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WEB_UI_DIST = REPO_ROOT / "web_ui" / "dist"
 WEB_UI_INDEX = WEB_UI_DIST / "index.html"
-API_LIKE_PREFIXES = {
-    "api",
-    "health",
-    "jobs",
-    "openapi.json",
-    "docs",
-    "redoc",
-}
+API_PREFIX = "api"
+HASHED_ASSET_RE = re.compile(r"(?:^|[-.])[A-Za-z0-9_-]{8,}\.[A-Za-z0-9]+$")
 
 
 def static_ui_available(dist_dir: Path = WEB_UI_DIST) -> bool:
     return (dist_dir / "index.html").is_file()
 
 
-def wants_html(request: Request) -> bool:
-    accept = request.headers.get("accept", "")
-    return "text/html" in accept.lower()
-
-
 def spa_index_response(
     request: Request,
     dist_dir: Path = WEB_UI_DIST,
 ) -> FileResponse | None:
-    if request.method != "GET" or not wants_html(request) or not static_ui_available(dist_dir):
+    if request.method != "GET" or not static_ui_available(dist_dir):
         return None
-    return FileResponse(str(dist_dir / "index.html"), media_type="text/html")
+    return FileResponse(
+        str(dist_dir / "index.html"),
+        media_type="text/html",
+        headers={"Cache-Control": "no-cache"},
+    )
 
 
 def is_api_like_path(path: str) -> bool:
     first_segment = path.strip("/").split("/", 1)[0]
-    return first_segment in API_LIKE_PREFIXES
+    return first_segment == API_PREFIX
+
+
+class CacheControlledStaticFiles(StaticFiles):
+    async def get_response(self, path: str, scope):
+        response = await super().get_response(path, scope)
+        if response.status_code == 200 and HASHED_ASSET_RE.search(Path(path).name):
+            response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        else:
+            response.headers["Cache-Control"] = "no-cache"
+        return response
 
 
 def install_static_ui(app: FastAPI, dist_dir: Path = WEB_UI_DIST) -> bool:
@@ -50,7 +54,7 @@ def install_static_ui(app: FastAPI, dist_dir: Path = WEB_UI_DIST) -> bool:
     if assets_dir.is_dir():
         app.mount(
             "/assets",
-            StaticFiles(directory=str(assets_dir)),
+            CacheControlledStaticFiles(directory=str(assets_dir)),
             name="web_ui_assets",
         )
 

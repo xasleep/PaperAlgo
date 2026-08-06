@@ -8,13 +8,23 @@ from fastapi.testclient import TestClient
 from web_api import artifact_service, job_service, main as main_module
 
 
+API_PREFIX = "/api/v1"
+
+
 @pytest.fixture()
 def state_client(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     runs_dir = tmp_path / "runs"
     runs_dir.mkdir()
     monkeypatch.setattr(artifact_service, "RUNS_DIR", runs_dir)
     monkeypatch.setattr(job_service, "RUNS_DIR", runs_dir)
-    return TestClient(main_module.app, raise_server_exceptions=False), runs_dir
+    return (
+        TestClient(
+            main_module.app,
+            base_url="http://localhost",
+            raise_server_exceptions=False,
+        ),
+        runs_dir,
+    )
 
 
 def _make_run(runs_dir: Path, job_id: str) -> Path:
@@ -50,7 +60,7 @@ def test_jobs_list_tolerates_corrupt_and_empty_state_json(
     empty_run = _make_run(runs_dir, "empty_job")
     (empty_run / "run_summary.json").write_text("", encoding="utf-8")
 
-    response = client.get("/jobs")
+    response = client.get(f"{API_PREFIX}/jobs")
 
     assert response.status_code == 200
     jobs_by_id = {job["job_id"]: job for job in response.json()["jobs"]}
@@ -75,7 +85,7 @@ def test_job_status_tolerates_corrupt_or_half_written_status_json(
     run_dir = _make_run(runs_dir, "bad_status")
     (run_dir / "run_status.json").write_text(content, encoding="utf-8")
 
-    response = client.get("/jobs/bad_status")
+    response = client.get(f"{API_PREFIX}/jobs/bad_status")
 
     assert response.status_code == 200
     body = response.json()
@@ -100,7 +110,7 @@ def test_job_summary_tolerates_corrupt_or_half_written_summary_json(
     run_dir = _make_run(runs_dir, "bad_summary")
     (run_dir / "run_summary.json").write_text(content, encoding="utf-8")
 
-    response = client.get("/jobs/bad_summary/summary")
+    response = client.get(f"{API_PREFIX}/jobs/bad_summary/summary")
 
     assert response.status_code == 200
     body = response.json()
