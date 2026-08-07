@@ -4,6 +4,7 @@ env/
 mineru_env/
 __pycache__/
 .pytest_cache/
+.pytest_tmp*/
 .mypy_cache/
 .ruff_cache/
 .coverage

@@ -16,6 +16,7 @@ for _stream in (sys.stdout, sys.stderr):
 STATUS_PENDING_EVAL = "待测评"
 STATUS_EVAL_FAILED = "测评但未通过"
 STATUS_EVAL_PASSED = "测评且通过"
+STATUS_EVAL_ERROR = "测评协议失败"
 MAX_REPAIR_ROUNDS = 3
 
 

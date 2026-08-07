@@ -3,6 +3,7 @@ import os
 import subprocess
 import sys
 
+from evaluation_contract import decide_repair_action
 from utils import (
     MAX_REPAIR_ROUNDS,
     STATUS_EVAL_FAILED,
@@ -121,16 +122,18 @@ def main(args):
             print("[AUTO-REFINE] Repository passed evaluation.")
             return
 
+        repair_decision = decide_repair_action(status)
         if current_status != STATUS_EVAL_FAILED:
             raise RuntimeError(
-                "Evaluation did not produce a recognized failed/passed status. "
+                "Evaluation did not produce a repairable quality failure. "
+                f"Reason: {repair_decision['reason']}. "
                 f"Found status: {current_status!r}"
             )
 
-        if repair_round >= args.max_repair_rounds:
+        if repair_decision["status"] != "ready":
             raise RuntimeError(
-                f"Evaluation still failed after {repair_round} repair rounds. "
-                "Stopping to avoid an infinite repair loop."
+                "Repair is not allowed by the evaluation contract: "
+                f"{repair_decision['reason']}."
             )
 
         repair_cmd = build_repair_cmd(args, script_dir)
