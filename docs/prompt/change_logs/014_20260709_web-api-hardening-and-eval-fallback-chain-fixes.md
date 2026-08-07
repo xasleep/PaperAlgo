@@ -220,7 +220,7 @@
     - 覆盖多 fallback 链在后续 build_eval_cmd 中继续携带剩余 fallback。
     - 覆盖未发生 fallback 时仍使用原始模型和完整 fallback 链。
 - 兼容性/注意事项：
-  - 默认 fallback 仍只内置 `qwen3.7-max -> qwen3.7-plus` 和 `qwen-3.7-max -> qwen-3.7-plus`。
+  - 当时的实现曾兼容两组 Qwen 拼写；PR-05 官方模型清单复核后，当前默认 fallback 只保留 `qwen3.7-max -> qwen3.7-plus`。
   - 其它 fallback 链需要通过 settings 中的 `evaluation.fallback_models` 或 CLI `--eval_fallback_gpt_versions` 显式传入。
 
 ### 文档与工程说明同步

@@ -74,7 +74,7 @@
     - 覆盖状态字段记录 effective model、fallback active 和 remaining fallback models。
 - 兼容性/注意事项：
   - fallback 仍只在 `PermissionDeniedError` / `BadRequestError` 且判断为 quota-like 错误时触发；非 quota-like 错误不会被吞掉。
-  - 默认 fallback 只内置 `qwen3.7-max -> qwen3.7-plus` 和 `qwen-3.7-max -> qwen-3.7-plus`；更长链需要通过 `--eval_fallback_gpt_versions` 或 Web settings 中的 `evaluation.fallback_models` 传入。
+  - 当时的实现曾兼容两组 Qwen 拼写；PR-05 官方模型清单复核后，当前默认 fallback 只保留 `qwen3.7-max -> qwen3.7-plus`。更长链需要通过 `--eval_fallback_gpt_versions` 或 Web settings 中的 `evaluation.fallback_models` 传入，并且每个 model ID 都必须注册在同一 Provider 下。
 
 ## 测试结果
 

@@ -307,6 +307,61 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             """,
         ),
     ),
+    (
+        6,
+        (
+            """
+            ALTER TABLE jobs ADD COLUMN reproduce_provider TEXT
+                CHECK(reproduce_provider IS NULL OR (
+                    typeof(reproduce_provider) = 'text'
+                    AND length(reproduce_provider) BETWEEN 1 AND 128
+                ))
+            """,
+            """
+            ALTER TABLE jobs ADD COLUMN reproduce_model TEXT
+                CHECK(reproduce_model IS NULL OR (
+                    typeof(reproduce_model) = 'text'
+                    AND length(reproduce_model) BETWEEN 1 AND 128
+                ))
+            """,
+            """
+            ALTER TABLE jobs ADD COLUMN evaluation_provider TEXT
+                CHECK(evaluation_provider IS NULL OR (
+                    typeof(evaluation_provider) = 'text'
+                    AND length(evaluation_provider) BETWEEN 1 AND 128
+                ))
+            """,
+            """
+            ALTER TABLE jobs ADD COLUMN evaluation_model TEXT
+                CHECK(evaluation_model IS NULL OR (
+                    typeof(evaluation_model) = 'text'
+                    AND length(evaluation_model) BETWEEN 1 AND 128
+                ))
+            """,
+            """
+            ALTER TABLE jobs ADD COLUMN evaluation_fallback_models_json TEXT
+                CHECK(evaluation_fallback_models_json IS NULL OR (
+                    typeof(evaluation_fallback_models_json) = 'text'
+                    AND length(evaluation_fallback_models_json) BETWEEN 2 AND 8192
+                ))
+            """,
+            """
+            ALTER TABLE jobs ADD COLUMN provider_registry_version INTEGER
+                CHECK(provider_registry_version IS NULL OR (
+                    typeof(provider_registry_version) = 'integer'
+                    AND provider_registry_version >= 1
+                ))
+            """,
+            """
+            ALTER TABLE jobs ADD COLUMN provider_contract_fingerprint TEXT
+                CHECK(provider_contract_fingerprint IS NULL OR (
+                    typeof(provider_contract_fingerprint) = 'text'
+                    AND length(provider_contract_fingerprint) = 64
+                    AND provider_contract_fingerprint NOT GLOB '*[^0-9a-f]*'
+                ))
+            """,
+        ),
+    ),
 )
 
 

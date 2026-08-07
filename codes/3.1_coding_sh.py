@@ -16,7 +16,8 @@ import argparse
 parser = argparse.ArgumentParser()
 
 parser.add_argument('--paper_name',type=str)
-parser.add_argument('--gpt_version',type=str, default="o3-mini")
+parser.add_argument('--provider',type=str, required=True)
+parser.add_argument('--gpt_version',type=str, required=True)
 parser.add_argument('--paper_format',type=str, default="JSON", choices=["JSON", "LaTeX"])
 parser.add_argument('--pdf_json_path', type=str) # json format
 parser.add_argument('--pdf_latex_path', type=str) # latex format
@@ -24,7 +25,7 @@ parser.add_argument('--output_dir',type=str, default="")
 parser.add_argument('--output_repo_dir',type=str, default="")
 
 args    = parser.parse_args()
-client = make_openai_client()
+client = make_openai_client(args.provider, args.gpt_version)
 
 paper_name = args.paper_name
 gpt_version = args.gpt_version
@@ -104,18 +105,8 @@ Next, you must write only the "{todo_file_name}".
 
 
 def api_call(msg):
-    if "o3-mini" in gpt_version or "o4-mini" in gpt_version:
-        completion = client.chat.completions.create(
-            model=gpt_version, 
-            reasoning_effort="high",
-            messages=msg
-        )
-    else:
-        completion = client.chat.completions.create(
-            model=gpt_version, 
-            messages=msg
-        )
-    return completion
+    request = {"model": gpt_version, "messages": msg, **client.contract.request_options}
+    return client.chat.completions.create(**request)
     
 
 artifact_output_dir=f'{output_dir}/coding_artifacts'
@@ -170,7 +161,14 @@ for todo_idx, todo_file_name in enumerate([reproduce_task.relative_path]):
     # save_dir_name = f"{paper_name}_repo"
     # print and logging
     print_response(completion_json)
-    temp_total_accumulated_cost = print_log_cost(completion_json, gpt_version, current_stage, output_dir, total_accumulated_cost)
+    temp_total_accumulated_cost = print_log_cost(
+        completion_json,
+        gpt_version,
+        current_stage,
+        output_dir,
+        total_accumulated_cost,
+        args.provider,
+    )
     total_accumulated_cost = temp_total_accumulated_cost
 
     # save artifacts

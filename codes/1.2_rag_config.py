@@ -25,16 +25,22 @@ def parse_args() -> argparse.Namespace:
         help="Output directory that contains planning_config.yaml",
     )
     parser.add_argument(
+        "--provider",
+        type=str,
+        required=True,
+        help="Explicit provider registry ID.",
+    )
+    parser.add_argument(
         "--gpt_version",
         type=str,
-        default="gpt-4.1-mini",
-        help="OpenAI chat model name used for name detection.",
+        required=True,
+        help="Registered model ID used for name detection.",
     )
     return parser.parse_args()
 
 
 args = parse_args()
-client = make_openai_client()
+client = make_openai_client(args.provider, args.gpt_version)
 
 planning_config_file = validate_task_path("planning_config.yaml")
 planning_config_path = safe_join(args.output_dir, planning_config_file)
@@ -87,6 +93,7 @@ Detect the model name and dataset names in the configuration file so that they c
 response = client.chat.completions.create(
     model=args.gpt_version,
     messages=messages,
+    **client.contract.request_options,
 )
 
 answer = response.choices[0].message.content.strip()

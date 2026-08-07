@@ -35,6 +35,20 @@ def _request(**overrides: object) -> dict[str, object]:
     return request
 
 
+def _provider_snapshot(**overrides: object) -> dict[str, object]:
+    snapshot: dict[str, object] = {
+        "reproduce_provider": "openai",
+        "reproduce_model": "gpt-4.1-mini",
+        "evaluation_provider": "openai",
+        "evaluation_model": "gpt-4.1-mini",
+        "evaluation_fallback_models": ["gpt-4o-mini"],
+        "provider_registry_version": 1,
+        "provider_contract_fingerprint": "a" * 64,
+    }
+    snapshot.update(overrides)
+    return snapshot
+
+
 def test_migrations_are_repeatable_and_enable_required_pragmas(tmp_path: Path) -> None:
     db_path = tmp_path / "state" / "paper2code.db"
 
@@ -68,7 +82,7 @@ def test_migrations_are_repeatable_and_enable_required_pragmas(tmp_path: Path) -
         "job_processes",
         "job_process_history",
     }.issubset(tables)
-    assert versions == [1, 2, 3, 4, 5]
+    assert versions == [1, 2, 3, 4, 5, 6]
     assert journal_mode.lower() == "wal"
     assert foreign_keys == 1
     assert busy_timeout == 5000
@@ -109,6 +123,7 @@ def test_concurrent_first_initialization_is_serialized(tmp_path: Path) -> None:
         (3, 1),
         (4, 1),
         (5, 1),
+        (6, 1),
     ]
     assert {
         "jobs",
@@ -164,7 +179,7 @@ def test_failed_migration_rolls_back_schema_and_can_be_retried(
             for row in connection.execute(
                 "SELECT version FROM schema_migrations"
             ).fetchall()
-        ] == [1, 2, 3, 4, 5]
+        ] == [1, 2, 3, 4, 5, 6]
         assert connection.execute(
             "SELECT COUNT(*) FROM jobs"
         ).fetchone()[0] == 0
@@ -218,7 +233,7 @@ def test_version_2_database_upgrades_repeatably_without_trusting_legacy_lease(
         foreign_keys = connection.execute("PRAGMA foreign_keys").fetchone()[0]
         busy_timeout = connection.execute("PRAGMA busy_timeout").fetchone()[0]
 
-    assert versions == [1, 2, 3, 4, 5]
+    assert versions == [1, 2, 3, 4, 5, 6]
     assert "owner_token" in columns
     assert legacy_row["owner_token"] is None
     assert journal_mode.lower() == "wal"
@@ -353,7 +368,7 @@ def test_version_3_database_upgrades_launch_states_without_losing_processes(
                 "WHERE job_id = 'claimed_job'"
             )
 
-    assert versions == [1, 2, 3, 4, 5]
+    assert versions == [1, 2, 3, 4, 5, 6]
     assert states == {
         "claimed_job": ("claimed", None),
         "registered_job": ("registered", None),
@@ -408,7 +423,7 @@ def test_failed_migration_4_rolls_back_added_launch_state(
             for row in connection.execute(
                 "SELECT version FROM schema_migrations ORDER BY version"
             )
-        ] == [1, 2, 3, 4, 5]
+        ] == [1, 2, 3, 4, 5, 6]
 
 
 def test_version_4_database_upgrades_recovery_schema_without_losing_rows(
@@ -512,7 +527,7 @@ def test_version_4_database_upgrades_recovery_schema_without_losing_rows(
                 """
             )
 
-    assert versions == [1, 2, 3, 4, 5]
+    assert versions == [1, 2, 3, 4, 5, 6]
     assert job["recovery_count"] == 0
     assert job["recovery_status"] == "none"
     assert process["process_attempt"] == 1
@@ -569,7 +584,7 @@ def test_failed_migration_5_rolls_back_recovery_columns(
             for row in connection.execute(
                 "SELECT version FROM schema_migrations ORDER BY version"
             )
-        ] == [1, 2, 3, 4, 5]
+        ] == [1, 2, 3, 4, 5, 6]
 
 
 def test_different_worker_ids_cannot_share_active_global_lease(tmp_path: Path) -> None:
@@ -1480,6 +1495,132 @@ def test_repository_rejects_unvalidated_sensitive_request_fields(tmp_path: Path)
     for database_file in db_path.parent.glob("paper2code.db*"):
         if secret.encode() in database_file.read_bytes():
             pytest.fail("SQLite files contain rejected sensitive input", pytrace=False)
+
+
+def test_migration_6_adds_non_sensitive_provider_snapshot_repeatably_and_keeps_old_job(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "version-5" / "paper2code.db"
+    current_migrations = database_module.MIGRATIONS
+    monkeypatch.setattr(database_module, "MIGRATIONS", current_migrations[:5])
+    initialize_database(db_path)
+    with closing(connect_database(db_path)) as connection:
+        with connection:
+            connection.execute(
+                """
+                INSERT INTO jobs (
+                    job_id, request_hash, paper_name, upload_id, domain, eval_type,
+                    generated_n, auto_refine, max_repair_rounds, console_output,
+                    skip_mineru, pdf_markdown_path, execution_status,
+                    evaluation_status, quality_status, version, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "historical_completed",
+                    "0" * 64,
+                    "paper",
+                    "0" * 32,
+                    "statistics",
+                    "ref_free",
+                    1,
+                    0,
+                    0,
+                    "quiet",
+                    0,
+                    "",
+                    "completed",
+                    "pending",
+                    "pending",
+                    3,
+                    "2026-01-01T00:00:00.000Z",
+                    "2026-01-01T00:00:00.000Z",
+                ),
+            )
+
+    monkeypatch.setattr(database_module, "MIGRATIONS", current_migrations)
+    initialize_database(db_path)
+    initialize_database(db_path)
+
+    with closing(connect_database(db_path)) as connection:
+        versions = [
+            row["version"]
+            for row in connection.execute(
+                "SELECT version FROM schema_migrations ORDER BY version"
+            )
+        ]
+        columns = {row["name"] for row in connection.execute("PRAGMA table_info(jobs)")}
+        historical = connection.execute(
+            "SELECT * FROM jobs WHERE job_id = 'historical_completed'"
+        ).fetchone()
+
+    assert versions == [1, 2, 3, 4, 5, 6]
+    assert {
+        "reproduce_provider",
+        "reproduce_model",
+        "evaluation_provider",
+        "evaluation_model",
+        "evaluation_fallback_models_json",
+        "provider_registry_version",
+        "provider_contract_fingerprint",
+    }.issubset(columns)
+    assert historical["execution_status"] == "completed"
+    assert historical["reproduce_provider"] is None
+
+
+def test_repository_persists_selection_snapshot_and_idempotency_keeps_original(
+    tmp_path: Path,
+) -> None:
+    repository = JobRepository(tmp_path / "paper2code.db")
+    original = _provider_snapshot()
+    changed = _provider_snapshot(
+        reproduce_provider="deepseek",
+        reproduce_model="deepseek-v4-pro",
+        provider_contract_fingerprint="b" * 64,
+    )
+
+    first, created = repository.create_job(
+        job_id="job_snapshot",
+        request=_request(),
+        paper_name="paper",
+        idempotency_key="snapshot-key",
+        provider_snapshot=original,
+    )
+    replay, replay_created = repository.create_job(
+        job_id="job_rebound",
+        request=_request(),
+        paper_name="paper",
+        idempotency_key="snapshot-key",
+        provider_snapshot=changed,
+    )
+
+    assert created is True
+    assert replay_created is False
+    assert replay["job_id"] == first["job_id"] == "job_snapshot"
+    assert replay["reproduce_provider"] == "openai"
+    assert replay["reproduce_model"] == "gpt-4.1-mini"
+    assert replay["evaluation_fallback_models"] == ["gpt-4o-mini"]
+    assert replay["provider_contract_fingerprint"] == "a" * 64
+
+
+def test_provider_snapshot_rejects_secrets_base_urls_and_invalid_shape(tmp_path: Path) -> None:
+    repository = JobRepository(tmp_path / "paper2code.db")
+    for extra in (
+        {"api_key": "UNIQUE-SNAPSHOT-SECRET"},
+        {"base_url": "https://must-not-persist.invalid/v1"},
+        {"evaluation_fallback_models": ["ok", 1]},
+        {"provider_contract_fingerprint": "short"},
+    ):
+        with pytest.raises(ValueError):
+            repository.create_job(
+                job_id="job_invalid_snapshot",
+                request=_request(),
+                paper_name="paper",
+                provider_snapshot={**_provider_snapshot(), **extra},
+            )
+
+    with closing(connect_database(tmp_path / "paper2code.db")) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 0
 
 
 def test_database_path_defaults_to_local_and_supports_explicit_override(

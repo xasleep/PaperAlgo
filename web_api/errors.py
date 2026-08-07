@@ -122,6 +122,22 @@ class FeatureNotSupportedError(ContractError, ValueError):
     default_message = "The requested feature is not supported by the local Web API."
 
 
+class ProviderConfigurationError(ContractError, ValueError):
+    status_code = 422
+    code = "provider_configuration_invalid"
+    default_message = "Provider/model configuration is invalid."
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message, details=details)
+        self.code = code
+
+
 class IdempotencyConflictError(ContractError, ValueError):
     status_code = 409
     code = "idempotency_conflict"

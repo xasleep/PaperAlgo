@@ -129,10 +129,16 @@ def parse_args() -> argparse.Namespace:
         help="Generated repository root whose files may be debugged.",
     )
     parser.add_argument(
+        "--provider",
+        type=str,
+        required=True,
+        help="Explicit provider registry ID.",
+    )
+    parser.add_argument(
         "--model",
         type=str,
-        default="o4-mini",
-        help="OpenAI chat model used for debugging.",
+        required=True,
+        help="Registered model ID used for debugging.",
     )
     parser.add_argument(
         "--save_num",
@@ -145,7 +151,7 @@ def parse_args() -> argparse.Namespace:
 
 
 args = parse_args()
-client = make_openai_client()
+client = make_openai_client(args.provider, args.model)
 
 if not os.path.exists(args.error_file_name):
     raise FileNotFoundError(f"Error file not found: {args.error_file_name}")
@@ -264,7 +270,7 @@ result = model(input_data)
 response = client.chat.completions.create(
     model=args.model,
     messages=msg,
-    reasoning_effort="high",
+    **client.contract.request_options,
 )
 
 answer = response.choices[0].message.content

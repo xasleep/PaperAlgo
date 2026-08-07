@@ -3,14 +3,14 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 
-ProviderName = Literal["deepseek", "kimi", "qwen", "claude", "openai"]
+ProviderName = str
 DomainName = Literal["general", "statistics"]
 EvalType = Literal["ref_free", "ref_based"]
 ConsoleOutput = Literal["progress", "full", "quiet"]
 
 
 class ProviderSettings(BaseModel):
-    provider: ProviderName
+    provider: ProviderName = Field(min_length=1)
     model: str = Field(min_length=1)
     api_key: str = Field(min_length=1)
     base_url: str = ""
@@ -41,6 +41,26 @@ class SettingsStatus(BaseModel):
     evaluation: EvaluationSettingsStatus = Field(
         default_factory=lambda: EvaluationSettingsStatus(has_api_key=False)
     )
+
+
+class ProviderModelDiscovery(BaseModel):
+    model_id: str
+    max_n: int
+    context_window: int | None
+    max_output_tokens: int | None
+    json_schema_support: bool | None
+    usage_support: bool | None
+    cache_token_support: bool | None
+
+
+class ProviderDiscovery(BaseModel):
+    provider_id: str
+    models: list[ProviderModelDiscovery]
+
+
+class ProviderRegistryResponse(BaseModel):
+    registry_version: int
+    providers: list[ProviderDiscovery]
 
 
 class SessionResponse(BaseModel):
@@ -86,6 +106,13 @@ class JobCreateResponse(BaseModel):
     quality_status: str | None = None
     failure_code: str | None = None
     version: int | None = None
+    reproduce_provider: str | None = None
+    reproduce_model: str | None = None
+    evaluation_provider: str | None = None
+    evaluation_model: str | None = None
+    evaluation_fallback_models: list[str] | None = None
+    provider_registry_version: int | None = None
+    provider_contract_fingerprint: str | None = None
 
 
 class CancelResponse(BaseModel):
@@ -126,6 +153,13 @@ class JobListItem(BaseModel):
     quality_status: str | None = None
     failure_code: str | None = None
     version: int | None = None
+    reproduce_provider: str | None = None
+    reproduce_model: str | None = None
+    evaluation_provider: str | None = None
+    evaluation_model: str | None = None
+    evaluation_fallback_models: list[str] | None = None
+    provider_registry_version: int | None = None
+    provider_contract_fingerprint: str | None = None
 
 
 class JobListResponse(BaseModel):

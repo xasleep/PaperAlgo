@@ -40,15 +40,15 @@ def _settings_payload(
     return {
         "reproduce": {
             "provider": "deepseek",
-            "model": "deepseek-test",
+            "model": "deepseek-v4-pro",
             "api_key": reproduce_key,
-            "base_url": "",
+            "base_url": "https://reproduce.invalid/v1",
         },
         "evaluation": {
             "provider": "qwen",
-            "model": "qwen-test",
+            "model": "qwen3.7-max",
             "api_key": evaluation_key,
-            "base_url": "",
+            "base_url": "https://evaluation.invalid/v1",
             "fallback_models": [],
         },
     }

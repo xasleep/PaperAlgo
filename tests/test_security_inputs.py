@@ -16,11 +16,12 @@ LOCAL_ORIGIN = "http://localhost"
 
 def _settings() -> WebSettings:
     return WebSettings(
-        reproduce={"provider": "openai", "model": "test-model", "api_key": "test-key"},
+        reproduce={"provider": "openai", "model": "gpt-4.1-mini", "api_key": "test-key", "base_url": "https://reproduce.invalid/v1"},
         evaluation={
             "provider": "openai",
-            "model": "test-model",
+            "model": "gpt-4.1-mini",
             "api_key": "test-key",
+            "base_url": "https://evaluation.invalid/v1",
         },
     )
 

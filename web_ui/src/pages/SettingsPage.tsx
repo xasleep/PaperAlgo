@@ -1,10 +1,14 @@
 import { Save, ShieldCheck } from "lucide-react";
 import { FormEvent, useEffect, useState } from "react";
 import { api, toApiError } from "../api/client";
-import type { ApiError, ProviderName, SettingsStatus, WebSettingsPayload } from "../api/types";
+import type {
+  ApiError,
+  ProviderName,
+  ProviderRegistryResponse,
+  SettingsStatus,
+  WebSettingsPayload,
+} from "../api/types";
 import ErrorNotice from "../components/ErrorNotice";
-
-const PROVIDERS: ProviderName[] = ["openai", "deepseek", "kimi", "qwen", "claude"];
 
 type SettingsForm = {
   reproduceProvider: ProviderName;
@@ -19,11 +23,11 @@ type SettingsForm = {
 };
 
 const emptyForm: SettingsForm = {
-  reproduceProvider: "openai",
+  reproduceProvider: "",
   reproduceModel: "",
   reproduceApiKey: "",
   reproduceBaseUrl: "",
-  evaluationProvider: "openai",
+  evaluationProvider: "",
   evaluationModel: "",
   evaluationApiKey: "",
   evaluationBaseUrl: "",
@@ -32,6 +36,7 @@ const emptyForm: SettingsForm = {
 
 export default function SettingsPage() {
   const [status, setStatus] = useState<SettingsStatus | null>(null);
+  const [registry, setRegistry] = useState<ProviderRegistryResponse | null>(null);
   const [form, setForm] = useState<SettingsForm>(emptyForm);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -40,11 +45,20 @@ export default function SettingsPage() {
 
   useEffect(() => {
     let ignore = false;
-    api
-      .getSettingsStatus()
-      .then((nextStatus) => {
+    Promise.all([api.getSettingsStatus(), api.getProviders()])
+      .then(([nextStatus, nextRegistry]) => {
         if (ignore) return;
         setStatus(nextStatus);
+        setRegistry(nextRegistry);
+        const firstProvider = nextRegistry.providers[0];
+        const firstModel = firstProvider?.models[0]?.model_id ?? "";
+        setForm((current) => ({
+          ...current,
+          reproduceProvider: firstProvider?.provider_id ?? "",
+          reproduceModel: firstModel,
+          evaluationProvider: firstProvider?.provider_id ?? "",
+          evaluationModel: firstModel,
+        }));
       })
       .catch((err) => setError(toApiError(err)))
       .finally(() => {
@@ -55,8 +69,46 @@ export default function SettingsPage() {
     };
   }, []);
 
+  function modelsFor(providerId: ProviderName): string[] {
+    return (
+      registry?.providers.find((provider) => provider.provider_id === providerId)?.models.map(
+        (model) => model.model_id,
+      ) ?? []
+    );
+  }
+
+  function invalidSelectionError(message: string): ApiError {
+    return {
+      status: 0,
+      code: "invalid_provider_selection",
+      message,
+      details: {},
+    };
+  }
+
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    const fallbackModels = form.evaluationFallbackModels
+      .split(",")
+      .map((item) => item.trim())
+      .filter(Boolean);
+    const reproduceModels = modelsFor(form.reproduceProvider);
+    const evaluationModels = modelsFor(form.evaluationProvider);
+    if (!registry) {
+      setError(invalidSelectionError("Provider Registry is unavailable."));
+      return;
+    }
+    if (!reproduceModels.includes(form.reproduceModel)) {
+      setError(invalidSelectionError("Select a registered reproduction model."));
+      return;
+    }
+    if (
+      !evaluationModels.includes(form.evaluationModel) ||
+      fallbackModels.some((model) => !evaluationModels.includes(model))
+    ) {
+      setError(invalidSelectionError("Select only registered evaluation models."));
+      return;
+    }
     setSaving(true);
     setSaved(false);
     setError(null);
@@ -73,10 +125,7 @@ export default function SettingsPage() {
         model: form.evaluationModel.trim(),
         api_key: form.evaluationApiKey,
         base_url: form.evaluationBaseUrl.trim(),
-        fallback_models: form.evaluationFallbackModels
-          .split(",")
-          .map((item) => item.trim())
-          .filter(Boolean),
+        fallback_models: fallbackModels,
       },
     };
 
@@ -118,13 +167,20 @@ export default function SettingsPage() {
           <ProviderSelect
             label="provider"
             value={form.reproduceProvider}
-            onChange={(value) => setForm({ ...form, reproduceProvider: value })}
+            providers={registry?.providers.map((provider) => provider.provider_id) ?? []}
+            onChange={(value) =>
+              setForm((current) => ({
+                ...current,
+                reproduceProvider: value,
+                reproduceModel: modelsFor(value)[0] ?? "",
+              }))
+            }
           />
-          <TextField
+          <ModelSelect
             label="model"
             value={form.reproduceModel}
+            models={modelsFor(form.reproduceProvider)}
             onChange={(value) => setForm({ ...form, reproduceModel: value })}
-            required
           />
           <TextField
             label="api_key"
@@ -138,6 +194,7 @@ export default function SettingsPage() {
             label="base_url"
             value={form.reproduceBaseUrl}
             onChange={(value) => setForm({ ...form, reproduceBaseUrl: value })}
+            required
           />
           <div className="field-meta">
             has_api_key: {status?.reproduce?.has_api_key ? "true" : "false"}
@@ -149,13 +206,21 @@ export default function SettingsPage() {
           <ProviderSelect
             label="provider"
             value={form.evaluationProvider}
-            onChange={(value) => setForm({ ...form, evaluationProvider: value })}
+            providers={registry?.providers.map((provider) => provider.provider_id) ?? []}
+            onChange={(value) =>
+              setForm((current) => ({
+                ...current,
+                evaluationProvider: value,
+                evaluationModel: modelsFor(value)[0] ?? "",
+                evaluationFallbackModels: "",
+              }))
+            }
           />
-          <TextField
+          <ModelSelect
             label="model"
             value={form.evaluationModel}
+            models={modelsFor(form.evaluationProvider)}
             onChange={(value) => setForm({ ...form, evaluationModel: value })}
-            required
           />
           <TextField
             label="api_key"
@@ -169,12 +234,17 @@ export default function SettingsPage() {
             label="base_url"
             value={form.evaluationBaseUrl}
             onChange={(value) => setForm({ ...form, evaluationBaseUrl: value })}
+            required
           />
-          <TextField
+          <MultiModelSelect
             label="fallback_models"
-            value={form.evaluationFallbackModels}
-            onChange={(value) => setForm({ ...form, evaluationFallbackModels: value })}
-            placeholder="model-a, model-b"
+            values={form.evaluationFallbackModels.split(",").filter(Boolean)}
+            models={modelsFor(form.evaluationProvider).filter(
+              (model) => model !== form.evaluationModel,
+            )}
+            onChange={(values) =>
+              setForm({ ...form, evaluationFallbackModels: values.join(",") })
+            }
           />
           <div className="field-meta">
             has_api_key: {status?.evaluation?.has_api_key ? "true" : "false"}
@@ -182,7 +252,11 @@ export default function SettingsPage() {
         </fieldset>
 
         <div className="form-actions">
-          <button className="primary-button" disabled={saving} type="submit">
+          <button
+            className="primary-button"
+            disabled={saving || loading || !registry || registry.providers.length === 0}
+            type="submit"
+          >
             <Save size={16} />
             {saving ? "Saving" : "Save Settings"}
           </button>
@@ -195,19 +269,77 @@ export default function SettingsPage() {
 function ProviderSelect({
   label,
   value,
+  providers,
   onChange,
 }: {
   label: string;
   value: ProviderName;
+  providers: ProviderName[];
   onChange: (value: ProviderName) => void;
 }) {
   return (
     <label>
       <span>{label}</span>
-      <select value={value} onChange={(event) => onChange(event.target.value as ProviderName)}>
-        {PROVIDERS.map((provider) => (
+      <select required value={value} onChange={(event) => onChange(event.target.value)}>
+        {providers.map((provider) => (
           <option key={provider} value={provider}>
             {provider}
+          </option>
+        ))}
+      </select>
+    </label>
+  );
+}
+
+function ModelSelect({
+  label,
+  value,
+  models,
+  onChange,
+}: {
+  label: string;
+  value: string;
+  models: string[];
+  onChange: (value: string) => void;
+}) {
+  return (
+    <label>
+      <span>{label}</span>
+      <select required value={value} onChange={(event) => onChange(event.target.value)}>
+        {models.map((model) => (
+          <option key={model} value={model}>
+            {model}
+          </option>
+        ))}
+      </select>
+    </label>
+  );
+}
+
+function MultiModelSelect({
+  label,
+  values,
+  models,
+  onChange,
+}: {
+  label: string;
+  values: string[];
+  models: string[];
+  onChange: (values: string[]) => void;
+}) {
+  return (
+    <label>
+      <span>{label}</span>
+      <select
+        multiple
+        value={values}
+        onChange={(event) =>
+          onChange(Array.from(event.target.selectedOptions, (option) => option.value))
+        }
+      >
+        {models.map((model) => (
+          <option key={model} value={model}>
+            {model}
           </option>
         ))}
       </select>

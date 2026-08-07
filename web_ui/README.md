@@ -71,7 +71,7 @@ Set-Location ..
 When `web_ui/dist/index.html` exists, FastAPI serves the built frontend at `/`
 and static assets from `/assets`. `/jobs` is always a React route, independent
 of `Accept`. JSON APIs live only below `/api/v1`, including
-`/api/v1/health`, `/api/v1/settings/status`, and `/api/v1/jobs`.
+`/api/v1/health`, `/api/v1/providers`, `/api/v1/settings/status`, and `/api/v1/jobs`.
 
 The browser client obtains a local session from `/api/v1/session`, keeps the
 returned CSRF token in memory, and sends it with state-changing requests. The
@@ -89,6 +89,22 @@ process that launched the Pipeline.
 Settings status returns only boolean configuration flags and does not return API key
 values. Keys are stored locally in `.local/web_settings.json` as plaintext JSON;
 this local single-user boundary is not encrypted credential storage.
+
+The Settings page loads selectable Provider/Model pairs from the current
+Registry through `GET /api/v1/providers`; it has no hard-coded vendor or model
+allowlist. Providers without active models are omitted. Discovery returns only
+non-sensitive IDs/capability state with `Cache-Control: no-store`. If discovery
+fails, the form shows the structured API error and disables submission rather
+than sending an unknown pair. Saved keys are never read back or displayed, and
+base URLs remain explicit user input.
+
+In SQLite runtime, a queued job keeps a non-sensitive selection snapshot. A
+later settings change cannot silently rebind it: the Worker accepts rotated
+credentials for the same selection, but fails before process creation when the
+selection, Registry version, or contract fingerprint differs. Legacy runtime
+behavior is unchanged. The current product remains Windows/local single-user,
+loopback-only, one FastAPI process and one Worker; PR-06 cost ledger and PR-07
+SSE are not implemented.
 
 ## Checks
 

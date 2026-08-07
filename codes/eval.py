@@ -1,9 +1,10 @@
 import json
 import os
-import sys
 import argparse
+from collections.abc import Mapping
 from task_manifest import load_task_manifest, read_manifest_text_files
 from openai import BadRequestError, PermissionDeniedError
+from provider_registry import get_provider_registry
 from utils import (
     num_tokens_from_messages,
     read_all_files,
@@ -30,6 +31,37 @@ MAX_REPAIR_ROUNDS_LIMIT = 10
 FALLBACK_REASON_QUOTA = "quota_like_error"
 
 
+class EvaluationProviderResponseError(RuntimeError):
+    """Stable evaluation error for malformed provider response cardinality."""
+
+    code = "provider_response_choice_count_mismatch"
+
+    def __init__(self, provider_id, model_id, requested_n, returned_n):
+        super().__init__(
+            "Provider/model returned fewer choices than requested "
+            f"(provider_id={provider_id}, model_id={model_id}, "
+            f"requested_n={requested_n}, returned_n={returned_n})."
+        )
+        self.provider_id = provider_id
+        self.model_id = model_id
+        self.requested_n = requested_n
+        self.returned_n = returned_n
+
+
+class EvaluationProviderUsageError(RuntimeError):
+    """Stable evaluation error for malformed provider usage metadata."""
+
+    code = "provider_response_usage_invalid"
+
+    def __init__(self, provider_id, model_id):
+        super().__init__(
+            "Provider/model returned invalid usage metadata "
+            f"(provider_id={provider_id}, model_id={model_id})."
+        )
+        self.provider_id = provider_id
+        self.model_id = model_id
+
+
 def api_call(request_json):
     if client is None:
         raise RuntimeError("API client has not been initialized.")
@@ -37,48 +69,35 @@ def api_call(request_json):
     return completion
 
 
-def model_max_choices_per_request(model_name):
-    model_name = model_name.lower()
-    if model_name.startswith("kimi-") or model_name.startswith("deepseek-"):
-        return 1
-    if model_name.startswith("qwen"):
-        return 1
-    return None
+def model_max_choices_per_request(provider_id, model_name):
+    return get_provider_registry().get(provider_id, model_name).max_n
 
 
-def build_request_json(gpt_version, msg, generated_n):
-    if "o3-mini" in gpt_version:
-        return {
-            "model": gpt_version,
-            "messages": msg,
-            "reasoning_effort": "high",
-            "n": generated_n,
-        }
-
-    return {
+def build_request_json(provider_id, gpt_version, msg, generated_n):
+    contract = get_provider_registry().get(provider_id, gpt_version)
+    request_json = {
         "model": gpt_version,
         "messages": msg,
-        "temperature": 1,
-        "frequency_penalty": 0,
-        "presence_penalty": 0,
-        "stop": None,
-        "n": generated_n,
+        **contract.request_options,
     }
+    if generated_n != 1:
+        request_json["n"] = generated_n
+    return request_json
 
 
-def default_fallback_models(model_name):
-    model_name = model_name.lower()
-    if model_name == "qwen3.7-max":
-        return ["qwen3.7-plus"]
-    if model_name == "qwen-3.7-max":
-        return ["qwen-3.7-plus"]
-    return []
+def default_fallback_models(provider_id, model_name):
+    contract = get_provider_registry().get(provider_id, model_name)
+    return list(contract.fallback_model_ids)
 
 
 def parse_fallback_models(value):
-    if not value:
+    if value == "":
         return []
-    return [item.strip() for item in value.split(",") if item.strip()]
+    if isinstance(value, list):
+        return list(value)
+    if isinstance(value, str):
+        return value.split(",")
+    raise ValueError("fallback_gpt_versions must be a string or list.")
 
 
 def validate_eval_args(args):
@@ -144,8 +163,10 @@ def get_code_language(file_name):
 
 
 def add_usage(total_usage, usage):
+    if not isinstance(usage, Mapping):
+        raise TypeError("usage must be a mapping")
     for key, value in usage.items():
-        if isinstance(value, dict):
+        if isinstance(value, Mapping):
             if not isinstance(total_usage.get(key), dict):
                 total_usage[key] = {}
             target = total_usage[key]
@@ -156,12 +177,17 @@ def add_usage(total_usage, usage):
             total_usage[key] = value
 
 
-def run_completion_requests(gpt_version, msg, generated_n):
-    if "o3-mini" in gpt_version and generated_n > 8:
-        print("[WARNING] o3-mini does not support n > 8. Setting generated_n to 8.")
-        generated_n = 8
+def response_usage_mapping(provider_id, model_id, completion_json):
+    if "usage" not in completion_json or completion_json["usage"] is None:
+        return None
+    usage = completion_json["usage"]
+    if not isinstance(usage, Mapping):
+        raise EvaluationProviderUsageError(provider_id, model_id)
+    return usage
 
-    max_choices_per_request = model_max_choices_per_request(gpt_version)
+
+def run_completion_requests(provider_id, gpt_version, msg, generated_n, input_tokens=None):
+    max_choices_per_request = model_max_choices_per_request(provider_id, gpt_version)
 
     if max_choices_per_request is not None and generated_n > max_choices_per_request:
         print(
@@ -177,41 +203,73 @@ def run_completion_requests(gpt_version, msg, generated_n):
     completion_json_lst = []
     choices = []
     usage = {}
+    usage_seen = False
 
     for request_idx in range(request_count):
         remaining_n = generated_n - len(choices)
         current_n = min(per_request_n, remaining_n)
-        request_json = build_request_json(gpt_version, msg, current_n)
+        request_json = build_request_json(provider_id, gpt_version, msg, current_n)
 
         if request_count > 1:
             print(f"[INFO] Evaluation request {request_idx + 1}/{request_count}")
 
-        completion = api_call(request_json)
+        transport_request = dict(request_json)
+        if input_tokens is not None:
+            transport_request["_input_token_count"] = input_tokens
+        completion = api_call(transport_request)
         completion_json = json.loads(completion.model_dump_json())
         completion_json_lst.append(completion_json)
 
-        for choice in completion_json.get("choices", []):
-            choice["index"] = len(choices)
-            choices.append(choice)
+        response_choices = completion_json.get("choices")
+        if not isinstance(response_choices, list) or len(response_choices) < current_n:
+            returned_n = len(response_choices) if isinstance(response_choices, list) else 0
+            raise EvaluationProviderResponseError(
+                provider_id,
+                gpt_version,
+                current_n,
+                returned_n,
+            )
 
-        add_usage(usage, completion_json.get("usage", {}))
+        for choice in response_choices:
+            indexed_choice = dict(choice)
+            indexed_choice["index"] = len(choices)
+            choices.append(indexed_choice)
+
+        response_usage = response_usage_mapping(provider_id, gpt_version, completion_json)
+        if response_usage is not None:
+            add_usage(usage, response_usage)
+            usage_seen = True
 
     aggregate_completion_json = {
         "object": "paper2code.multi_completion",
         "model": gpt_version,
         "choices": choices,
-        "usage": usage,
+        "usage": usage if usage_seen else None,
         "responses": completion_json_lst,
     }
 
-    final_request_json = build_request_json(gpt_version, msg, per_request_n)
+    final_request_json = build_request_json(provider_id, gpt_version, msg, per_request_n)
 
     return final_request_json, aggregate_completion_json, generated_n
 
 
-def run_completion_requests_with_fallback(gpt_version, msg, generated_n, fallback_models):
+def run_completion_requests_with_fallback(
+    provider_id,
+    gpt_version,
+    msg,
+    generated_n,
+    fallback_models,
+    input_tokens=None,
+):
     global client
 
+    fallback_models = list(
+        get_provider_registry().validate_fallback_chain(
+            provider_id,
+            gpt_version,
+            fallback_models,
+        )
+    )
     model_chain = [gpt_version] + fallback_models
     last_error = None
     fallback_reason = ""
@@ -223,13 +281,21 @@ def run_completion_requests_with_fallback(gpt_version, msg, generated_n, fallbac
                 f"[WARNING] Falling back evaluation model from "
                 f"{model_chain[model_idx - 1]} to {model_name}."
             )
-        client = make_openai_client(model_name)
+        if input_tokens is not None:
+            get_provider_registry().validate_context(
+                provider_id,
+                model_name,
+                input_tokens,
+            )
+        client = make_openai_client(provider_id, model_name)
 
         try:
             request_json, completion_json, generated_n = run_completion_requests(
+                provider_id,
                 model_name,
                 msg,
                 generated_n,
+                input_tokens,
             )
             fallback_info = {
                 "fallback_used": model_idx > 0,
@@ -269,9 +335,10 @@ def main(args):
     target_repo_dir = args.target_repo_dir
     eval_result_dir = args.eval_result_dir
     gpt_version = args.gpt_version
+    provider_id = args.provider
     fallback_models = parse_fallback_models(args.fallback_gpt_versions)
     if not fallback_models:
-        fallback_models = default_fallback_models(gpt_version)
+        fallback_models = default_fallback_models(provider_id, gpt_version)
     generated_n = args.generated_n
     max_repair_rounds = args.max_repair_rounds
     data_dir = args.data_dir
@@ -394,18 +461,10 @@ def main(args):
 
     try:
         num_tokens = num_tokens_from_messages(msg)
-    except Exception as e:
-        print(
-            f"[WARNING] An exception was raised while counting tokens "
-            f"for the target repository of {args.paper_name}."
-        )
-        print(e)
-        print("-" * 40)
-        num_tokens = 0
-
-    if num_tokens > 128000:
-        print(f"[ERROR] {args.paper_name} more than 128k")
-        sys.exit(0)
+    except Exception as exc:
+        raise RuntimeError(
+            "Unable to determine request size for provider context validation."
+        ) from exc
 
     (
         request_json,
@@ -414,10 +473,12 @@ def main(args):
         actual_gpt_version,
         fallback_info,
     ) = run_completion_requests_with_fallback(
+        provider_id,
         gpt_version,
         msg,
         generated_n,
         fallback_models,
+        num_tokens,
     )
 
     score_key = "score"
@@ -575,6 +636,7 @@ def main(args):
         f"[Evaluation] {paper_name} - {eval_type}",
         output_dir,
         0,
+        provider_id,
     )
     # ---------------
 
@@ -614,7 +676,8 @@ if __name__ == "__main__":
     )
 
     argparser.add_argument("--generated_n", type=int, default=8)
-    argparser.add_argument("--gpt_version", type=str, default="deepseek-v4-pro")
+    argparser.add_argument("--provider", type=str, required=True)
+    argparser.add_argument("--gpt_version", type=str, required=True)
     argparser.add_argument("--fallback_gpt_versions", type=str, default="")
     argparser.add_argument("--max_repair_rounds", type=int, default=MAX_REPAIR_ROUNDS)
 

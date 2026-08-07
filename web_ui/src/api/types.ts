@@ -5,7 +5,7 @@ export type ApiError = {
   details: Record<string, unknown>;
 };
 
-export type ProviderName = "deepseek" | "kimi" | "qwen" | "claude" | "openai";
+export type ProviderName = string;
 export type DomainName = "general" | "statistics";
 export type EvalType = "ref_free";
 export type ConsoleOutput = "progress" | "full" | "quiet";
@@ -20,6 +20,26 @@ export type SettingsStatus = {
   configured: boolean;
   reproduce: ProviderSettingsStatus;
   evaluation: EvaluationSettingsStatus;
+};
+
+export type ProviderModelDiscovery = {
+  model_id: string;
+  max_n: number;
+  context_window: number | null;
+  max_output_tokens: number | null;
+  json_schema_support: boolean | null;
+  usage_support: boolean | null;
+  cache_token_support: boolean | null;
+};
+
+export type ProviderDiscovery = {
+  provider_id: ProviderName;
+  models: ProviderModelDiscovery[];
+};
+
+export type ProviderRegistryResponse = {
+  registry_version: number;
+  providers: ProviderDiscovery[];
 };
 
 export type WebSettingsPayload = {

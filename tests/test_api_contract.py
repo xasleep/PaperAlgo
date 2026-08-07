@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from codes.provider_registry import DEFAULT_REGISTRY_PATH, ProviderRegistry
 from web_api import artifact_service, job_service, log_service, main as main_module, settings_store
 from web_api.schemas import WebSettings
 
@@ -14,11 +15,17 @@ LOCAL_ORIGIN = "http://localhost"
 
 def _settings() -> WebSettings:
     return WebSettings(
-        reproduce={"provider": "openai", "model": "test-model", "api_key": "repro-secret"},
+        reproduce={
+            "provider": "openai",
+            "model": "gpt-4.1-mini",
+            "api_key": "repro-secret",
+            "base_url": "https://reproduce.invalid/v1",
+        },
         evaluation={
             "provider": "openai",
-            "model": "test-model",
+            "model": "gpt-4.1-mini",
             "api_key": "eval-secret",
+            "base_url": "https://evaluation.invalid/v1",
             "fallback_models": ["gpt-4o-mini"],
         },
     )
@@ -134,6 +141,179 @@ def test_settings_not_configured_create_job_returns_structured_error(
         code="settings_not_configured",
         forbidden=["repro-secret", "eval-secret", str(settings_path.parent)],
     )
+
+
+def _registered_settings_payload(**overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "reproduce": {
+            "provider": "deepseek",
+            "model": "deepseek-v4-pro",
+            "api_key": "repro-secret",
+            "base_url": "https://reproduce.invalid/v1",
+        },
+        "evaluation": {
+            "provider": "qwen",
+            "model": "qwen3.7-max",
+            "api_key": "eval-secret",
+            "base_url": "https://evaluation.invalid/v1",
+            "fallback_models": ["qwen3.7-plus"],
+        },
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_settings_reject_unknown_model_before_persisting(
+    contract_client: tuple[TestClient, Path, Path, Path],
+) -> None:
+    client, _, _, settings_path = contract_client
+    payload = _registered_settings_payload()
+    payload["reproduce"]["model"] = "deepseek-not-registered"
+
+    response = client.post(f"{API_PREFIX}/settings", json=payload)
+
+    _assert_error(
+        response,
+        status_code=422,
+        code="unknown_model",
+        forbidden=["repro-secret", "eval-secret"],
+    )
+    assert not settings_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("provider_id", "model_id"),
+    [
+        ("deepseek", "deepseek-chat"),
+        ("deepseek", "deepseek-reasoner"),
+        ("qwen", "qwen-3.7-max"),
+        ("qwen", "qwen-3.7-plus"),
+    ],
+)
+def test_settings_reject_retired_or_unverified_default_model_ids(
+    contract_client: tuple[TestClient, Path, Path, Path],
+    provider_id: str,
+    model_id: str,
+) -> None:
+    client, _, _, settings_path = contract_client
+    payload = _registered_settings_payload()
+    payload["reproduce"] = {
+        "provider": provider_id,
+        "model": model_id,
+        "api_key": "retired-model-secret",
+        "base_url": "https://retired-model.invalid/v1",
+    }
+
+    response = client.post(f"{API_PREFIX}/settings", json=payload)
+
+    _assert_error(
+        response,
+        status_code=422,
+        code="unknown_model",
+        forbidden=["retired-model-secret", "eval-secret"],
+    )
+    assert not settings_path.exists()
+
+
+def test_settings_reject_unknown_provider_through_registry(
+    contract_client: tuple[TestClient, Path, Path, Path],
+) -> None:
+    client, _, _, settings_path = contract_client
+    payload = _registered_settings_payload()
+    payload["reproduce"]["provider"] = "not-registered"
+
+    response = client.post(f"{API_PREFIX}/settings", json=payload)
+
+    _assert_error(
+        response,
+        status_code=422,
+        code="unknown_provider",
+        forbidden=["repro-secret", "eval-secret"],
+    )
+    assert not settings_path.exists()
+
+
+def test_settings_reject_missing_required_base_url(
+    contract_client: tuple[TestClient, Path, Path, Path],
+) -> None:
+    client, _, _, settings_path = contract_client
+    payload = _registered_settings_payload()
+    payload["reproduce"]["base_url"] = ""
+
+    response = client.post(f"{API_PREFIX}/settings", json=payload)
+
+    _assert_error(
+        response,
+        status_code=422,
+        code="provider_base_url_missing",
+        forbidden=["repro-secret", "eval-secret"],
+    )
+    assert not settings_path.exists()
+
+
+@pytest.mark.parametrize(
+    "fallback_models",
+    [
+        ["qwen3.7-plus", "qwen3.7-plus"],
+        ["qwen3.7-max"],
+    ],
+)
+def test_settings_reject_duplicate_or_primary_fallback_models(
+    contract_client: tuple[TestClient, Path, Path, Path],
+    fallback_models: list[str],
+) -> None:
+    client, _, _, settings_path = contract_client
+    payload = _registered_settings_payload()
+    payload["evaluation"]["fallback_models"] = fallback_models
+
+    response = client.post(f"{API_PREFIX}/settings", json=payload)
+
+    _assert_error(
+        response,
+        status_code=422,
+        code="invalid_provider_fallbacks",
+        forbidden=["repro-secret", "eval-secret"],
+    )
+    assert not settings_path.exists()
+
+
+def test_settings_reject_fallback_model_from_another_provider(
+    contract_client: tuple[TestClient, Path, Path, Path],
+) -> None:
+    client, _, _, settings_path = contract_client
+    payload = _registered_settings_payload()
+    payload["evaluation"]["fallback_models"] = ["deepseek-v4-pro"]
+
+    response = client.post(f"{API_PREFIX}/settings", json=payload)
+
+    _assert_error(
+        response,
+        status_code=422,
+        code="unknown_model",
+        forbidden=["repro-secret", "eval-secret"],
+    )
+    assert not settings_path.exists()
+
+
+def test_create_job_revalidates_provider_contract_before_queue(
+    contract_client: tuple[TestClient, Path, Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, _, _, _ = contract_client
+    invalid = _registered_settings_payload()
+    invalid["evaluation"]["model"] = "unregistered-eval-model"
+    monkeypatch.setattr(main_module, "load_settings", lambda: WebSettings(**invalid))
+    started = []
+    monkeypatch.setattr(job_service, "start_job", lambda **kwargs: started.append(kwargs))
+    upload = _upload(client, "paper.pdf", b"%PDF-1.7\nbody")
+
+    response = client.post(
+        f"{API_PREFIX}/jobs",
+        json=_job_payload(upload_id=upload.json()["upload_id"]),
+    )
+
+    _assert_error(response, status_code=422, code="unknown_model")
+    assert started == []
 
 
 @pytest.mark.parametrize(
@@ -423,3 +603,81 @@ def test_repo_missing_returns_stable_codes(
 
     _assert_error(file_response, status_code=404, code="repo_not_available")
     _assert_error(download_response, status_code=404, code="repo_not_available")
+
+
+@pytest.mark.parametrize("accept", ["application/json", "text/html", "*/*"])
+def test_provider_discovery_is_json_no_store_and_never_spa_html(
+    contract_client: tuple[TestClient, Path, Path, Path],
+    accept: str,
+) -> None:
+    client, _, _, _ = contract_client
+
+    response = client.get(f"{API_PREFIX}/providers", headers={"Accept": accept})
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/json")
+    assert response.headers["cache-control"] == "no-store"
+    body = response.json()
+    assert set(body) == {"registry_version", "providers"}
+    assert body["registry_version"] == 1
+    assert body["providers"]
+    assert all(provider["models"] for provider in body["providers"])
+    assert "claude" not in {provider["provider_id"] for provider in body["providers"]}
+    lowered = response.text.lower()
+    for forbidden in (
+        "api_key",
+        "api-key",
+        "secret",
+        "authorization",
+        "base_url",
+        "environment",
+        "prompt",
+        "response_body",
+        "command",
+    ):
+        assert forbidden not in lowered
+
+
+def test_provider_discovery_uses_the_loaded_registry_without_a_second_allowlist(
+    contract_client: tuple[TestClient, Path, Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, _, _, _ = contract_client
+    mapping = json.loads(DEFAULT_REGISTRY_PATH.read_text(encoding="utf-8"))
+    template = mapping["providers"]["openai"]["models"]["gpt-4.1-mini"]
+    mapping["providers"]["custom-provider"] = {
+        "models": {"custom-model": template}
+    }
+    mapping["providers"]["empty-provider"] = {"models": {}}
+    registry = ProviderRegistry.from_mapping(mapping)
+    monkeypatch.setattr(main_module, "get_provider_registry", lambda: registry)
+
+    response = client.get(f"{API_PREFIX}/providers")
+
+    assert response.status_code == 200
+    providers = {
+        provider["provider_id"]: provider for provider in response.json()["providers"]
+    }
+    assert [model["model_id"] for model in providers["custom-provider"]["models"]] == [
+        "custom-model"
+    ]
+    assert "empty-provider" not in providers
+
+
+def test_settings_status_remains_boolean_only_after_provider_discovery(
+    contract_client: tuple[TestClient, Path, Path, Path],
+) -> None:
+    client, _, _, _ = contract_client
+
+    response = client.get(f"{API_PREFIX}/settings/status")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert set(body) == {"configured", "reproduce", "evaluation"}
+    assert type(body["configured"]) is bool
+    assert all(type(value) is bool for value in body["reproduce"].values())
+    assert all(type(value) is bool for value in body["evaluation"].values())
+    lowered = response.text.lower()
+    assert "provider" not in lowered
+    assert "model" not in lowered
+    assert "base_url" not in lowered

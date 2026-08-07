@@ -1,0 +1,128 @@
+{
+  "version": 1,
+  "providers": {
+    "openai": {
+      "models": {
+        "gpt-4.1-mini": {
+          "base_url": null,
+          "base_url_env": "OPENAI_BASE_URL",
+          "api_key_env": "OPENAI_API_KEY",
+          "max_n": 1,
+          "context_window": null,
+          "max_output_tokens": null,
+          "json_schema_support": null,
+          "usage_support": null,
+          "cache_token_support": null,
+          "timeout_seconds": 120,
+          "max_retries": 2,
+          "max_concurrency": 2,
+          "pricing": {"status": "unknown", "currency": null, "input_per_million": null, "cached_input_per_million": null, "output_per_million": null, "effective_date": null},
+          "request_options": {"temperature": 1, "frequency_penalty": 0, "presence_penalty": 0},
+          "fallback_model_ids": []
+        },
+        "gpt-4o-mini": {
+          "base_url": null,
+          "base_url_env": "OPENAI_BASE_URL",
+          "api_key_env": "OPENAI_API_KEY",
+          "max_n": 1,
+          "context_window": null,
+          "max_output_tokens": null,
+          "json_schema_support": null,
+          "usage_support": null,
+          "cache_token_support": null,
+          "timeout_seconds": 120,
+          "max_retries": 2,
+          "max_concurrency": 2,
+          "pricing": {"status": "unknown", "currency": null, "input_per_million": null, "cached_input_per_million": null, "output_per_million": null, "effective_date": null},
+          "request_options": {"temperature": 1, "frequency_penalty": 0, "presence_penalty": 0},
+          "fallback_model_ids": []
+        }
+      }
+    },
+    "deepseek": {
+      "models": {
+        "deepseek-v4-flash": {
+          "base_url": null, "base_url_env": "DEEPSEEK_BASE_URL", "api_key_env": "DEEPSEEK_API_KEY",
+          "max_n": 1, "context_window": null, "max_output_tokens": null,
+          "json_schema_support": null, "usage_support": null, "cache_token_support": null,
+          "timeout_seconds": 120, "max_retries": 2, "max_concurrency": 2,
+          "pricing": {"status": "unknown", "currency": null, "input_per_million": null, "cached_input_per_million": null, "output_per_million": null, "effective_date": null},
+          "request_options": {"temperature": 1, "frequency_penalty": 0, "presence_penalty": 0}, "fallback_model_ids": []
+        },
+        "deepseek-v4-pro": {
+          "base_url": null, "base_url_env": "DEEPSEEK_BASE_URL", "api_key_env": "DEEPSEEK_API_KEY",
+          "max_n": 1, "context_window": null, "max_output_tokens": null,
+          "json_schema_support": null, "usage_support": null, "cache_token_support": null,
+          "timeout_seconds": 120, "max_retries": 2, "max_concurrency": 2,
+          "pricing": {"status": "unknown", "currency": null, "input_per_million": null, "cached_input_per_million": null, "output_per_million": null, "effective_date": null},
+          "request_options": {"temperature": 1, "frequency_penalty": 0, "presence_penalty": 0}, "fallback_model_ids": []
+        }
+      }
+    },
+    "kimi": {
+      "models": {
+        "kimi-k3": {
+          "base_url": null, "base_url_env": "KIMI_BASE_URL", "api_key_env": "KIMI_API_KEY",
+          "max_n": 1, "context_window": null, "max_output_tokens": null,
+          "json_schema_support": null, "usage_support": null, "cache_token_support": null,
+          "timeout_seconds": 120, "max_retries": 2, "max_concurrency": 2,
+          "pricing": {"status": "unknown", "currency": null, "input_per_million": null, "cached_input_per_million": null, "output_per_million": null, "effective_date": null},
+          "request_options": {}, "fallback_model_ids": []
+        },
+        "kimi-k2.7-code": {
+          "base_url": null, "base_url_env": "KIMI_BASE_URL", "api_key_env": "KIMI_API_KEY",
+          "max_n": 1, "context_window": null, "max_output_tokens": null,
+          "json_schema_support": null, "usage_support": null, "cache_token_support": null,
+          "timeout_seconds": 120, "max_retries": 2, "max_concurrency": 2,
+          "pricing": {"status": "unknown", "currency": null, "input_per_million": null, "cached_input_per_million": null, "output_per_million": null, "effective_date": null},
+          "request_options": {"temperature": 1, "frequency_penalty": 0, "presence_penalty": 0}, "fallback_model_ids": []
+        },
+        "kimi-k2.7-code-highspeed": {
+          "base_url": null, "base_url_env": "KIMI_BASE_URL", "api_key_env": "KIMI_API_KEY",
+          "max_n": 1, "context_window": null, "max_output_tokens": null,
+          "json_schema_support": null, "usage_support": null, "cache_token_support": null,
+          "timeout_seconds": 120, "max_retries": 2, "max_concurrency": 2,
+          "pricing": {"status": "unknown", "currency": null, "input_per_million": null, "cached_input_per_million": null, "output_per_million": null, "effective_date": null},
+          "request_options": {"temperature": 1, "frequency_penalty": 0, "presence_penalty": 0}, "fallback_model_ids": []
+        },
+        "kimi-k2.6": {
+          "base_url": null, "base_url_env": "KIMI_BASE_URL", "api_key_env": "KIMI_API_KEY",
+          "max_n": 1, "context_window": null, "max_output_tokens": null,
+          "json_schema_support": null, "usage_support": null, "cache_token_support": null,
+          "timeout_seconds": 120, "max_retries": 2, "max_concurrency": 2,
+          "pricing": {"status": "unknown", "currency": null, "input_per_million": null, "cached_input_per_million": null, "output_per_million": null, "effective_date": null},
+          "request_options": {"temperature": 1, "frequency_penalty": 0, "presence_penalty": 0}, "fallback_model_ids": []
+        }
+      }
+    },
+    "qwen": {
+      "models": {
+        "qwen3.8-max": {
+          "base_url": null, "base_url_env": "QWEN_BASE_URL", "api_key_env": "QWEN_API_KEY",
+          "max_n": 1, "context_window": null, "max_output_tokens": null,
+          "json_schema_support": null, "usage_support": null, "cache_token_support": null,
+          "timeout_seconds": 120, "max_retries": 2, "max_concurrency": 2,
+          "pricing": {"status": "unknown", "currency": null, "input_per_million": null, "cached_input_per_million": null, "output_per_million": null, "effective_date": null},
+          "request_options": {"temperature": 1, "frequency_penalty": 0, "presence_penalty": 0}, "fallback_model_ids": []
+        },
+        "qwen3.7-max": {
+          "base_url": null, "base_url_env": "QWEN_BASE_URL", "api_key_env": "QWEN_API_KEY",
+          "max_n": 1, "context_window": null, "max_output_tokens": null,
+          "json_schema_support": null, "usage_support": null, "cache_token_support": null,
+          "timeout_seconds": 120, "max_retries": 2, "max_concurrency": 2,
+          "pricing": {"status": "unknown", "currency": null, "input_per_million": null, "cached_input_per_million": null, "output_per_million": null, "effective_date": null},
+          "request_options": {"temperature": 1, "frequency_penalty": 0, "presence_penalty": 0}, "fallback_model_ids": ["qwen3.7-plus"]
+        },
+        "qwen3.7-plus": {
+          "base_url": null, "base_url_env": "QWEN_BASE_URL", "api_key_env": "QWEN_API_KEY",
+          "max_n": 1, "context_window": null, "max_output_tokens": null,
+          "json_schema_support": null, "usage_support": null, "cache_token_support": null,
+          "timeout_seconds": 120, "max_retries": 2, "max_concurrency": 2,
+          "pricing": {"status": "unknown", "currency": null, "input_per_million": null, "cached_input_per_million": null, "output_per_million": null, "effective_date": null},
+          "request_options": {"temperature": 1, "frequency_penalty": 0, "presence_penalty": 0}, "fallback_model_ids": []
+        }
+      }
+    },
+    "claude": {"models": {}}
+  }
+}

@@ -7,6 +7,7 @@ import type {
   JobDetail,
   JobListItem,
   LogsResponse,
+  ProviderRegistryResponse,
   RepoFileResponse,
   RepoTreeResponse,
   SettingsStatus,
@@ -139,6 +140,8 @@ export const api = {
   health: () => requestJson<{ status: string }>("/health"),
 
   getSettingsStatus: () => requestJson<SettingsStatus>("/settings/status"),
+
+  getProviders: () => requestJson<ProviderRegistryResponse>("/providers"),
 
   saveSettings: (payload: WebSettingsPayload) =>
     requestJson<SettingsStatus>("/settings", {

@@ -106,9 +106,25 @@ PR-04A 的 fail-closed 进程边界保持不变：已登记且存活、身份匹
 
 ## Provider 配置原则
 
-WebUI 的 Settings 页面分别配置复现模型和评测模型，当前 schema 支持 `deepseek`、`kimi`、`qwen`、`claude`、`openai`。模型名称必须与实际 Provider 一致；自定义 `base_url` 应指向对应的 OpenAI-compatible API 根地址，而不是 Provider 官网页面。评测模型可以配置 fallback 模型链。
+PR-05 起，所有远程 LLM 调用必须用 `provider_id + model_id` 显式选择，并先通过 `codes/providers.v1.json` 与 `codes/provider_registry.py` 校验。系统不再根据模型名前缀或当前恰好存在的密钥猜 Provider，也不会让 DeepSeek、Qwen 等静默落到 OpenAI 默认 endpoint。Web Settings 保存和新任务入队前都会验证 Provider、模型、API key 与必要 `base_url`；未知或缺失配置返回 422。
+
+Registry 为每个模型记录 `max_n`、context/output 上限、JSON Schema/usage/cache-token 能力、timeout/retry/concurrency 与带生效日期的价格。没有经过验证的 context 或价格显式写为 `null`/`unknown`，成本日志会显示 unavailable，不用陈旧表格猜算。当前默认远程模型采用 `max_n=1` 的保守契约；`generated_n > 1` 由应用层拆成独立请求，并继续受 1–32 候选预算和 Registry 并发限制。评测 fallback 只接受同一显式 Provider 下已注册的 model_id；CLI 逗号链按字面值解析，不 trim、不过滤空 token，非法 token 在创建客户端前失败。跨 Provider fallback 必须等未来契约显式携带新的 provider_id，不能再靠模型名推断。
+
+Registry v1 使用封闭 schema：根、Provider、Model、Pricing 和 `request_options` 的未知字段都会被拒绝，所有数值拒绝 bool、NaN、Infinity 和越界值，fallback 必须唯一、非自引用且位于同一 Provider。加载后 Contract（包括嵌套 request options）是只读的；JSON/I/O/schema 错误统一为脱敏的 `invalid_provider_registry`，远程 Provider 的 timeout、429 或 5xx 则继续原样失败。
+
+CLI 仍保留现有 `--reproduce_provider/--reproduce_gpt_version` 与 `--eval_provider/--eval_gpt_version` 迁移面，阶段脚本则接收 `--provider + --gpt_version`。如需维护自定义模型，可复制版本化 Registry 并通过 `PAPER2CODE_PROVIDER_REGISTRY_PATH` 指向它；配置文件只允许保存环境变量名和能力/价格元数据，不得保存密钥。
+
+默认模型清单是 PaperAlgo 当前支持清单，不是官方模型全集镜像。2026-08-06 依据官方文档复核后，OpenAI active 条目只保留 `gpt-4.1-mini`、`gpt-4o-mini`；`o3-mini`、`o4-mini` 已列入 Deprecated，不进入新任务。DeepSeek 仅接受 `deepseek-v4-pro` / `deepseek-v4-flash`，Qwen 接受官方拼写 `qwen3.8-max`、`qwen3.7-max`、`qwen3.7-plus`，Kimi 接受 `kimi-k3`、`kimi-k2.7-code`、`kimi-k2.7-code-highspeed`、`kimi-k2.6`。K3 使用空 `request_options`，最终请求省略官方要求不发送的固定参数。默认条目的 `base_url: null` 是要求本地用户显式选择 endpoint/地域的安全策略，不代表官方地址未知。
+
+CLI Pipeline 会先构造最小系统环境，再只投影当前角色和所选 Provider/Model 的凭据。`REPRODUCE_*` / `EVAL_*` 优先于模型契约声明的 Provider 原生变量；未设置角色变量时可使用例如 `DEEPSEEK_API_KEY` / `DEEPSEEK_BASE_URL`。未选 Provider 的凭据以及另一角色的凭据不会传给阶段子进程。WebUI 的 `build_pipeline_env()` 行为保持不变。
 
 API key 只应通过本地 Settings 页面或当前 PowerShell 会话的环境变量提供，不应写入 README、命令脚本或测试 fixture。Web settings 保存在被 Git 忽略的 `.local/web_settings.json`；状态接口只返回 `has_api_key`，但本地文件仍是明文 JSON，不等于系统凭据库或磁盘加密。
+
+WebUI 通过只读 `GET /api/v1/providers` 动态获取当前实际 Registry 中可选的 Provider/Model，不维护第二份硬编码清单；响应仅包含版本、ID 和非敏感能力状态，使用 `Cache-Control: no-store`，而 `/api/v1/settings/status` 仍只返回布尔配置状态。无 active model 的 Provider 不可选，Registry 获取失败时 Settings 表单 fail closed。
+
+SQLite 新任务会在入队时保存 reproduce/evaluation Provider、Model、fallback、Registry version 和确定性 Contract SHA-256 的非敏感选择快照，不保存 API key、Authorization、base URL、Prompt、完整响应、完整命令或环境。Worker 可读取当前本地 settings 中轮换后的同一组凭据；若选择、Registry version、指纹不匹配，或历史 queued/running 行缺少快照，则在 `Popen` 前以 `provider_settings_changed` 失败，不猜测或重绑定。相同 `Idempotency-Key` 的 replay 返回原 job 与原快照。该规则不改变 legacy runtime 的同步启动语义。
+
+当前边界仍是 Windows、本地单用户、`127.0.0.1`、单 FastAPI 与单 Worker；`.local/web_settings.json` 和子进程环境中的 API key 不是加密凭据存储。PR-06 cost ledger 与 PR-07 SSE 尚未实现。
 
 ## MinerU 安装边界
 

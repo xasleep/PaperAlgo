@@ -48,6 +48,8 @@ def build_eval_cmd(args, script_dir):
         args.eval_type,
         "--generated_n",
         str(args.generated_n),
+        "--provider",
+        args.eval_provider,
         "--gpt_version",
         args.eval_gpt_version,
     ]
@@ -71,6 +73,8 @@ def build_repair_cmd(args, script_dir):
         args.paper_format,
         "--domain",
         args.domain,
+        "--provider",
+        args.repair_provider,
         "--gpt_version",
         args.repair_gpt_version,
         "--output_dir",
@@ -169,7 +173,9 @@ if __name__ == "__main__":
         choices=["ref_free", "ref_based"],
     )
     parser.add_argument("--generated_n", type=int, default=8)
+    parser.add_argument("--eval_provider", type=str, required=True)
     parser.add_argument("--eval_gpt_version", type=str, required=True)
+    parser.add_argument("--repair_provider", type=str, required=True)
     parser.add_argument("--repair_gpt_version", type=str, required=True)
     parser.add_argument("--gold_repo_dir", type=str, default="")
     parser.add_argument("--selected_file_path", type=str, default="")
