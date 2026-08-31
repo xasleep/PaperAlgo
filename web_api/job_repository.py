@@ -82,6 +82,52 @@ def _checkpoint_path(value: str) -> str:
     return value
 
 
+REPAIR_ATTEMPT_STATUSES = frozenset({"running", "completed", "failed", "skipped"})
+
+
+def _repair_attempt(value: int) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise ValueError("repair attempt must be a positive integer.")
+    return value
+
+
+def _repair_text(value: str, field: str, *, nullable: bool = False) -> str | None:
+    if value is None and nullable:
+        return None
+    if not isinstance(value, str) or not value or len(value) > 128 or not value.isprintable():
+        raise ValueError(f"{field} must contain between 1 and 128 printable characters.")
+    return value
+
+
+def _repair_files_json(files_to_fix: list[str] | tuple[str, ...]) -> str:
+    if (
+        not isinstance(files_to_fix, (list, tuple))
+        or len(files_to_fix) > 128
+        or any(
+            not isinstance(item, str)
+            or not item
+            or len(item) > 512
+            or not item.isprintable()
+            for item in files_to_fix
+        )
+    ):
+        raise ValueError("files_to_fix must be a bounded list of printable paths.")
+    encoded = json.dumps(
+        list(files_to_fix),
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+    if len(encoded) > 8192:
+        raise ValueError("files_to_fix is too large.")
+    return encoded
+
+
+def _repair_attempt_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    result = dict(row)
+    result["files_to_fix"] = json.loads(result.pop("files_to_fix_json"))
+    return result
+
+
 def _canonical_request(request: Mapping[str, object]) -> tuple[dict[str, object], str]:
     if set(request) != REQUEST_FIELDS:
         raise ValueError("SQLite job requests must contain only the validated job fields.")
@@ -1164,6 +1210,265 @@ class JobRepository:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def _assert_repair_mutation_allowed(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        job_id: str,
+        worker_id: str,
+        instance_token: str,
+        launch_token: str,
+        now: str,
+    ) -> sqlite3.Row:
+        self._assert_current_lease(connection, worker_id, instance_token, now)
+        job = connection.execute(
+            "SELECT * FROM jobs WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+        process = connection.execute(
+            "SELECT * FROM job_processes WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+        if job is None or process is None:
+            raise JobNotFoundError()
+        if (
+            job["execution_status"] != "running"
+            or process["launch_token"] != launch_token
+            or process["launch_state"] not in {"registered", "exited"}
+        ):
+            raise OptimisticLockConflictError()
+        return job
+
+    def _record_repair_attempt(
+        self,
+        job_id: str,
+        *,
+        worker_id: str,
+        instance_token: str,
+        launch_token: str,
+        attempt: int,
+        status: str,
+        reason: str,
+        result: str | None,
+        files_to_fix: list[str] | tuple[str, ...],
+    ) -> dict[str, Any]:
+        job_id = validate_job_id(job_id)
+        worker_id = _runtime_identifier(worker_id, "worker_id")
+        instance_token = _runtime_identifier(instance_token, "instance_token")
+        launch_token = _runtime_identifier(launch_token, "launch_token")
+        attempt = _repair_attempt(attempt)
+        if status not in REPAIR_ATTEMPT_STATUSES:
+            raise ValueError("repair attempt status is not allowed.")
+        reason = _repair_text(reason, "reason")
+        result = _repair_text(result, "result", nullable=True)
+        files_json = _repair_files_json(files_to_fix)
+        now = utc_now()
+        event_type = {
+            "running": "job.repair_started",
+            "completed": "job.repair_completed",
+            "failed": "job.repair_failed",
+            "skipped": "job.repair_skipped",
+        }[status]
+        with closing(connect_database(self.database_path)) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                job = self._assert_repair_mutation_allowed(
+                    connection,
+                    job_id=job_id,
+                    worker_id=worker_id,
+                    instance_token=instance_token,
+                    launch_token=launch_token,
+                    now=now,
+                )
+                existing = connection.execute(
+                    """
+                    SELECT * FROM repair_attempts
+                    WHERE job_id = ? AND attempt = ?
+                    """,
+                    (job_id, attempt),
+                ).fetchone()
+                if existing is not None:
+                    if existing["files_to_fix_json"] != files_json:
+                        raise OptimisticLockConflictError()
+                    existing_result = existing["result"]
+                    existing_status = existing["status"]
+                    if existing_status == status and existing_result == result:
+                        connection.commit()
+                        return _repair_attempt_row_to_dict(existing)
+                    if status == "running" and existing_status in {
+                        "running",
+                        "completed",
+                        "failed",
+                        "skipped",
+                    }:
+                        connection.commit()
+                        return _repair_attempt_row_to_dict(existing)
+                    if existing_status != "running" or status == "running":
+                        raise OptimisticLockConflictError()
+                    connection.execute(
+                        """
+                        UPDATE repair_attempts
+                        SET status = ?, reason = ?, result = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (status, reason, result, now, existing["id"]),
+                    )
+                else:
+                    connection.execute(
+                        """
+                        INSERT INTO repair_attempts (
+                            job_id, attempt, status, reason, result,
+                            files_to_fix_json, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            job_id,
+                            attempt,
+                            status,
+                            reason,
+                            result,
+                            files_json,
+                            now,
+                            now,
+                        ),
+                    )
+                connection.execute(
+                    """
+                    INSERT INTO job_events (
+                        job_id, event_type, source, job_version,
+                        execution_status, evaluation_status, quality_status, created_at
+                    ) VALUES (?, ?, 'worker', ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        job_id,
+                        event_type,
+                        job["version"],
+                        job["execution_status"],
+                        job["evaluation_status"],
+                        job["quality_status"],
+                        now,
+                    ),
+                )
+                row = connection.execute(
+                    """
+                    SELECT * FROM repair_attempts
+                    WHERE job_id = ? AND attempt = ?
+                    """,
+                    (job_id, attempt),
+                ).fetchone()
+                connection.commit()
+                return _repair_attempt_row_to_dict(row)
+            except Exception:
+                connection.rollback()
+                raise
+
+    def start_repair_attempt(
+        self,
+        job_id: str,
+        *,
+        worker_id: str,
+        instance_token: str,
+        launch_token: str,
+        attempt: int,
+        reason: str,
+        files_to_fix: list[str] | tuple[str, ...],
+    ) -> dict[str, Any]:
+        return self._record_repair_attempt(
+            job_id,
+            worker_id=worker_id,
+            instance_token=instance_token,
+            launch_token=launch_token,
+            attempt=attempt,
+            status="running",
+            reason=reason,
+            result=None,
+            files_to_fix=files_to_fix,
+        )
+
+    def complete_repair_attempt(
+        self,
+        job_id: str,
+        *,
+        worker_id: str,
+        instance_token: str,
+        launch_token: str,
+        attempt: int,
+        result: str,
+        files_to_fix: list[str] | tuple[str, ...],
+        reason: str = "quality_rejected",
+    ) -> dict[str, Any]:
+        return self._record_repair_attempt(
+            job_id,
+            worker_id=worker_id,
+            instance_token=instance_token,
+            launch_token=launch_token,
+            attempt=attempt,
+            status="completed",
+            reason=reason,
+            result=result,
+            files_to_fix=files_to_fix,
+        )
+
+    def fail_repair_attempt(
+        self,
+        job_id: str,
+        *,
+        worker_id: str,
+        instance_token: str,
+        launch_token: str,
+        attempt: int,
+        reason: str,
+        result: str,
+        files_to_fix: list[str] | tuple[str, ...],
+    ) -> dict[str, Any]:
+        return self._record_repair_attempt(
+            job_id,
+            worker_id=worker_id,
+            instance_token=instance_token,
+            launch_token=launch_token,
+            attempt=attempt,
+            status="failed",
+            reason=reason,
+            result=result,
+            files_to_fix=files_to_fix,
+        )
+
+    def skip_repair_attempt(
+        self,
+        job_id: str,
+        *,
+        worker_id: str,
+        instance_token: str,
+        launch_token: str,
+        attempt: int,
+        reason: str,
+        files_to_fix: list[str] | tuple[str, ...],
+    ) -> dict[str, Any]:
+        return self._record_repair_attempt(
+            job_id,
+            worker_id=worker_id,
+            instance_token=instance_token,
+            launch_token=launch_token,
+            attempt=attempt,
+            status="skipped",
+            reason=reason,
+            result=None,
+            files_to_fix=files_to_fix,
+        )
+
+    def list_repair_attempts(self, job_id: str) -> list[dict[str, Any]]:
+        job_id = validate_job_id(job_id)
+        with closing(connect_database(self.database_path)) as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM repair_attempts
+                WHERE job_id = ?
+                ORDER BY attempt ASC, id ASC
+                """,
+                (job_id,),
+            ).fetchall()
+        return [_repair_attempt_row_to_dict(row) for row in rows]
+
     def prepare_recovery_attempt(
         self,
         job_id: str,
@@ -1421,7 +1726,10 @@ class JobRepository:
         event_type: str,
         exit_code: int | None,
         failure_code: str | None,
+        evaluation_status: str | None = None,
+        quality_status: str | None = None,
         cancel_command_status: str | None = None,
+        cancel_command_error_code: str | None = None,
     ) -> dict[str, Any]:
         job_id = validate_job_id(job_id)
         worker_id = _runtime_identifier(worker_id, "worker_id")
@@ -1461,13 +1769,18 @@ class JobRepository:
                         or cancel_command["status"] not in {"pending", "claimed"}
                     ):
                         raise OptimisticLockConflictError()
+                transition_kwargs = {"execution_status": execution_status}
+                if evaluation_status is not None:
+                    transition_kwargs["evaluation_status"] = evaluation_status
+                if quality_status is not None:
+                    transition_kwargs["quality_status"] = quality_status
                 next_state = validate_job_transition(
                     JobState(
                         execution_status=current["execution_status"],
                         evaluation_status=current["evaluation_status"],
                         quality_status=current["quality_status"],
                     ),
-                    execution_status=execution_status,
+                    **transition_kwargs,
                 )
                 next_version = int(current["version"]) + 1
                 recovery_status = (
@@ -1523,7 +1836,11 @@ class JobRepository:
                         """,
                         (
                             cancel_command_status,
-                            failure_code if cancel_command_status == "failed" else None,
+                            (
+                                cancel_command_error_code
+                                if cancel_command_status == "failed"
+                                else None
+                            ),
                             now,
                             job_id,
                         ),
@@ -1573,6 +1890,8 @@ class JobRepository:
         instance_token: str,
         launch_token: str,
         exit_code: int,
+        evaluation_status: str | None = None,
+        quality_status: str | None = None,
     ) -> dict[str, Any]:
         if not isinstance(exit_code, int) or isinstance(exit_code, bool):
             raise ValueError("exit_code must be an integer.")
@@ -1586,6 +1905,8 @@ class JobRepository:
                 event_type="job.process_completed",
                 exit_code=exit_code,
                 failure_code=None,
+                evaluation_status=evaluation_status,
+                quality_status=quality_status,
             )
         return self._finish_running_process(
             job_id,
@@ -1596,6 +1917,8 @@ class JobRepository:
             event_type="job.process_failed",
             exit_code=exit_code,
             failure_code="pipeline_process_failed",
+            evaluation_status=evaluation_status or "skipped",
+            quality_status=quality_status or "skipped",
         )
 
     def complete_cancellation(
@@ -1629,9 +1952,15 @@ class JobRepository:
         failure_code: str,
         event_type: str = "job.process_failed",
         exit_code: int | None = None,
+        cancel_command_error_code: str | None = None,
     ) -> dict[str, Any]:
         failure_code = _runtime_identifier(failure_code, "failure_code")
         event_type = _runtime_identifier(event_type, "event_type")
+        if cancel_command_error_code is not None:
+            cancel_command_error_code = _runtime_identifier(
+                cancel_command_error_code,
+                "cancel_command_error_code",
+            )
         return self._finish_running_process(
             job_id,
             worker_id=worker_id,
@@ -1641,7 +1970,10 @@ class JobRepository:
             event_type=event_type,
             exit_code=exit_code,
             failure_code=failure_code,
+            evaluation_status="skipped",
+            quality_status="skipped",
             cancel_command_status="failed",
+            cancel_command_error_code=cancel_command_error_code or failure_code,
         )
 
     def transition_job(

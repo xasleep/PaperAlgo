@@ -18,6 +18,11 @@ from codes.checkpoint_protocol import (
     latest_completed_checkpoint,
     list_checkpoints,
 )
+from codes.evaluation_contract import (
+    EvaluationContractError,
+    decide_repair_action,
+    extract_evaluation_result,
+)
 from codes.task_manifest import TaskManifestError, load_task_manifest
 
 from . import job_service
@@ -66,6 +71,11 @@ class ConfirmedExitDecision:
     recovery_allowed: bool
     recovery_count: int
     max_recoveries: int
+
+
+def _safe_load_json(path: Path) -> object:
+    with open(path, "r", encoding="utf-8") as stream:
+        return json.load(stream)
 
 
 CommandBuilder = Callable[[dict[str, object]], LaunchSpec]
@@ -186,6 +196,7 @@ class PipelineWorker:
         *,
         event_type: str = "job.process_failed",
         exit_code: int | None = None,
+        cancel_command_error_code: str | None = None,
     ) -> None:
         self.repository.fail_process(
             managed.job_id,
@@ -195,16 +206,65 @@ class PipelineWorker:
             failure_code=failure_code,
             event_type=event_type,
             exit_code=exit_code,
+            cancel_command_error_code=cancel_command_error_code,
         )
         self._forget(managed.job_id)
 
+    def _final_evaluation_result(self, job_id: str) -> dict[str, object]:
+        run_dir = job_service.RUNS_DIR / job_id
+        latest_completed = latest_completed_checkpoint(run_dir, expected_job_id=job_id)
+        if latest_completed is None or latest_completed[0]["stage_name"] != "completed":
+            raise CheckpointProtocolError(
+                "final_checkpoint_missing",
+                "Completed pipeline checkpoint is missing.",
+            )
+        feedback_path = run_dir / "output" / "eval_feedback.json"
+        try:
+            feedback = _safe_load_json(feedback_path)
+            result = extract_evaluation_result(feedback)  # type: ignore[arg-type]
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise CheckpointProtocolError(
+                "final_evaluation_missing",
+                "Final evaluation result is missing or unreadable.",
+            ) from exc
+        except (EvaluationContractError, TypeError) as exc:
+            raise CheckpointProtocolError(
+                "final_evaluation_invalid",
+                "Final evaluation result does not satisfy the contract.",
+            ) from exc
+        if result["execution_status"] != "completed":
+            raise CheckpointProtocolError(
+                "final_evaluation_invalid",
+                "Final evaluation result has an invalid execution status.",
+            )
+        return result
+
     def _finish_managed(self, managed: ManagedProcess, exit_code: int) -> None:
+        final_result = None
+        if exit_code == 0 and self.command_builder is _pipeline_launch_spec:
+            try:
+                final_result = self._final_evaluation_result(managed.job_id)
+            except CheckpointProtocolError as exc:
+                self._fail_managed(
+                    managed,
+                    exc.code,
+                    event_type="job.final_state_rejected",
+                    exit_code=exit_code,
+                    cancel_command_error_code="already_finished",
+                )
+                return
         self.repository.finish_process(
             managed.job_id,
             worker_id=self.worker_id,
             instance_token=self.instance_token,
             launch_token=managed.launch_token,
             exit_code=exit_code,
+            evaluation_status=(
+                None if final_result is None else str(final_result["evaluation_status"])
+            ),
+            quality_status=(
+                None if final_result is None else str(final_result["quality_status"])
+            ),
         )
         self._forget(managed.job_id)
 
@@ -237,6 +297,84 @@ class PipelineWorker:
             and launch.command_summary.isprintable()
         )
 
+    def _repair_context(self, job_id: str, repair_round: int) -> tuple[str, list[str]]:
+        run_dir = job_service.RUNS_DIR / job_id
+        feedback_path = run_dir / "output" / "eval_feedback.json"
+        try:
+            feedback = _safe_load_json(feedback_path)
+            if isinstance(feedback, dict):
+                decision_input = dict(feedback)
+                decision_input["repair_round"] = max(repair_round - 1, 0)
+                decision = decide_repair_action(decision_input)
+                files = list(decision.get("files_to_fix") or [])
+                reason = str(decision.get("reason") or "quality_rejected")
+                if files or reason:
+                    return reason, files
+        except Exception:
+            pass
+
+        status_path = run_dir / "output" / "repo_status.json"
+        try:
+            repo_status = _safe_load_json(status_path)
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            repo_status = {}
+        if not isinstance(repo_status, dict):
+            repo_status = {}
+        raw_files = (
+            repo_status.get("files_to_fix")
+            or repo_status.get("files_to_repair")
+            or repo_status.get("repaired_files")
+            or []
+        )
+        files = [str(item) for item in raw_files] if isinstance(raw_files, list) else []
+        return str(repo_status.get("repair_reason") or "quality_rejected"), files
+
+    def _sync_repair_attempt_checkpoint(
+        self,
+        managed: ManagedProcess,
+        checkpoint: dict[str, object],
+    ) -> None:
+        if checkpoint.get("stage_name") != "repair":
+            return
+        stage_sequence = int(checkpoint["stage_sequence"])
+        repair_round = (stage_sequence - 5) // 2
+        if repair_round < 1:
+            raise ValueError("repair checkpoint sequence is invalid.")
+        reason, files_to_fix = self._repair_context(managed.job_id, repair_round)
+        status = str(checkpoint["status"])
+        if status == "running":
+            self.repository.start_repair_attempt(
+                managed.job_id,
+                worker_id=self.worker_id,
+                instance_token=self.instance_token,
+                launch_token=managed.launch_token,
+                attempt=repair_round,
+                reason=reason,
+                files_to_fix=files_to_fix,
+            )
+        elif status == "completed":
+            self.repository.complete_repair_attempt(
+                managed.job_id,
+                worker_id=self.worker_id,
+                instance_token=self.instance_token,
+                launch_token=managed.launch_token,
+                attempt=repair_round,
+                reason=reason,
+                result="pending_evaluation",
+                files_to_fix=files_to_fix,
+            )
+        elif status == "failed":
+            self.repository.fail_repair_attempt(
+                managed.job_id,
+                worker_id=self.worker_id,
+                instance_token=self.instance_token,
+                launch_token=managed.launch_token,
+                attempt=repair_round,
+                reason=str(checkpoint.get("error_code") or "stage_execution_failed"),
+                result="repair_failed",
+                files_to_fix=files_to_fix,
+            )
+
     def _sync_process_checkpoints(self, managed: ManagedProcess) -> None:
         run_dir = job_service.RUNS_DIR / managed.job_id
         known_paths = {
@@ -259,6 +397,7 @@ class PipelineWorker:
                     None,
                 )
                 if matching is not None and matching.get("status") == checkpoint["status"]:
+                    self._sync_repair_attempt_checkpoint(managed, checkpoint)
                     continue
             self.repository.record_stage_checkpoint(
                 managed.job_id,
@@ -268,6 +407,7 @@ class PipelineWorker:
                 checkpoint=checkpoint,
                 checkpoint_path=checkpoint_path,
             )
+            self._sync_repair_attempt_checkpoint(managed, checkpoint)
             known_paths.add(checkpoint_path)
 
     def _complete_confirmed_dead_cancellation(self, managed: ManagedProcess) -> None:

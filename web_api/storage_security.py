@@ -37,6 +37,18 @@ def _apply_private_file_permissions(path: Path) -> None:
 
 
 def _current_windows_principal() -> str:
+    if os.name == "nt":
+        completed = subprocess.run(
+            ["whoami"],
+            capture_output=True,
+            text=True,
+            check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        principal = (completed.stdout or "").strip()
+        if completed.returncode == 0 and principal:
+            return principal
+
     username = (os.environ.get("USERNAME") or getpass.getuser() or "").strip()
     if not username:
         raise LocalStorageSecurityError(

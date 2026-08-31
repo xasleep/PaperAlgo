@@ -2,7 +2,15 @@ import json
 import os
 import argparse
 from collections.abc import Mapping
-from task_manifest import load_task_manifest, read_manifest_text_files
+from evaluation_contract import (
+    build_evaluation_error_result,
+    build_quality_result,
+    classify_evaluation_exception,
+    has_quorum,
+    legacy_status_from_result,
+    resolve_files_to_fix,
+)
+from task_manifest import TaskManifestError, load_task_manifest, read_manifest_text_files
 from openai import BadRequestError, PermissionDeniedError
 from provider_registry import get_provider_registry
 from utils import (
@@ -14,8 +22,7 @@ from utils import (
     make_openai_client,
     load_paper_content,
     MAX_REPAIR_ROUNDS,
-    STATUS_EVAL_FAILED,
-    STATUS_EVAL_PASSED,
+    MalformedEvaluatorResponseError,
     eval_feedback_path,
     load_json_file,
     repo_status_path,
@@ -60,6 +67,42 @@ class EvaluationProviderUsageError(RuntimeError):
         )
         self.provider_id = provider_id
         self.model_id = model_id
+
+
+def parse_evaluator_output(output, *, score_key="score", rationale_key="critique_list"):
+    try:
+        output_json = json.loads(output)
+    except json.JSONDecodeError:
+        try:
+            output_json = json.loads(extract_json_from_string(output))
+        except Exception as exc:
+            raise MalformedEvaluatorResponseError(
+                "Evaluator response was not valid JSON."
+            ) from exc
+
+    if not isinstance(output_json, Mapping):
+        raise MalformedEvaluatorResponseError("Evaluator response must be an object.")
+    if score_key not in output_json or rationale_key not in output_json:
+        raise MalformedEvaluatorResponseError(
+            "Evaluator response is missing required fields."
+        )
+    raw_score = output_json[score_key]
+    if isinstance(raw_score, bool) or not isinstance(raw_score, (int, float)):
+        raise MalformedEvaluatorResponseError("Evaluator score must be numeric.")
+    score = int(raw_score)
+    if score != raw_score:
+        raise MalformedEvaluatorResponseError("Evaluator score must be an integer.")
+
+    rationale_value = output_json[rationale_key]
+    if isinstance(rationale_value, str):
+        rationale = rationale_value
+    elif isinstance(rationale_value, (list, dict)):
+        rationale = json.dumps(rationale_value, ensure_ascii=False)
+    else:
+        raise MalformedEvaluatorResponseError(
+            "Evaluator critique_list must be text, an object, or a list."
+        )
+    return score, rationale
 
 
 def api_call(request_json):
@@ -321,6 +364,74 @@ def run_completion_requests_with_fallback(
     raise last_error
 
 
+def _safe_model_name(model_name):
+    return str(model_name or "unknown").replace("/", "_").replace("\\", "_")
+
+
+def persist_evaluation_result(
+    *,
+    output_dir,
+    eval_result_dir,
+    paper_name,
+    eval_type,
+    result,
+    summary="",
+    cost_completion_json=None,
+):
+    now_str = get_now_str()
+    os.makedirs(eval_result_dir, exist_ok=True)
+    eval_result_file = (
+        f"{eval_result_dir}/{paper_name}_eval_{eval_type}_"
+        f"{_safe_model_name(result.get('eval_model') or result.get('requested_eval_model'))}_"
+        f"{now_str}.json"
+    )
+    result_payload = dict(result)
+    save_json_file(eval_result_file, result_payload)
+
+    errors = result.get("errors") or []
+    error_summary = ""
+    if errors:
+        first_error = errors[0]
+        error_summary = str(first_error.get("message") or first_error.get("code") or "")
+
+    feedback_json = {
+        **result_payload,
+        "requested_eval_model": result.get("requested_eval_model"),
+        "eval_model": result.get("eval_model"),
+        "score": result.get("quality_score"),
+        "valid_n": result.get("valid_n"),
+        "score_lst": result.get("score_lst"),
+        "passed": result.get("quality_verdict") == "passed",
+        "summary": summary or error_summary,
+        "files_to_repair": result.get("files_to_fix", []),
+        "eval_result_file": eval_result_file,
+        "updated_at": get_now_str(),
+    }
+    save_json_file(eval_feedback_path(output_dir), feedback_json)
+
+    write_repo_status(
+        output_dir,
+        legacy_status_from_result(result),
+        **result_payload,
+        files_to_repair=result.get("files_to_fix", []),
+        eval_score=result.get("quality_score"),
+        feedback_file=eval_feedback_path(output_dir),
+        eval_result_file=eval_result_file,
+    )
+
+    if cost_completion_json is not None:
+        print_log_cost(
+            cost_completion_json,
+            result.get("eval_model") or result.get("requested_eval_model"),
+            f"[Evaluation] {paper_name} - {eval_type}",
+            output_dir,
+            0,
+            result.get("provider_id"),
+        )
+
+    return eval_result_file
+
+
 def main(args):
     global client
     validate_eval_args(args)
@@ -346,6 +457,10 @@ def main(args):
     is_papercoder = True if args.papercoder else False
 
     gold_repo_dir = args.gold_repo_dir
+
+    existing_status = load_json_file(repo_status_path(output_dir), default={}) or {}
+    repair_round = int(existing_status.get("repair_round", 0) or 0)
+    task_manifest = None
 
     paper_content = load_paper_content(
         paper_format,
@@ -466,58 +581,73 @@ def main(args):
             "Unable to determine request size for provider context validation."
         ) from exc
 
-    (
-        request_json,
-        completion_json,
-        generated_n,
-        actual_gpt_version,
-        fallback_info,
-    ) = run_completion_requests_with_fallback(
-        provider_id,
-        gpt_version,
-        msg,
-        generated_n,
-        fallback_models,
-        num_tokens,
-    )
+    try:
+        (
+            request_json,
+            completion_json,
+            generated_n,
+            actual_gpt_version,
+            fallback_info,
+        ) = run_completion_requests_with_fallback(
+            provider_id,
+            gpt_version,
+            msg,
+            generated_n,
+            fallback_models,
+            num_tokens,
+        )
+    except Exception as exc:
+        classified = classify_evaluation_exception(exc)
+        result = build_evaluation_error_result(
+            paper_name=paper_name,
+            target_repo_dir=target_repo_dir,
+            eval_type=eval_type,
+            requested_eval_model=gpt_version,
+            provider_id=provider_id,
+            error_code=classified["error_code"],
+            error_message=classified["message"],
+            generated_n=generated_n,
+            repair_round=repair_round,
+            max_repair_rounds=max_repair_rounds,
+        )
+        persist_evaluation_result(
+            output_dir=output_dir,
+            eval_result_dir=eval_result_dir,
+            paper_name=paper_name,
+            eval_type=eval_type,
+            result=result,
+            summary=classified["message"],
+        )
+        print(f"[ERROR] Evaluation failed before quality assessment: {classified['error_code']}")
+        return
 
     score_key = "score"
     rationale_key = "critique_list"
 
     all_scores = []
     rationales = []
+    malformed_response_seen = False
 
     for n in range(generated_n):
         choice = completion_json["choices"][n]
         output = choice["message"]["content"].strip()
 
         try:
-            output_json2 = json.loads(output)
-            score = int(output_json2[score_key])
-
-            if isinstance(output_json2[rationale_key], str):
-                rationale = output_json2[rationale_key]
-            else:
-                rationale = json.dumps(output_json2[rationale_key], ensure_ascii=False)
-
-        except Exception:
-            try:
-                output_json2 = json.loads(extract_json_from_string(output))
-                score = int(output_json2[score_key])
-
-                if isinstance(output_json2[rationale_key], str):
-                    rationale = output_json2[rationale_key]
-                else:
-                    rationale = json.dumps(output_json2[rationale_key], ensure_ascii=False)
-
-            except Exception as e2:
-                print("[WARNING] Invalid response: parsing error")
-                print(e2)
-                print("-" * 40)
-                continue
+            score, rationale = parse_evaluator_output(
+                output,
+                score_key=score_key,
+                rationale_key=rationale_key,
+            )
+        except MalformedEvaluatorResponseError as exc:
+            malformed_response_seen = True
+            print("[WARNING] Invalid response: malformed evaluator response")
+            print(exc)
+            print("-" * 40)
+            continue
 
         # score
         if score < 1 or score > 5:
+            malformed_response_seen = True
             print(
                 f"[WARNING] Invalid response: score {score}, "
                 f"Score must be in the range of 1–5."
@@ -527,96 +657,70 @@ def main(args):
         all_scores.append(int(score))
         rationales.append(rationale)
 
-    if len(all_scores) == 0:
-        print("[ERROR] No valid evaluation responses were parsed.")
-        avg_score = 0
-    else:
-        avg_score = sum(all_scores) / len(all_scores)
+    try:
+        if malformed_response_seen and not has_quorum(
+            valid_n=len(all_scores),
+            generated_n=generated_n,
+        ):
+            raise MalformedEvaluatorResponseError(
+                "Evaluator responses did not provide enough valid structured results."
+            )
+        feedback = summarize_eval_feedback(rationales)
+        if task_manifest is None and feedback["files_to_repair"]:
+            raise TaskManifestError(
+                "Evaluator selected repair files without a TaskManifest boundary."
+            )
+        files_to_fix = (
+            list(resolve_files_to_fix(feedback["files_to_repair"], task_manifest))
+            if task_manifest is not None
+            else []
+        )
+        result = build_quality_result(
+            paper_name=paper_name,
+            target_repo_dir=target_repo_dir,
+            eval_type=eval_type,
+            requested_eval_model=gpt_version,
+            eval_model=actual_gpt_version,
+            provider_id=provider_id,
+            generated_n=generated_n,
+            scores=all_scores,
+            findings=feedback["findings"],
+            files_to_fix=files_to_fix,
+            repair_round=repair_round,
+            max_repair_rounds=max_repair_rounds,
+            **fallback_info,
+        )
+        summary = feedback["summary"]
+    except Exception as exc:
+        classified = classify_evaluation_exception(exc)
+        result = build_evaluation_error_result(
+            paper_name=paper_name,
+            target_repo_dir=target_repo_dir,
+            eval_type=eval_type,
+            requested_eval_model=gpt_version,
+            eval_model=actual_gpt_version,
+            provider_id=provider_id,
+            error_code="malformed_evaluator_response"
+            if classified["error_code"] == "provider_protocol_error"
+            else classified["error_code"],
+            error_message=classified["message"],
+            generated_n=generated_n,
+            repair_round=repair_round,
+            max_repair_rounds=max_repair_rounds,
+            **fallback_info,
+        )
+        summary = classified["message"]
 
-    feedback = summarize_eval_feedback(rationales)
-    is_passed = avg_score >= 4.0 and not feedback["has_high_severity"]
-    repo_status = STATUS_EVAL_PASSED if is_passed else STATUS_EVAL_FAILED
-
-    existing_status = load_json_file(repo_status_path(output_dir), default={}) or {}
-    repair_round = int(existing_status.get("repair_round", 0) or 0)
-
-    output_json = {
-        "paper_name": paper_name,
-        "target_repo_dir": target_repo_dir,
-        "eval_type": eval_type,
-        "gold_repo_dir": gold_repo_dir,
-        "generated_n": generated_n,
-        "requested_gpt_version": gpt_version,
-        "actual_gpt_version": actual_gpt_version,
-        "fallback_gpt_versions": fallback_models,
-        **fallback_info,
-        "request_json": request_json,
-        "completion_json": completion_json,
-        "eval_result": {
-            "score": avg_score,
-            "valid_n": len(all_scores),
-            "score_lst": all_scores,
-            "rationale_lst": rationales,
-            "has_high_severity": feedback["has_high_severity"],
-            "passed": is_passed,
-        },
-    }
-
-    now_str = get_now_str()
-    os.makedirs(eval_result_dir, exist_ok=True)
-
-    with open(
-        f"{eval_result_dir}/{paper_name}_eval_{eval_type}_{actual_gpt_version}_{now_str}.json",
-        "w",
-        encoding="utf-8",
-    ) as f:
-        json.dump(output_json, f, ensure_ascii=False, indent=2)
-
-    feedback_json = {
-        "paper_name": paper_name,
-        "target_repo_dir": target_repo_dir,
-        "eval_type": eval_type,
-        "requested_eval_model": gpt_version,
-        "eval_model": actual_gpt_version,
-        "fallback_gpt_versions": fallback_models,
-        **fallback_info,
-        "score": avg_score,
-        "valid_n": len(all_scores),
-        "score_lst": all_scores,
-        "passed": is_passed,
-        "pass_rule": "score >= 4.0 and no high severity findings",
-        "has_high_severity": feedback["has_high_severity"],
-        "repair_round": repair_round,
-        "max_repair_rounds": max_repair_rounds,
-        "summary": feedback["summary"],
-        "findings": feedback["findings"],
-        "findings_by_file": feedback["findings_by_file"],
-        "files_to_repair": feedback["files_to_repair"],
-        "eval_result_file": f"{eval_result_dir}/{paper_name}_eval_{eval_type}_{actual_gpt_version}_{now_str}.json",
-        "updated_at": get_now_str(),
-    }
-    save_json_file(eval_feedback_path(output_dir), feedback_json)
-
-    write_repo_status(
-        output_dir,
-        repo_status,
+    persist_evaluation_result(
+        output_dir=output_dir,
+        eval_result_dir=eval_result_dir,
         paper_name=paper_name,
-        target_repo_dir=target_repo_dir,
         eval_type=eval_type,
-        requested_eval_model=gpt_version,
-        eval_model=actual_gpt_version,
-        **fallback_info,
-        eval_score=avg_score,
-        valid_n=len(all_scores),
-        has_high_severity=feedback["has_high_severity"],
-        pass_rule="score >= 4.0 and no high severity findings",
-        repair_round=repair_round,
-        max_repair_rounds=max_repair_rounds,
-        feedback_file=eval_feedback_path(output_dir),
-        eval_result_file=feedback_json["eval_result_file"],
+        result=result,
+        summary=summary,
+        cost_completion_json=completion_json,
     )
 
-    # ---------------
     print()
     print("=" * 40)
     print("🌟 Evaluation Summary 🌟")
@@ -624,21 +728,15 @@ def main(args):
     print(f"🧪 Evaluation type: {eval_type}")
     print(f"📁 Target repo directory: {target_repo_dir}")
     print("📊 Evaluation result:")
-    print(f"\t📈 Score: {avg_score:.4f}")
-    print(f"\t✅ Valid: {output_json['eval_result']['valid_n']}/{generated_n}")
-    print(f"\t🚦 Status: {repo_status}")
-    print(f"\t🧯 High severity: {feedback['has_high_severity']}")
+    if result["quality_score"] is None:
+        print("\t📈 Score: not assessed")
+    else:
+        print(f"\t📈 Score: {result['quality_score']:.4f}")
+    print(f"\t✅ Valid: {result['valid_n']}/{generated_n}")
+    print(f"\t🧪 Evaluation status: {result['evaluation_status']}")
+    print(f"\t🚦 Quality verdict: {result['quality_verdict']}")
+    print(f"\t🧯 Repair status: {result['repair_status']}")
     print("=" * 40)
-
-    print_log_cost(
-        completion_json,
-        actual_gpt_version,
-        f"[Evaluation] {paper_name} - {eval_type}",
-        output_dir,
-        0,
-        provider_id,
-    )
-    # ---------------
 
 
 if __name__ == "__main__":

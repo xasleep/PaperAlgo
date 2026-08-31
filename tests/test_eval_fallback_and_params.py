@@ -729,14 +729,8 @@ def test_eval_main_records_actual_fallback_model(monkeypatch, tmp_path: Path) ->
                 "message": {
                     "content": json.dumps(
                         {
-                            "score": 3,
-                            "critique_list": [
-                                {
-                                    "file_name": "main.py",
-                                    "severity_level": "medium",
-                                    "critique": "needs work",
-                                }
-                            ],
+                            "score": 5,
+                            "critique_list": [],
                         }
                     )
                 }
@@ -793,6 +787,110 @@ def test_eval_main_records_actual_fallback_model(monkeypatch, tmp_path: Path) ->
     assert repo_status["fallback_remaining_models"] == []
     assert repo_status["max_repair_rounds"] == 0
     assert feedback["eval_model"] == "qwen3.7-plus"
+
+
+def test_eval_main_blocks_file_repair_without_manifest_boundary(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    eval_module = _load_code_module("eval_for_missing_manifest_repair", "eval.py")
+    data_dir = tmp_path / "data"
+    prompts_dir = data_dir / "prompts"
+    prompts_dir.mkdir(parents=True)
+    (prompts_dir / "ref_free.txt").write_text("{{Paper}}\n{{Code}}\n", encoding="utf-8")
+    markdown_path = tmp_path / "paper.md"
+    markdown_path.write_text("# paper\n", encoding="utf-8")
+    output_dir = tmp_path / "output"
+    target_repo_dir = tmp_path / "repo"
+    eval_result_dir = tmp_path / "results"
+    output_dir.mkdir()
+    target_repo_dir.mkdir()
+    (target_repo_dir / "main.py").write_text("print('needs repair')\n", encoding="utf-8")
+
+    completion_json = {
+        "model": "fake-primary",
+        "choices": [
+            {
+                "message": {
+                    "content": json.dumps(
+                        {
+                            "score": 2,
+                            "critique_list": [
+                                {
+                                    "file_name": "main.py",
+                                    "severity_level": "medium",
+                                    "critique": "needs repair",
+                                }
+                            ],
+                        }
+                    )
+                }
+            }
+        ],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+    }
+
+    monkeypatch.setattr(eval_module, "num_tokens_from_messages", lambda msg: 1)
+    monkeypatch.setattr(eval_module, "print_log_cost", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(
+        eval_module,
+        "get_provider_registry",
+        lambda: _synthetic_registry(
+            provider_id="fake",
+            primary_model_id="fake-primary",
+            fallback_model_ids=(),
+        ),
+    )
+    monkeypatch.setattr(
+        eval_module,
+        "run_completion_requests_with_fallback",
+        lambda *args, **kwargs: (
+            {"model": "fake-primary", "n": 1},
+            completion_json,
+            1,
+            "fake-primary",
+            {
+                "fallback_used": False,
+                "fallback_reason": "",
+                "fallback_from_model": "",
+                "fallback_eval_model": "",
+                "fallback_model_chain": ["fake-primary"],
+                "fallback_remaining_models": [],
+            },
+        ),
+    )
+
+    args = SimpleNamespace(
+        paper_name="paper",
+        paper_format="Markdown",
+        domain="general",
+        pdf_json_path=None,
+        pdf_latex_path=None,
+        pdf_markdown_path=str(markdown_path),
+        data_dir=str(data_dir),
+        output_dir=str(output_dir),
+        target_repo_dir=str(target_repo_dir),
+        gold_repo_dir="",
+        eval_result_dir=str(eval_result_dir),
+        eval_type="ref_free",
+        generated_n=1,
+        gpt_version="fake-primary",
+        provider="fake",
+        fallback_gpt_versions="",
+        selected_file_path="",
+        papercoder=False,
+        max_repair_rounds=1,
+    )
+
+    eval_module.main(args)
+
+    repo_status = eval_module.load_json_file(eval_module.repo_status_path(str(output_dir)))
+    assert repo_status["evaluation_status"] == "failed"
+    assert repo_status["quality_status"] == "skipped"
+    assert repo_status["quality_verdict"] == "not_assessed"
+    assert repo_status["repair_status"] == "blocked"
+    assert repo_status["errors"][0]["code"] == "malformed_evaluator_response"
+    assert repo_status["files_to_fix"] == []
 
 
 def test_auto_refine_reuses_fallback_model_after_first_quota_failure(tmp_path: Path) -> None:

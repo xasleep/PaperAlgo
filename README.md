@@ -126,6 +126,14 @@ SQLite 新任务会在入队时保存 reproduce/evaluation Provider、Model、fa
 
 当前边界仍是 Windows、本地单用户、`127.0.0.1`、单 FastAPI 与单 Worker；`.local/web_settings.json` 和子进程环境中的 API key 不是加密凭据存储。PR-06 cost ledger 与 PR-07 SSE 尚未实现。
 
+## Evaluation 与 Repair 契约
+
+PR-06A 起，`codes/evaluation_contract.py` 是评测结果和 repair 决策的权威边界。Pipeline 现在区分 `execution_status`、`evaluation_status`、`quality_status` / `quality_verdict` 和 `repair_status`：执行失败会跳过 evaluation；evaluator timeout、Provider protocol error、malformed response、unavailable 和 quorum 不足只表示 evaluation failure，不表示代码质量不合格。
+
+质量结论必须满足 quorum，默认 quorum 为 `floor(generated_n / 2) + 1`。只有 evaluator 成功完成且 quality rejected 时才可能进入 repair。`files_to_fix=[]` 表示不修改任何文件；非空列表必须重新绑定到 Planning 产生的 TaskManifest，并通过目标 repo 路径验证，绝不解释为修复整个仓库或整个 manifest。
+
+Evaluation result、feedback、repo status、SQLite events 和 summaries 不保存 prompt、完整模型响应、API key、Authorization 或原始 Provider payload。PR-06A 不实现成本 ledger、预算 enforcement、SSE、命令 API 或 WebUI 实时控制。
+
 ## MinerU 安装边界
 
 MinerU 是可选的外部 PDF 解析依赖，不在本仓库中安装、封装或测试。请按 MinerU 自身文档在独立环境中安装，避免与 Web/API 环境的依赖冲突。Pipeline 按以下顺序寻找执行文件：

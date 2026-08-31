@@ -289,7 +289,10 @@ def test_online_zero_exit_completes_without_recovery(
         worker.close()
 
     job = repository.get_job(managed.job_id)
-    assert job["execution_status"] == "completed"
+    assert job["execution_status"] == "failed"
+    assert job["evaluation_status"] == "skipped"
+    assert job["quality_status"] == "skipped"
+    assert job["failure_code"] == "final_checkpoint_missing"
     assert job["recovery_count"] == 0
     assert repository.get_process(managed.job_id)["exit_code"] == 0
 

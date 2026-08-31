@@ -1,4 +1,5 @@
 import io
+import json
 import os
 import sqlite3
 import subprocess
@@ -10,6 +11,16 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from codes.checkpoint_protocol import (
+    completed_checkpoint,
+    running_checkpoint,
+    write_checkpoint,
+)
+from codes.evaluation_contract import (
+    build_evaluation_error_result,
+    build_quality_result,
+    legacy_status_from_result,
+)
 from web_api import job_service, main as main_module, worker as worker_module
 from web_api.database import connect_database
 from web_api.errors import OptimisticLockConflictError
@@ -203,6 +214,286 @@ def _registered_managed_job(
     )
     worker._managed[job_id] = managed
     return managed
+
+
+def _write_completed_pipeline_boundaries(
+    run_dir: Path,
+    job_id: str,
+    evaluation_result: dict[str, object],
+    *,
+    evaluation_resume_from_stage: str = "completed",
+    include_terminal_boundary: bool = True,
+) -> None:
+    paths: list[str] = []
+
+    def write_file(relative_path: str, content: str) -> None:
+        path = run_dir / Path(*relative_path.split("/"))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        if relative_path not in paths:
+            paths.append(relative_path)
+
+    def write_completed(stage_name: str, sequence: int, resume_from_stage: str | None) -> None:
+        write_checkpoint(
+            run_dir,
+            completed_checkpoint(
+                run_dir,
+                job_id=job_id,
+                stage_name=stage_name,
+                stage_sequence=sequence,
+                stage_attempt=1,
+                started_at=f"2026-07-22T00:00:{sequence:02d}.000Z",
+                completed_at=f"2026-07-22T00:00:{sequence:02d}.500Z",
+                artifact_paths=paths,
+                resume_from_stage=resume_from_stage,
+            ),
+        )
+
+    write_file("input/source_markdown.md", "# paper\n")
+    write_completed("mineru_skipped", 1, "planning")
+    write_file("output/task_manifest.json", '{"version":1,"files":[{"path":"main.py"}]}')
+    write_file("output/planning_response.json", "{}")
+    write_file("output/planning_trajectories.json", "[]")
+    write_completed("planning", 2, "extract_config")
+    write_file("output/planning_config.yaml", "seed: 1\n")
+    write_file("output/planning_artifacts/1.1_overall_plan.txt", "plan\n")
+    write_completed("extract_config", 3, "analyzing")
+    write_file("output/analyzing_artifacts/main_analysis.txt", "analysis\n")
+    write_file("output/main_simple_analysis_response.json", "{}")
+    write_completed("analyzing", 4, "coding")
+    write_file("repo/config.yaml", "seed: 1\n")
+    write_file("repo/main.py", "print('ok')\n")
+    write_completed("coding", 5, "evaluation")
+    status_payload = {
+        **evaluation_result,
+        "status": legacy_status_from_result(evaluation_result),
+        "eval_score": evaluation_result.get("quality_score"),
+        "files_to_repair": evaluation_result.get("files_to_fix", []),
+    }
+    write_file("output/eval_feedback.json", json.dumps(evaluation_result))
+    write_file("output/repo_status.json", json.dumps(status_payload))
+    write_completed("evaluation", 6, evaluation_resume_from_stage)
+    if include_terminal_boundary:
+        write_file("run_status.json", '{"status":"completed"}')
+        write_file("run_summary.json", '{"status":"completed"}')
+        write_completed("completed", 7, None)
+
+
+def _quality_result_for_worker(
+    *,
+    scores: list[int],
+    files_to_fix: list[str] | None = None,
+    repair_round: int = 0,
+    max_repair_rounds: int = 1,
+) -> dict[str, object]:
+    findings = [
+        {
+            "file_name": "main.py",
+            "severity_level": "medium",
+            "critique": "missing a required experiment",
+        }
+    ] if files_to_fix else []
+    return build_quality_result(
+        paper_name="paper",
+        target_repo_dir="repo",
+        eval_type="ref_free",
+        requested_eval_model="fake-primary",
+        eval_model="fake-primary",
+        provider_id="fake",
+        generated_n=1,
+        scores=scores,
+        findings=findings,
+        files_to_fix=files_to_fix or [],
+        repair_round=repair_round,
+        max_repair_rounds=max_repair_rounds,
+    )
+
+
+@pytest.mark.parametrize(
+    ("evaluation_result", "expected_state"),
+    [
+        (
+            _quality_result_for_worker(scores=[5]),
+            ("completed", "completed", "accepted", None),
+        ),
+        (
+            _quality_result_for_worker(scores=[2], files_to_fix=["main.py"]),
+            ("completed", "completed", "rejected", None),
+        ),
+        (
+            build_evaluation_error_result(
+                paper_name="paper",
+                target_repo_dir="repo",
+                eval_type="ref_free",
+                requested_eval_model="fake-primary",
+                provider_id="fake",
+                error_code="malformed_evaluator_response",
+                error_message="Evaluator response was malformed.",
+                generated_n=1,
+                repair_round=0,
+                max_repair_rounds=1,
+            ),
+            ("completed", "failed", "skipped", None),
+        ),
+    ],
+)
+def test_default_worker_exit_zero_syncs_final_evaluation_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    evaluation_result: dict[str, object],
+    expected_state: tuple[str, str, str, str | None],
+) -> None:
+    runs_dir = tmp_path / "runs"
+    monkeypatch.setattr(job_service, "RUNS_DIR", runs_dir)
+    repository = JobRepository(tmp_path / "paper2code.db")
+    worker = PipelineWorker(
+        repository=repository,
+        worker_id="final-sync-worker",
+        instance_token=f"final-sync-{expected_state[2]}",
+    )
+
+    class ExitedProcess:
+        @staticmethod
+        def poll() -> int:
+            return 0
+
+    job_id = f"final_sync_{expected_state[2]}"
+    _registered_managed_job(repository, worker, job_id, ExitedProcess())
+    _write_completed_pipeline_boundaries(runs_dir / job_id, job_id, evaluation_result)
+
+    try:
+        worker._monitor_managed()
+    finally:
+        worker.close()
+
+    job = repository.get_job(job_id)
+    assert (
+        job["execution_status"],
+        job["evaluation_status"],
+        job["quality_status"],
+        job["failure_code"],
+    ) == expected_state
+
+
+def test_default_worker_exit_zero_without_final_boundary_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(job_service, "RUNS_DIR", tmp_path / "runs")
+    repository = JobRepository(tmp_path / "paper2code.db")
+    worker = PipelineWorker(
+        repository=repository,
+        worker_id="missing-final-worker",
+        instance_token="missing-final-token",
+    )
+
+    class ExitedProcess:
+        @staticmethod
+        def poll() -> int:
+            return 0
+
+    _registered_managed_job(repository, worker, "missing_final", ExitedProcess())
+
+    try:
+        worker._monitor_managed()
+    finally:
+        worker.close()
+
+    job = repository.get_job("missing_final")
+    assert job["execution_status"] == "failed"
+    assert job["evaluation_status"] == "skipped"
+    assert job["quality_status"] == "skipped"
+    assert job["failure_code"] == "final_checkpoint_missing"
+
+
+def test_worker_syncs_repair_attempts_from_repair_checkpoints(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runs_dir = tmp_path / "runs"
+    monkeypatch.setattr(job_service, "RUNS_DIR", runs_dir)
+    repository = JobRepository(tmp_path / "paper2code.db")
+    worker = PipelineWorker(
+        repository=repository,
+        worker_id="repair-sync-worker",
+        instance_token="repair-sync-token",
+    )
+    job_id = "repair_sync"
+    _registered_managed_job(repository, worker, job_id, process=None)
+    run_dir = runs_dir / job_id
+    evaluation_result = _quality_result_for_worker(
+        scores=[2],
+        files_to_fix=["main.py"],
+        repair_round=0,
+        max_repair_rounds=2,
+    )
+    _write_completed_pipeline_boundaries(
+        run_dir,
+        job_id,
+        evaluation_result,
+        evaluation_resume_from_stage="repair",
+        include_terminal_boundary=False,
+    )
+
+    write_checkpoint(
+        run_dir,
+        running_checkpoint(
+            job_id=job_id,
+            stage_name="repair",
+            stage_sequence=7,
+            stage_attempt=1,
+            started_at="2026-07-22T00:00:07.000Z",
+        ),
+    )
+    try:
+        worker._sync_process_checkpoints(worker._managed[job_id])
+        assert repository.list_repair_attempts(job_id)[0]["status"] == "running"
+
+        status_payload = {
+            "status": "待测评",
+            "repair_round": 1,
+            "completed_repair_attempts": [
+                {
+                    "attempt": 1,
+                    "status": "completed",
+                    "result": "pending_evaluation",
+                    "reason": "quality_rejected",
+                    "files_to_fix": ["main.py"],
+                }
+            ],
+        }
+        (run_dir / "output" / "repo_status.json").write_text(
+            json.dumps(status_payload),
+            encoding="utf-8",
+        )
+        artifact_paths = [
+            path.relative_to(run_dir).as_posix()
+            for path in run_dir.rglob("*")
+            if path.is_file() and "checkpoints" not in path.parts
+        ]
+        write_checkpoint(
+            run_dir,
+            completed_checkpoint(
+                run_dir,
+                job_id=job_id,
+                stage_name="repair",
+                stage_sequence=7,
+                stage_attempt=1,
+                started_at="2026-07-22T00:00:07.000Z",
+                completed_at="2026-07-22T00:00:07.500Z",
+                artifact_paths=artifact_paths,
+                resume_from_stage="evaluation",
+            ),
+        )
+        worker._sync_process_checkpoints(worker._managed[job_id])
+    finally:
+        worker.close()
+
+    attempts = repository.list_repair_attempts(job_id)
+    assert [(item["attempt"], item["status"], item["files_to_fix"]) for item in attempts] == [
+        (1, "completed", ["main.py"])
+    ]
+    assert attempts[0]["result"] == "pending_evaluation"
 
 
 def test_worker_entrypoint_help_is_available() -> None:
@@ -969,7 +1260,7 @@ def test_queued_cancel_is_completed_without_launch(
 
 @pytest.mark.parametrize(
     ("exit_code", "expected_status", "expected_failure"),
-    [(0, "completed", None), (7, "failed", "pipeline_process_failed")],
+    [(0, "failed", "final_checkpoint_missing"), (7, "failed", "pipeline_process_failed")],
 )
 def test_natural_exit_wins_over_late_cancel_command(
     monkeypatch: pytest.MonkeyPatch,
@@ -1068,8 +1359,8 @@ def test_cancel_missing_result_polls_local_process_again_before_failing(
 
         job = repository.get_job("second_poll_race")
         command = repository.get_cancel_command("second_poll_race")
-        assert job["execution_status"] == "completed"
-        assert job["failure_code"] is None
+        assert job["execution_status"] == "failed"
+        assert job["failure_code"] == "final_checkpoint_missing"
         assert repository.get_process("second_poll_race")["exit_code"] == 0
         assert command["status"] == "failed"
         assert command["error_code"] == "already_finished"

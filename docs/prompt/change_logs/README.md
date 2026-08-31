@@ -144,3 +144,4 @@ change log 记录的是“系统行为发生了什么变化”，而不是单纯
 | 023 | [023_20260709_local-dev-cors-for-vite.md](023_20260709_local-dev-cors-for-vite.md) | Local dev CORS for Vite |
 | 024 | [024_20260709_vite-strict-dev-port.md](024_20260709_vite-strict-dev-port.md) | Vite strict dev port |
 | 025 | [025_20260806_explicit_provider_model_registry.md](025_20260806_explicit_provider_model_registry.md) | Explicit Provider/Model Registry |
+| 026 | [026_20260807_evaluation_contract_and_repair_policy.md](026_20260807_evaluation_contract_and_repair_policy.md) | Evaluation Contract and Repair Policy |

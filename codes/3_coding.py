@@ -16,20 +16,18 @@ from utils import (
     get_completion_message,
     load_paper_content,
     MAX_REPAIR_ROUNDS,
-    STATUS_EVAL_FAILED,
-    STATUS_EVAL_PASSED,
     STATUS_PENDING_EVAL,
     eval_feedback_path as default_eval_feedback_path,
     load_json_file,
     repo_status_path,
     write_repo_status,
 )
+from evaluation_contract import decide_repair_action, resolve_files_to_fix
 from task_manifest import (
     load_task_manifest,
     safe_join,
     safe_write_text,
     task_artifact_key,
-    validate_repair_paths,
     validate_task_path,
 )
 import argparse
@@ -100,23 +98,32 @@ if repair_from_eval:
         sys.exit(0)
     feedback_repair_round = int(repair_feedback.get("repair_round", 0) or 0)
     current_repair_round = max(current_repair_round, feedback_repair_round)
+    feedback_for_decision = {
+        **repair_feedback,
+        "repair_round": current_repair_round,
+        "max_repair_rounds": max_repair_rounds,
+    }
+    repair_decision = decide_repair_action(feedback_for_decision)
 
-    if current_repair_round >= max_repair_rounds:
+    if repair_decision["status"] == "skipped":
+        print(
+            "[INFO] Repair skipped: "
+            f"{repair_decision['reason']}."
+        )
+        sys.exit(0)
+    if repair_decision["status"] != "ready":
         raise RuntimeError(
-            f"Maximum repair rounds reached: {current_repair_round}/{max_repair_rounds}."
+            "Repair is not allowed by the evaluation contract: "
+            f"{repair_decision['reason']}."
         )
 
-    raw_repair_files = repair_feedback.get("files_to_repair")
-    if raw_repair_files is None:
-        raw_repair_files = []
-    repair_task_files = validate_repair_paths(raw_repair_files, task_manifest)
-    if not repair_task_files:
-        repair_task_files = tuple(
-            task
-            for task in task_manifest.files
-            if not task.relative_path.endswith((".yaml", ".yml"))
+    repair_files = set(
+        resolve_files_to_fix(
+            repair_decision["files_to_fix"],
+            task_manifest,
+            repo_root=output_repo_dir,
         )
-    repair_files = {task.relative_path for task in repair_task_files}
+    )
 
     print(
         f"[INFO] Repair mode enabled. Repair round "
@@ -486,6 +493,17 @@ for todo_idx, todo_file_name in enumerate(tqdm(todo_file_lst)):
 save_accumulated_cost(f"{output_dir}/accumulated_cost.json", total_accumulated_cost)
 
 new_repair_round = current_repair_round + 1 if repair_from_eval else current_repair_round
+completed_repair_attempts = list(repo_status.get("completed_repair_attempts") or [])
+if repair_from_eval:
+    completed_repair_attempts.append(
+        {
+            "attempt": new_repair_round,
+            "status": "completed",
+            "result": "pending_evaluation",
+            "reason": repair_decision["reason"],
+            "files_to_fix": sorted(repair_files),
+        }
+    )
 write_repo_status(
     output_dir,
     STATUS_PENDING_EVAL,
@@ -494,7 +512,12 @@ write_repo_status(
     eval_status_before_repair=repo_status.get("status"),
     repair_round=new_repair_round,
     max_repair_rounds=max_repair_rounds,
+    repair_status="completed" if repair_from_eval else "not_applicable",
+    repair_attempt=new_repair_round if repair_from_eval else 0,
+    repair_reason=repair_decision["reason"] if repair_from_eval else "",
     repaired_from_feedback=repair_from_eval,
     repaired_files=sorted(repair_files) if repair_from_eval else [],
+    files_to_fix=sorted(repair_files) if repair_from_eval else [],
+    completed_repair_attempts=completed_repair_attempts,
     feedback_file=eval_feedback_file if repair_from_eval else "",
 )

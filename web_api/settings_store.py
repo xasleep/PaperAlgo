@@ -27,13 +27,19 @@ def save_settings(settings: WebSettings) -> None:
 
 
 def load_settings() -> WebSettings | None:
-    if not SETTINGS_PATH.exists():
+    try:
+        if not SETTINGS_PATH.exists():
+            return None
+    except OSError:
         return None
     try:
         harden_local_storage(LOCAL_DIR, SETTINGS_PATH)
-    except LocalStorageSecurityError:
+    except (LocalStorageSecurityError, OSError):
         pass
-    data = read_json_file(SETTINGS_PATH, default={})
+    try:
+        data = read_json_file(SETTINGS_PATH, default={})
+    except OSError:
+        return None
     try:
         return WebSettings(**data)
     except (TypeError, ValidationError):

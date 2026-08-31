@@ -13,9 +13,9 @@ EXECUTION_TRANSITIONS = {
     "canceled": frozenset(),
 }
 EVALUATION_TRANSITIONS = {
-    "pending": frozenset({"running", "passed", "failed", "skipped"}),
-    "running": frozenset({"passed", "failed", "skipped"}),
-    "passed": frozenset(),
+    "pending": frozenset({"running", "completed", "failed", "skipped"}),
+    "running": frozenset({"completed", "failed", "skipped"}),
+    "completed": frozenset(),
     "failed": frozenset(),
     "skipped": frozenset(),
 }
@@ -50,8 +50,10 @@ def _validate_composite_state(state: JobState) -> None:
     elif execution == "completed":
         if evaluation in {"pending", "running"}:
             valid = quality == "pending"
-        elif evaluation in {"passed", "failed", "skipped"}:
+        elif evaluation == "completed":
             valid = quality in QUALITY_TRANSITIONS
+        elif evaluation in {"failed", "skipped"}:
+            valid = quality in {"pending", "skipped"}
 
     if not valid:
         raise InvalidStateTransitionError(

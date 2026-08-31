@@ -18,6 +18,7 @@ try:
         running_checkpoint,
         write_checkpoint,
     )
+    from evaluation_contract import decide_repair_action
     from provider_registry import REGISTRY_PATH_ENV, get_provider_registry
     from task_manifest import (
         load_task_manifest,
@@ -43,6 +44,7 @@ except ModuleNotFoundError:
         running_checkpoint,
         write_checkpoint,
     )
+    from codes.evaluation_contract import decide_repair_action
     from codes.provider_registry import REGISTRY_PATH_ENV, get_provider_registry
     from codes.task_manifest import (
         load_task_manifest,
@@ -1095,20 +1097,28 @@ def main(args):
                 )
                 repo_status = load_json_file(repo_status_path(output_dir), default={}) or {}
                 remember_fallback_eval_model(args, repo_status, status_path)
+                repair_decision = decide_repair_action(repo_status)
                 if repo_status.get("status") == STATUS_EVAL_PASSED:
                     evaluation_next["stage"] = "completed"
+                elif (
+                    repo_status.get("status") == STATUS_EVAL_FAILED
+                    and repair_decision["status"] == "ready"
+                ):
+                    evaluation_next["stage"] = "repair"
                 elif repo_status.get("status") == STATUS_EVAL_FAILED:
-                    repair_round = int(repo_status.get("repair_round", 0) or 0)
-                    if repair_round < args.max_repair_rounds:
-                        evaluation_next["stage"] = "repair"
-                    else:
-                        evaluation_limit_message["message"] = repair_limit_message(
-                            repair_round, args.max_repair_rounds
+                    evaluation_limit_message["message"] = (
+                        repair_limit_message(
+                            int(repo_status.get("repair_round", 0) or 0),
+                            args.max_repair_rounds,
                         )
+                        if repair_decision["reason"] == "repair_limit_reached"
+                        else f"Evaluation failed without an allowed repair: {repair_decision['reason']}."
+                    )
                 else:
                     raise RuntimeError(
-                        "Evaluation did not produce a recognized repository status. "
-                        f"Found: {repo_status.get('status')!r}"
+                        "Evaluation did not produce a repairable quality failure. "
+                        f"Reason: {repair_decision['reason']}. "
+                        f"Found status: {repo_status.get('status')!r}"
                     )
             last_stage_sequence = stage_sequence
             if evaluation_next["stage"] == "completed":
