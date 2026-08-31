@@ -545,6 +545,39 @@ def validate_evaluation_result(payload: Mapping[str, object]) -> dict[str, objec
             "evaluation_schema_invalid",
             "Assessed quality must include a numeric score.",
         )
+    if quality_status == "accepted" and quality_verdict != "passed":
+        raise _contract_error(
+            "evaluation_schema_invalid",
+            "Accepted quality must have a passed verdict.",
+        )
+    if quality_status == "rejected" and quality_verdict != "failed":
+        raise _contract_error(
+            "evaluation_schema_invalid",
+            "Rejected quality must have a failed verdict.",
+        )
+    if quality_verdict == "passed" and quality_status != "accepted":
+        raise _contract_error(
+            "evaluation_schema_invalid",
+            "Passed quality verdict must be accepted.",
+        )
+    if quality_verdict == "failed" and quality_status != "rejected":
+        raise _contract_error(
+            "evaluation_schema_invalid",
+            "Failed quality verdict must be rejected.",
+        )
+    if evaluation_status != "completed" and (
+        quality_status in {"accepted", "rejected"}
+        or quality_verdict != "not_assessed"
+    ):
+        raise _contract_error(
+            "evaluation_schema_invalid",
+            "Only completed evaluations can make a quality conclusion.",
+        )
+    if evaluation_status == "completed" and quality_verdict == "not_assessed":
+        raise _contract_error(
+            "evaluation_schema_invalid",
+            "Completed evaluations must make a quality conclusion.",
+        )
     errors = _require_mapping_list(payload["errors"], "errors")
     if evaluation_status == "failed" and not errors:
         raise _contract_error(
@@ -594,6 +627,15 @@ def validate_evaluation_result(payload: Mapping[str, object]) -> dict[str, objec
             "has_high_severity must be boolean.",
         )
     return dict(payload)
+
+
+def extract_evaluation_result(payload: Mapping[str, object]) -> dict[str, object]:
+    if not isinstance(payload, Mapping):
+        raise _contract_error("evaluation_schema_invalid", "Evaluation result must be an object.")
+    _assert_non_sensitive_mapping(payload)
+    return validate_evaluation_result(
+        {field: payload[field] for field in _RESULT_FIELDS if field in payload}
+    )
 
 
 def _legacy_decision(result: Mapping[str, object]) -> dict[str, object]:
@@ -667,6 +709,8 @@ def decide_repair_action(result: Mapping[str, object]) -> dict[str, object]:
         return {"status": "skipped", "reason": "no_files_to_fix", **base}
     if repair_round >= max_attempts:
         return {"status": "blocked", "reason": "repair_limit_reached", **base}
+    if validated["repair_status"] != "pending":
+        return {"status": "blocked", "reason": "repair_status_not_pending", **base}
 
     next_attempt = repair_round + 1
     for attempt in validated["completed_repair_attempts"]:
@@ -721,6 +765,8 @@ def classify_evaluation_exception(error: BaseException) -> dict[str, str]:
     error_code = getattr(error, "code", "")
     if isinstance(error, TimeoutError):
         code = "evaluator_timeout"
+    elif error_code == "malformed_evaluator_response":
+        code = "malformed_evaluator_response"
     elif error.__class__.__name__ in {
         "TaskManifestError",
         "InvalidTaskPathError",

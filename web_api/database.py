@@ -565,6 +565,13 @@ def _ensure_schema_migrations_table(connection: sqlite3.Connection) -> None:
         connection.execute(SCHEMA_MIGRATIONS_SQL)
 
 
+def _applied_migration_versions(connection: sqlite3.Connection) -> set[int]:
+    return {
+        row["version"]
+        for row in connection.execute("SELECT version FROM schema_migrations")
+    }
+
+
 def initialize_database(path: Path | str | None = None) -> Path:
     database_path = normalize_database_path(path)
     with _initialization_lock(database_path):
@@ -578,27 +585,17 @@ def initialize_database(path: Path | str | None = None) -> Path:
                 _remove_new_database_files(database_path)
             raise
         try:
-            existing_migrations = connection.execute(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
-                ("schema_migrations",),
-            ).fetchone()
-            applied = set()
-            if existing_migrations is not None:
-                applied = {
-                    row["version"]
-                    for row in connection.execute(
-                        "SELECT version FROM schema_migrations"
-                    )
-                }
             for version, statements in MIGRATIONS:
-                if version in applied:
-                    continue
                 rebuilds_jobs_table = version == 7
                 if rebuilds_jobs_table:
                     connection.execute("PRAGMA foreign_keys = OFF")
                 connection.execute("BEGIN IMMEDIATE")
                 try:
                     _ensure_schema_migrations_table(connection)
+                    applied = _applied_migration_versions(connection)
+                    if version in applied:
+                        connection.commit()
+                        continue
                     for statement in statements:
                         connection.execute(statement)
                     connection.execute(
@@ -606,7 +603,6 @@ def initialize_database(path: Path | str | None = None) -> Path:
                         (version, utc_now()),
                     )
                     connection.commit()
-                    applied.add(version)
                 except Exception:
                     connection.rollback()
                     raise

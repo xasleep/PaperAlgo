@@ -20,6 +20,12 @@ STATUS_EVAL_ERROR = "测评协议失败"
 MAX_REPAIR_ROUNDS = 3
 
 
+class MalformedEvaluatorResponseError(ValueError):
+    """Evaluator response shape was invalid after JSON parsing."""
+
+    code = "malformed_evaluator_response"
+
+
 def repo_status_path(output_dir):
     return os.path.join(output_dir, "repo_status.json")
 
@@ -60,6 +66,29 @@ def save_json_file(path, data):
             pass
 
 
+def _validate_finding_items(value):
+    items = value if isinstance(value, list) else [value]
+    normalized = []
+    for item in items:
+        if not isinstance(item, Mapping):
+            raise MalformedEvaluatorResponseError(
+                "Evaluator findings must be objects."
+            )
+        for field in ("file_name", "func_name", "severity_level"):
+            field_value = item.get(field)
+            if field_value is not None and not isinstance(field_value, str):
+                raise MalformedEvaluatorResponseError(
+                    "Evaluator finding fields must be text."
+                )
+        critique = item.get("critique")
+        if not isinstance(critique, str) or not critique.strip():
+            raise MalformedEvaluatorResponseError(
+                "Evaluator finding critique must be non-empty text."
+            )
+        normalized.append(item)
+    return normalized
+
+
 def write_repo_status(output_dir, status, **kwargs):
     status_data = {
         "status": status,
@@ -72,23 +101,23 @@ def write_repo_status(output_dir, status, **kwargs):
 
 def parse_eval_rationale(rationale):
     if isinstance(rationale, list):
-        return rationale
+        return _validate_finding_items(rationale)
     if isinstance(rationale, dict):
-        return [rationale]
+        return _validate_finding_items(rationale)
     if not isinstance(rationale, str):
-        return []
+        raise MalformedEvaluatorResponseError("Evaluator rationale must be text.")
 
     text = rationale.strip()
     if not text:
         return []
     try:
         parsed = json.loads(text)
-        if isinstance(parsed, list):
-            return parsed
-        if isinstance(parsed, dict):
-            return [parsed]
-    except Exception:
-        pass
+    except json.JSONDecodeError:
+        parsed = None
+    if isinstance(parsed, list):
+        return _validate_finding_items(parsed)
+    if isinstance(parsed, dict):
+        return _validate_finding_items(parsed)
 
     return [{"file_name": "repository", "severity_level": "unknown", "critique": text}]
 
@@ -104,6 +133,10 @@ def summarize_eval_feedback(rationales):
 
     for rationale in rationales:
         for item in parse_eval_rationale(rationale):
+            if not isinstance(item, Mapping):
+                raise MalformedEvaluatorResponseError(
+                    "Evaluator findings must be objects."
+                )
             file_name = str(item.get("file_name") or "repository")
             func_name = str(item.get("func_name") or "")
             severity = normalize_severity(item.get("severity_level"))

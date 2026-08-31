@@ -6,6 +6,7 @@ from evaluation_contract import (
     build_evaluation_error_result,
     build_quality_result,
     classify_evaluation_exception,
+    has_quorum,
     legacy_status_from_result,
     resolve_files_to_fix,
 )
@@ -21,6 +22,7 @@ from utils import (
     make_openai_client,
     load_paper_content,
     MAX_REPAIR_ROUNDS,
+    MalformedEvaluatorResponseError,
     eval_feedback_path,
     load_json_file,
     repo_status_path,
@@ -65,6 +67,42 @@ class EvaluationProviderUsageError(RuntimeError):
         )
         self.provider_id = provider_id
         self.model_id = model_id
+
+
+def parse_evaluator_output(output, *, score_key="score", rationale_key="critique_list"):
+    try:
+        output_json = json.loads(output)
+    except json.JSONDecodeError:
+        try:
+            output_json = json.loads(extract_json_from_string(output))
+        except Exception as exc:
+            raise MalformedEvaluatorResponseError(
+                "Evaluator response was not valid JSON."
+            ) from exc
+
+    if not isinstance(output_json, Mapping):
+        raise MalformedEvaluatorResponseError("Evaluator response must be an object.")
+    if score_key not in output_json or rationale_key not in output_json:
+        raise MalformedEvaluatorResponseError(
+            "Evaluator response is missing required fields."
+        )
+    raw_score = output_json[score_key]
+    if isinstance(raw_score, bool) or not isinstance(raw_score, (int, float)):
+        raise MalformedEvaluatorResponseError("Evaluator score must be numeric.")
+    score = int(raw_score)
+    if score != raw_score:
+        raise MalformedEvaluatorResponseError("Evaluator score must be an integer.")
+
+    rationale_value = output_json[rationale_key]
+    if isinstance(rationale_value, str):
+        rationale = rationale_value
+    elif isinstance(rationale_value, (list, dict)):
+        rationale = json.dumps(rationale_value, ensure_ascii=False)
+    else:
+        raise MalformedEvaluatorResponseError(
+            "Evaluator critique_list must be text, an object, or a list."
+        )
+    return score, rationale
 
 
 def api_call(request_json):
@@ -588,38 +626,28 @@ def main(args):
 
     all_scores = []
     rationales = []
+    malformed_response_seen = False
 
     for n in range(generated_n):
         choice = completion_json["choices"][n]
         output = choice["message"]["content"].strip()
 
         try:
-            output_json2 = json.loads(output)
-            score = int(output_json2[score_key])
-
-            if isinstance(output_json2[rationale_key], str):
-                rationale = output_json2[rationale_key]
-            else:
-                rationale = json.dumps(output_json2[rationale_key], ensure_ascii=False)
-
-        except Exception:
-            try:
-                output_json2 = json.loads(extract_json_from_string(output))
-                score = int(output_json2[score_key])
-
-                if isinstance(output_json2[rationale_key], str):
-                    rationale = output_json2[rationale_key]
-                else:
-                    rationale = json.dumps(output_json2[rationale_key], ensure_ascii=False)
-
-            except Exception as e2:
-                print("[WARNING] Invalid response: parsing error")
-                print(e2)
-                print("-" * 40)
-                continue
+            score, rationale = parse_evaluator_output(
+                output,
+                score_key=score_key,
+                rationale_key=rationale_key,
+            )
+        except MalformedEvaluatorResponseError as exc:
+            malformed_response_seen = True
+            print("[WARNING] Invalid response: malformed evaluator response")
+            print(exc)
+            print("-" * 40)
+            continue
 
         # score
         if score < 1 or score > 5:
+            malformed_response_seen = True
             print(
                 f"[WARNING] Invalid response: score {score}, "
                 f"Score must be in the range of 1–5."
@@ -629,8 +657,15 @@ def main(args):
         all_scores.append(int(score))
         rationales.append(rationale)
 
-    feedback = summarize_eval_feedback(rationales)
     try:
+        if malformed_response_seen and not has_quorum(
+            valid_n=len(all_scores),
+            generated_n=generated_n,
+        ):
+            raise MalformedEvaluatorResponseError(
+                "Evaluator responses did not provide enough valid structured results."
+            )
+        feedback = summarize_eval_feedback(rationales)
         if task_manifest is None and feedback["files_to_repair"]:
             raise TaskManifestError(
                 "Evaluator selected repair files without a TaskManifest boundary."

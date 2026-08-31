@@ -156,6 +156,77 @@ def test_quality_result_schema_accepts_explicit_completed_quality_failure() -> N
     assert decide_repair_action(result)["status"] == "ready"
 
 
+@pytest.mark.parametrize(
+    "mutations",
+    [
+        {"evaluation_status": "pending"},
+        {"evaluation_status": "skipped"},
+        {
+            "quality_status": "rejected",
+            "quality_verdict": "passed",
+            "repair_status": "not_applicable",
+        },
+        {
+            "quality_status": "accepted",
+            "quality_verdict": "failed",
+            "repair_status": "pending",
+        },
+        {
+            "evaluation_status": "failed",
+            "quality_status": "accepted",
+            "quality_verdict": "passed",
+            "repair_status": "not_applicable",
+            "errors": [{"code": "evaluator_unavailable", "message": "sanitized"}],
+        },
+    ],
+)
+def test_contract_rejects_illegal_status_quality_combinations(
+    mutations: dict[str, object],
+) -> None:
+    from codes.evaluation_contract import EvaluationContractError, validate_evaluation_result
+
+    result = _quality_result(
+        scores=[2, 3, 3],
+        findings=[
+            {
+                "file_name": "main.py",
+                "severity_level": "medium",
+                "critique": "missing a required experiment",
+            }
+        ],
+        files_to_fix=["main.py"],
+    )
+    result.update(mutations)
+
+    with pytest.raises(EvaluationContractError):
+        validate_evaluation_result(result)
+
+
+def test_repair_action_ready_requires_pending_repair_status() -> None:
+    from codes.evaluation_contract import decide_repair_action
+
+    result = _quality_result(
+        scores=[2, 3, 3],
+        findings=[
+            {
+                "file_name": "main.py",
+                "severity_level": "medium",
+                "critique": "missing a required experiment",
+            }
+        ],
+        files_to_fix=["main.py"],
+    )
+    result["repair_status"] = "blocked"
+
+    assert decide_repair_action(result) == {
+        "status": "blocked",
+        "reason": "repair_status_not_pending",
+        "attempt": 0,
+        "max_attempts": 2,
+        "files_to_fix": ["main.py"],
+    }
+
+
 def test_schema_rejects_unknown_fields_raw_payloads_and_leaky_errors() -> None:
     from codes.evaluation_contract import (
         EvaluationContractError,
@@ -453,6 +524,140 @@ def test_eval_fallback_exhaustion_is_deterministic_and_sanitized(monkeypatch) ->
     assert classified["error_code"] == "evaluator_unavailable"
     assert "sk-SECRET" not in classified["message"]
     assert "prompt must not persist" not in json.dumps(classified)
+
+
+def _run_eval_entry_with_response(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    response_payload: dict[str, object],
+) -> tuple[dict[str, object], dict[str, object], dict[str, object]]:
+    eval_module = _load_code_module(
+        f"eval_malformed_entry_{abs(hash(json.dumps(response_payload, sort_keys=True)))}",
+        "eval.py",
+    )
+    data_dir = tmp_path / "data"
+    prompts_dir = data_dir / "prompts"
+    prompts_dir.mkdir(parents=True)
+    (prompts_dir / "ref_free.txt").write_text(
+        "Evaluate {{Paper}} against {{Code}}.",
+        encoding="utf-8",
+    )
+    markdown = tmp_path / "paper.md"
+    markdown.write_text("# paper\n", encoding="utf-8")
+    output_dir = tmp_path / "output"
+    target_repo_dir = tmp_path / "repo"
+    eval_result_dir = tmp_path / "results"
+    target_repo_dir.mkdir()
+    (target_repo_dir / "main.py").write_text("print('ok')\n", encoding="utf-8")
+
+    monkeypatch.setattr(eval_module, "num_tokens_from_messages", lambda messages: 1)
+
+    def fake_completion_with_fallback(*args: object, **kwargs: object):
+        del args, kwargs
+        completion_json = {
+            "model": "fake-primary",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": json.dumps(response_payload, ensure_ascii=False),
+                    },
+                }
+            ],
+            "usage": None,
+        }
+        return {}, completion_json, 1, "fake-primary", {}
+
+    monkeypatch.setattr(
+        eval_module,
+        "run_completion_requests_with_fallback",
+        fake_completion_with_fallback,
+    )
+
+    args = SimpleNamespace(
+        paper_name="paper",
+        paper_format="Markdown",
+        domain="statistics",
+        pdf_json_path=None,
+        pdf_latex_path=None,
+        pdf_markdown_path=str(markdown),
+        output_dir=str(output_dir),
+        target_repo_dir=str(target_repo_dir),
+        eval_result_dir=str(eval_result_dir),
+        gpt_version="fake-primary",
+        provider="fake",
+        fallback_gpt_versions=[],
+        generated_n=1,
+        max_repair_rounds=1,
+        data_dir=str(data_dir),
+        eval_type="ref_free",
+        papercoder=False,
+        gold_repo_dir="",
+        selected_file_path="",
+    )
+
+    monkeypatch.setattr(eval_module, "default_fallback_models", lambda *args: [])
+    eval_module.main(args)
+
+    feedback = json.loads((output_dir / "eval_feedback.json").read_text(encoding="utf-8"))
+    status = json.loads((output_dir / "repo_status.json").read_text(encoding="utf-8"))
+    result_path = Path(str(feedback["eval_result_file"]))
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    return feedback, status, result
+
+
+@pytest.mark.parametrize(
+    "response_payload",
+    [
+        {"score": 2, "critique_list": ["bad UNIQUE-EVAL-SECRET"]},
+        {"score": 2},
+        {
+            "score": 2,
+            "critique_list": [
+                {
+                    "file_name": "main.py",
+                    "severity_level": ["high"],
+                    "critique": "bad",
+                }
+            ],
+        },
+        {
+            "score": 2,
+            "critique_list": [
+                {
+                    "file_name": "main.py",
+                    "severity_level": "high",
+                    "critique": "bad",
+                },
+                "mixed",
+            ],
+        },
+    ],
+)
+def test_malformed_evaluator_feedback_is_persisted_as_structured_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    response_payload: dict[str, object],
+) -> None:
+    feedback, status, result = _run_eval_entry_with_response(
+        tmp_path,
+        monkeypatch,
+        response_payload,
+    )
+
+    for payload in (feedback, status, result):
+        assert payload["evaluation_status"] == "failed"
+        assert payload["quality_status"] == "skipped"
+        assert payload["quality_verdict"] == "not_assessed"
+        assert payload["repair_status"] == "blocked"
+        assert payload["errors"][0]["code"] == "malformed_evaluator_response"
+        assert payload["files_to_fix"] == []
+    assert feedback["files_to_repair"] == []
+    assert feedback["passed"] is False
+    serialized = json.dumps([feedback, status, result], ensure_ascii=False)
+    assert "UNIQUE-EVAL-SECRET" not in serialized
+    assert "Evaluate {{Paper}}" not in serialized
 
 
 def test_sqlite_state_machine_separates_evaluation_and_quality_statuses(

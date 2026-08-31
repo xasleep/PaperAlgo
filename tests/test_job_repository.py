@@ -1,4 +1,8 @@
+import os
 import sqlite3
+import subprocess
+import sys
+import textwrap
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
@@ -137,6 +141,163 @@ def test_concurrent_first_initialization_is_serialized(tmp_path: Path) -> None:
         "job_processes",
         "job_process_history",
     }.issubset(tables)
+
+
+def test_cross_process_initialization_rereads_migrations_after_write_lock(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "cross-process" / "paper2code.db"
+    current_migrations = database_module.MIGRATIONS
+    monkeypatch.setattr(database_module, "MIGRATIONS", current_migrations[:6])
+    initialize_database(db_path)
+    with closing(connect_database(db_path)) as connection:
+        with connection:
+            connection.execute(
+                """
+                INSERT INTO jobs (
+                    job_id, request_hash, paper_name, upload_id, domain, eval_type,
+                    generated_n, auto_refine, max_repair_rounds, console_output,
+                    skip_mineru, pdf_markdown_path, execution_status,
+                    evaluation_status, quality_status, version, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "legacy_quality_failed",
+                    "0" * 64,
+                    "paper",
+                    "0" * 32,
+                    "statistics",
+                    "ref_free",
+                    1,
+                    1,
+                    2,
+                    "quiet",
+                    0,
+                    "",
+                    "completed",
+                    "failed",
+                    "pending",
+                    3,
+                    "2026-01-01T00:00:00.000Z",
+                    "2026-01-01T00:00:00.000Z",
+                ),
+            )
+
+    child_code = textwrap.dedent(
+        """
+        import os
+        import sys
+        import time
+        from pathlib import Path
+
+        from web_api import database as database_module
+
+        db_path = Path(sys.argv[1])
+        sync_dir = Path(sys.argv[2])
+        worker_index = sys.argv[3]
+        original_connect = database_module.connect_database
+
+        class CursorProxy:
+            def __init__(self, rows):
+                self._rows = list(rows)
+
+            def __iter__(self):
+                return iter(self._rows)
+
+            def fetchone(self):
+                return self._rows[0] if self._rows else None
+
+            def fetchall(self):
+                return list(self._rows)
+
+        class SyncConnection:
+            def __init__(self, connection):
+                self._connection = connection
+                self._saw_begin = False
+
+            def execute(self, statement, parameters=()):
+                normalized = " ".join(str(statement).split()).upper()
+                if normalized.startswith("BEGIN IMMEDIATE"):
+                    self._saw_begin = True
+                cursor = self._connection.execute(statement, parameters)
+                if (
+                    "SELECT VERSION FROM SCHEMA_MIGRATIONS" in normalized
+                    and not self._saw_begin
+                ):
+                    rows = cursor.fetchall()
+                    sync_dir.mkdir(parents=True, exist_ok=True)
+                    (sync_dir / f"ready-{worker_index}").write_text(
+                        "1", encoding="utf-8"
+                    )
+                    deadline = time.monotonic() + 10
+                    while len(list(sync_dir.glob("ready-*"))) < 2:
+                        if time.monotonic() > deadline:
+                            raise TimeoutError("migration synchronization timed out")
+                        time.sleep(0.02)
+                    return CursorProxy(rows)
+                return cursor
+
+            def __getattr__(self, name):
+                return getattr(self._connection, name)
+
+        def connect_with_sync(path=None):
+            return SyncConnection(original_connect(path))
+
+        database_module.connect_database = connect_with_sync
+        database_module.initialize_database(db_path)
+        """
+    )
+    sync_dir = tmp_path / "migration-sync"
+    env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1])}
+    processes = [
+        subprocess.Popen(
+            [sys.executable, "-c", child_code, str(db_path), str(sync_dir), str(index)],
+            cwd=Path(__file__).resolve().parents[1],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for index in range(2)
+    ]
+    results = [process.communicate(timeout=30) for process in processes]
+
+    for index, process in enumerate(processes):
+        assert process.returncode == 0, (
+            f"child {index} failed\nSTDOUT:\n{results[index][0]}\n"
+            f"STDERR:\n{results[index][1]}"
+        )
+
+    with closing(connect_database(db_path)) as connection:
+        versions = connection.execute(
+            "SELECT version, COUNT(*) AS count "
+            "FROM schema_migrations GROUP BY version ORDER BY version"
+        ).fetchall()
+        legacy = connection.execute(
+            "SELECT execution_status, evaluation_status, quality_status "
+            "FROM jobs WHERE job_id = 'legacy_quality_failed'"
+        ).fetchone()
+        indexes = {
+            row["name"]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'"
+            )
+        }
+        foreign_keys = connection.execute("PRAGMA foreign_keys").fetchone()[0]
+
+    assert [(row["version"], row["count"]) for row in versions] == [
+        (1, 1),
+        (2, 1),
+        (3, 1),
+        (4, 1),
+        (5, 1),
+        (6, 1),
+        (7, 1),
+    ]
+    assert tuple(legacy) == ("completed", "completed", "rejected")
+    assert "jobs_updated_at_idx" in indexes
+    assert foreign_keys == 1
 
 
 def test_failed_migration_rolls_back_schema_and_can_be_retried(
@@ -909,6 +1070,131 @@ def test_stage_checkpoint_transitions_are_atomic_idempotent_and_fenced(
         ]
     assert event_types.count("job.stage_running") == 1
     assert event_types.count("job.stage_completed") == 1
+
+
+def test_repair_attempts_are_persisted_idempotent_and_restart_readable(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "paper2code.db"
+    repository = JobRepository(db_path)
+    repository.create_job(
+        job_id="repair_history",
+        request=_request(max_repair_rounds=3),
+        paper_name="paper",
+    )
+    assert repository.acquire_worker_lease("worker", "token") is True
+    repository.claim_next_queued_job(
+        worker_id="worker",
+        instance_token="token",
+        launch_token="launch-token",
+    )
+    repository.record_process_started(
+        "repair_history",
+        worker_id="worker",
+        instance_token="token",
+        launch_token="launch-token",
+        pid=1234,
+        process_create_time="create-1234",
+        process_group_id=1234,
+        command_summary="python fake.py --job-id repair_history",
+    )
+
+    started = repository.start_repair_attempt(
+        "repair_history",
+        worker_id="worker",
+        instance_token="token",
+        launch_token="launch-token",
+        attempt=1,
+        reason="quality_rejected",
+        files_to_fix=["main.py"],
+    )
+    repeated_start = repository.start_repair_attempt(
+        "repair_history",
+        worker_id="worker",
+        instance_token="token",
+        launch_token="launch-token",
+        attempt=1,
+        reason="quality_rejected",
+        files_to_fix=["main.py"],
+    )
+    completed = repository.complete_repair_attempt(
+        "repair_history",
+        worker_id="worker",
+        instance_token="token",
+        launch_token="launch-token",
+        attempt=1,
+        result="pending_evaluation",
+        files_to_fix=["main.py"],
+    )
+    repeated_completed = repository.complete_repair_attempt(
+        "repair_history",
+        worker_id="worker",
+        instance_token="token",
+        launch_token="launch-token",
+        attempt=1,
+        result="pending_evaluation",
+        files_to_fix=["main.py"],
+    )
+    repository.start_repair_attempt(
+        "repair_history",
+        worker_id="worker",
+        instance_token="token",
+        launch_token="launch-token",
+        attempt=2,
+        reason="quality_rejected",
+        files_to_fix=["main.py"],
+    )
+    failed = repository.fail_repair_attempt(
+        "repair_history",
+        worker_id="worker",
+        instance_token="token",
+        launch_token="launch-token",
+        attempt=2,
+        reason="stage_execution_failed",
+        result="repair_failed",
+        files_to_fix=["main.py"],
+    )
+    skipped = repository.skip_repair_attempt(
+        "repair_history",
+        worker_id="worker",
+        instance_token="token",
+        launch_token="launch-token",
+        attempt=3,
+        reason="no_files_to_fix",
+        files_to_fix=[],
+    )
+
+    restarted = JobRepository(db_path)
+    attempts = restarted.list_repair_attempts("repair_history")
+
+    assert repeated_start["id"] == started["id"]
+    assert completed["id"] == started["id"]
+    assert repeated_completed == completed
+    assert [(item["attempt"], item["status"], item["files_to_fix"]) for item in attempts] == [
+        (1, "completed", ["main.py"]),
+        (2, "failed", ["main.py"]),
+        (3, "skipped", []),
+    ]
+    assert attempts[0]["result"] == "pending_evaluation"
+    assert failed["reason"] == "stage_execution_failed"
+    assert skipped["reason"] == "no_files_to_fix"
+    with closing(connect_database(db_path)) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM repair_attempts WHERE job_id = ?",
+            ("repair_history",),
+        ).fetchone()[0] == 3
+
+    replay = restarted.start_repair_attempt(
+        "repair_history",
+        worker_id="worker",
+        instance_token="token",
+        launch_token="launch-token",
+        attempt=1,
+        reason="quality_rejected",
+        files_to_fix=["main.py"],
+    )
+    assert replay["status"] == "completed"
+    assert restarted.list_repair_attempts("repair_history") == attempts
 
 
 def test_claim_registration_and_unresolved_launch_state_transitions(
