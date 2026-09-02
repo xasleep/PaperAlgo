@@ -128,8 +128,9 @@ async def iter_job_event_stream(
         if not follow:
             return
         now = time.monotonic()
+        if now < next_heartbeat:
+            await asyncio.sleep(max(0.001, min(poll_seconds, next_heartbeat - now)))
+            now = time.monotonic()
         if now >= next_heartbeat:
             yield ": heartbeat\n\n"
             next_heartbeat = now + heartbeat_seconds
-            continue
-        await asyncio.sleep(max(0.001, min(poll_seconds, next_heartbeat - now)))
