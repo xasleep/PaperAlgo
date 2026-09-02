@@ -73,6 +73,7 @@ SYSTEM_ENV_ALLOWLIST = {
     "LANG",
     "LOCALAPPDATA",
     "NUMBER_OF_PROCESSORS",
+    "PAPER2CODE_COST_LEDGER_DB_PATH",
     "PAPER2CODE_PROVIDER_REGISTRY_PATH",
     "PATH",
     "PATHEXT",
@@ -200,6 +201,19 @@ class PipelineCheckpointAdapter:
         if self.resume_sequence == stage_sequence and self.resume_attempt:
             return self.resume_attempt
         return 1
+
+    def cost_context(self, stage_name, stage_sequence, *, repair_attempt=None):
+        if not self.enabled:
+            return {}
+        context = {
+            "PAPER2CODE_COST_JOB_ID": self.job_id,
+            "PAPER2CODE_COST_STAGE": stage_name,
+            "PAPER2CODE_COST_STAGE_ATTEMPT": str(self.attempt_for(stage_sequence)),
+            "PAPER2CODE_COST_RECOVERY_ATTEMPT": str(self.recovery_count),
+        }
+        if repair_attempt is not None:
+            context["PAPER2CODE_COST_REPAIR_ATTEMPT"] = str(repair_attempt)
+        return context
 
     @contextmanager
     def stage(
@@ -390,9 +404,22 @@ def should_echo_line(line, console_output):
     return any(fragment in stripped for fragment in progress_fragments)
 
 
-def run_command(label, cmd, cwd, log_path, status_path, env=None, console_output="progress"):
+def run_command(
+    label,
+    cmd,
+    cwd,
+    log_path,
+    status_path,
+    env=None,
+    console_output="progress",
+    cost_context=None,
+):
     if env is None:
         env = build_clean_env()
+    else:
+        env = dict(env)
+    if cost_context:
+        env.update(cost_context)
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"
 
@@ -905,6 +932,7 @@ def main(args):
                 status_path,
                 env=reproduce_env,
                 console_output=args.console_output,
+                cost_context=checkpoint_adapter.cost_context("planning", 2),
             )
             load_task_manifest(output_dir)
     else:
@@ -967,6 +995,7 @@ def main(args):
                 status_path,
                 env=reproduce_env,
                 console_output=args.console_output,
+                cost_context=checkpoint_adapter.cost_context("analyzing", 4),
             )
 
     planning_config_file = validate_task_path("planning_config.yaml")
@@ -1014,6 +1043,7 @@ def main(args):
                 status_path,
                 env=reproduce_env,
                 console_output=args.console_output,
+                cost_context=checkpoint_adapter.cost_context("coding", 5),
             )
 
     if checkpoint_adapter.enabled and checkpoint_adapter.resume_sequence > 6:
@@ -1062,6 +1092,11 @@ def main(args):
                         status_path,
                         env=reproduce_env,
                         console_output=args.console_output,
+                        cost_context=checkpoint_adapter.cost_context(
+                            "repair",
+                            stage_sequence,
+                            repair_attempt=repair_round,
+                        ),
                     )
                 last_stage_sequence = stage_sequence
                 stage_sequence += 1
@@ -1094,6 +1129,10 @@ def main(args):
                     status_path,
                     env=eval_env,
                     console_output=args.console_output,
+                    cost_context=checkpoint_adapter.cost_context(
+                        "evaluation",
+                        stage_sequence,
+                    ),
                 )
                 repo_status = load_json_file(repo_status_path(output_dir), default={}) or {}
                 remember_fallback_eval_model(args, repo_status, status_path)
@@ -1162,6 +1201,10 @@ def main(args):
                 status_path,
                 env=eval_env,
                 console_output=args.console_output,
+                cost_context=checkpoint_adapter.cost_context(
+                    "evaluation",
+                    stage_sequence,
+                ),
             )
             repo_status = load_json_file(repo_status_path(output_dir), default={}) or {}
             remember_fallback_eval_model(args, repo_status, status_path)

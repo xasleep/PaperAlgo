@@ -7,6 +7,7 @@ ProviderName = str
 DomainName = Literal["general", "statistics"]
 EvalType = Literal["ref_free", "ref_based"]
 ConsoleOutput = Literal["progress", "full", "quiet"]
+CostBudgetPolicy = Literal["none", "hard"]
 
 
 class ProviderSettings(BaseModel):
@@ -83,6 +84,9 @@ class JobCreateRequest(BaseModel):
     console_output: ConsoleOutput = "quiet"
     skip_mineru: bool = False
     pdf_markdown_path: str = ""
+    cost_budget_policy: CostBudgetPolicy = "none"
+    cost_budget_currency: str | None = Field(default=None, max_length=16)
+    cost_budget_amount: str | None = Field(default=None, max_length=64)
 
 
 class ErrorBody(BaseModel):
@@ -93,6 +97,18 @@ class ErrorBody(BaseModel):
 
 class ErrorResponse(BaseModel):
     error: ErrorBody
+
+
+class CostSummary(BaseModel):
+    attempt_count: int = 0
+    status_counts: dict[str, int] = Field(default_factory=dict)
+    actual_by_currency: dict[str, str] = Field(default_factory=dict)
+    estimated_by_currency: dict[str, str] = Field(default_factory=dict)
+    reserved_by_currency: dict[str, str] = Field(default_factory=dict)
+    unknown_attempts: int = 0
+    budget_policy: CostBudgetPolicy = "none"
+    budget_currency: str | None = None
+    budget_amount: str | None = None
 
 
 class JobCreateResponse(BaseModel):
@@ -113,6 +129,10 @@ class JobCreateResponse(BaseModel):
     evaluation_fallback_models: list[str] | None = None
     provider_registry_version: int | None = None
     provider_contract_fingerprint: str | None = None
+    cost_budget_policy: CostBudgetPolicy | None = None
+    cost_budget_currency: str | None = None
+    cost_budget_amount: str | None = None
+    cost_summary: CostSummary | None = None
 
 
 class CancelResponse(BaseModel):
@@ -160,6 +180,10 @@ class JobListItem(BaseModel):
     evaluation_fallback_models: list[str] | None = None
     provider_registry_version: int | None = None
     provider_contract_fingerprint: str | None = None
+    cost_budget_policy: CostBudgetPolicy | None = None
+    cost_budget_currency: str | None = None
+    cost_budget_amount: str | None = None
+    cost_summary: CostSummary | None = None
 
 
 class JobListResponse(BaseModel):

@@ -8,9 +8,11 @@
 
 当前提供标准库 SQLite 持久化控制面，但默认 `JOB_RUNTIME=legacy` 仍保持既有子进程行为；`JOB_RUNTIME=sqlite` 由 `python -m web_api.worker` 启动独立单并发 Worker，并提供 PID/create-time 进程级 reconciliation、固定阶段 checkpoint 与默认最多 1 次的受限恢复。checkpoint adapter 只由 SQLite Worker 启用，legacy runtime 不获得阶段恢复。当前没有任意语句级 checkpoint、exactly-once、SSE、WebSocket、Celery、Redis、PostgreSQL、Kubernetes 或 LangGraph。WebUI 对活跃任务每 2 秒轮询，FastAPI 只支持单实例。
 
-PR-05 的 Provider Registry v1 是封闭且深度不可变的显式契约；未知 schema 字段、非法 request options、非有限/越界数字和不可信 fallback 直接以脱敏错误拒绝。`GET /api/v1/providers` 从当前 Registry 动态生成 WebUI 可选项，只返回非敏感 ID/能力并使用 `no-store`；`settings/status` 仍只返回布尔状态。SQLite queued job 固定 Provider/Model/fallback、Registry version 和 Contract SHA-256，不保存 key 或 base URL。Worker 只允许同一选择下轮换凭据，不匹配或缺少快照时在 `Popen` 前以 `provider_settings_changed` fail closed；legacy runtime 不变。API key 仍是本地明文 settings 与临时子进程环境数据，不是加密存储。PR-06 cost ledger 和 PR-07 SSE 尚未实现。
+PR-05 的 Provider Registry v1 是封闭且深度不可变的显式契约；未知 schema 字段、非法 request options、非有限/越界数字和不可信 fallback 直接以脱敏错误拒绝。`GET /api/v1/providers` 从当前 Registry 动态生成 WebUI 可选项，只返回非敏感 ID/能力并使用 `no-store`；`settings/status` 仍只返回布尔状态。SQLite queued job 固定 Provider/Model/fallback、Registry version 和 Contract SHA-256，不保存 key 或 base URL。Worker 只允许同一选择下轮换凭据，不匹配或缺少快照时在 `Popen` 前以 `provider_settings_changed` fail closed；legacy runtime 不变。API key 仍是本地明文 settings 与临时子进程环境数据，不是加密存储。PR-06B 已实现 SQLite append-only remote-call cost ledger 和 hard budget 预调用 enforcement；PR-07 SSE 尚未实现。
 
-PR-06A 的 Evaluation Contract 将 execution、evaluation、quality verdict 和 repair policy 分离。Evaluator timeout、Provider protocol error、malformed response、unavailable 和 quorum 不足不会被写成质量不合格；只有 evaluator completed 且 quality rejected 才能触发 repair。`files_to_fix=[]` 表示不修改任何文件，非空 repair 目标必须重新通过 TaskManifest 和 repo 路径验证。Evaluation result、feedback、repo status、SQLite events 和 summaries 不保存 prompt、完整模型响应或凭据。Cost ledger、预算 enforcement、SSE 和 WebUI 实时控制仍未实现。
+PR-06A 的 Evaluation Contract 将 execution、evaluation、quality verdict 和 repair policy 分离。Evaluator timeout、Provider protocol error、malformed response、unavailable 和 quorum 不足不会被写成质量不合格；只有 evaluator completed 且 quality rejected 才能触发 repair。`files_to_fix=[]` 表示不修改任何文件，非空 repair 目标必须重新通过 TaskManifest 和 repo 路径验证。Evaluation result、feedback、repo status、SQLite events 和 summaries 不保存 prompt、完整模型响应或凭据。PR-06B 的成本账本独立于 Evaluation Contract，仅返回 job 级 summary；SSE 和 WebUI 实时控制仍未实现。
+
+PR-06B cost ledger 仅记录 Provider Registry 入口处发生的真实远程 LLM attempt：logical call、attempt、job/stage/repair/recovery attempt、provider/model、request/retry/fallback 序号、可获得 usage、pricing contract version/fingerprint、currency、cost status、Decimal 字符串金额和 started/completed/failed/cancelled 时间。账本不保存 prompt、完整 response、API key、Authorization、本地 credential 或敏感路径。未返回 usage 保持 unknown，不记为 0；未验证价格保持 unknown；不同 currency 分别汇总，不猜测汇率。hard budget 在远程调用前以 SQLite `BEGIN IMMEDIATE` 原子检查和预占上界；上界所需的价格、输入 token、输出 token 上限或币种无法确定时 fail closed，不发起调用。取消、timeout、provider error 和 partial usage 会保留已经暴露的成本信息。
 
 SQLite Worker 对本地进程先观察真实退出码，再消费取消命令：exit 0 直接 completed；在线非零退出与 Worker 重启后 confirmed-missing 使用同一恢复资格判断；晚到 cancel 失败为 `already_finished`，不会把自然退出误记为 canceled 或触发恢复。取消前续租并重新验证 PID/create time/process group，Windows 强制终止绑定到同一进程句柄并有界等待，只有完整树已确认退出才持久化 canceled。单 job 的设置、输入、命令或进程创建错误记录为 `process_launch_failed` 后继续轮询；SQLite、fencing、持久化、乐观冲突和未知错误保持 fail fast。
 
@@ -57,6 +59,17 @@ Set-Location ..
 - Python 测试仍只报告 1 个既有 `StarletteDeprecationWarning`，无 skip；未运行真实 LLM、MinerU、vLLM 或完整 Pipeline。
 
 该快照验证的是固定阶段边界与默认一次恢复，不代表 exactly-once 或任意崩溃点自动恢复。恢复测试使用 fake stage/fake pipeline 和临时数据库。
+
+## 2026-09-02 PR-06B 验收快照
+
+- python -m compileall -q codes web_api tests: 通过。
+- PR-06B 成本账本定向测试: 11 passed。
+- Provider Registry、evaluation fallback、PR-06A Evaluation Contract、JobRepository、SQLite runtime 定向回归: 241 passed。
+- python -m pytest -q -rs: 615 passed。
+- WebUI 	ypecheck、uild、erify:same-origin、smoke、smoke:prod: 全部通过。
+- Python 测试仍只报告 1 个既有 StarletteDeprecationWarning; 未运行真实 LLM、MinerU、汇率服务或完整 Pipeline。
+
+该快照验证的是 append-only cost ledger、hard budget fail-closed 策略、API summary 脱敏和既有 PR-05/PR-06A 回归, 不代表 SSE 或 WebUI 成本面板。
 
 ## 测试政策
 

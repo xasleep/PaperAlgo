@@ -6,6 +6,7 @@ import sqlite3
 from collections.abc import Mapping
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -28,7 +29,7 @@ from .job_state import JobState, validate_job_transition
 from .path_security import validate_job_id
 
 
-REQUEST_FIELDS = frozenset(
+BASE_REQUEST_FIELDS = frozenset(
     {
         "upload_id",
         "paper_name",
@@ -42,6 +43,10 @@ REQUEST_FIELDS = frozenset(
         "pdf_markdown_path",
     }
 )
+COST_BUDGET_FIELDS = frozenset(
+    {"cost_budget_policy", "cost_budget_currency", "cost_budget_amount"}
+)
+REQUEST_FIELDS = BASE_REQUEST_FIELDS | COST_BUDGET_FIELDS
 EVENT_SOURCES = frozenset({"control_plane", "pipeline_adapter", "recovery", "worker"})
 GLOBAL_WORKER_LEASE = "pipeline-worker"
 CANCEL_DEDUPE_HASH = hashlib.sha256(b"cancel:v1").hexdigest()
@@ -129,9 +134,22 @@ def _repair_attempt_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
 
 
 def _canonical_request(request: Mapping[str, object]) -> tuple[dict[str, object], str]:
-    if set(request) != REQUEST_FIELDS:
+    request_fields = set(request)
+    if request_fields - REQUEST_FIELDS or not BASE_REQUEST_FIELDS.issubset(request_fields):
         raise ValueError("SQLite job requests must contain only the validated job fields.")
-    normalized = {field: request[field] for field in sorted(REQUEST_FIELDS)}
+    budget_policy, budget_currency, budget_amount = _normalize_cost_budget(
+        request.get("cost_budget_policy", "none"),
+        request.get("cost_budget_currency"),
+        request.get("cost_budget_amount"),
+    )
+    normalized = {field: request[field] for field in sorted(BASE_REQUEST_FIELDS)}
+    normalized.update(
+        {
+            "cost_budget_policy": budget_policy,
+            "cost_budget_currency": budget_currency,
+            "cost_budget_amount": budget_amount,
+        }
+    )
     string_fields = (
         "upload_id",
         "paper_name",
@@ -160,6 +178,37 @@ def _canonical_request(request: Mapping[str, object]) -> tuple[dict[str, object]
         separators=(",", ":"),
     ).encode("utf-8")
     return normalized, hashlib.sha256(encoded).hexdigest()
+
+
+def _normalize_cost_budget(
+    policy: object,
+    currency: object,
+    amount: object,
+) -> tuple[str, str | None, str | None]:
+    if policy is None:
+        policy = "none"
+    if policy not in {"none", "hard"}:
+        raise ValueError("cost_budget_policy must be 'none' or 'hard'.")
+    if policy == "none":
+        if currency is not None or amount is not None:
+            raise ValueError("cost budget currency/amount require a hard policy.")
+        return "none", None, None
+    if (
+        not isinstance(currency, str)
+        or not 1 <= len(currency) <= 16
+        or not currency.isascii()
+        or not currency.isprintable()
+    ):
+        raise ValueError("cost_budget_currency must be printable ASCII.")
+    if not isinstance(amount, str) or not 1 <= len(amount) <= 64:
+        raise ValueError("cost_budget_amount must be a decimal string.")
+    try:
+        decimal_amount = Decimal(amount)
+    except (InvalidOperation, ValueError) as exc:
+        raise ValueError("cost_budget_amount must be a decimal string.") from exc
+    if not decimal_amount.is_finite() or decimal_amount < 0:
+        raise ValueError("cost_budget_amount must be finite and non-negative.")
+    return "hard", currency, amount
 
 
 def _idempotency_hash(value: str | None) -> str | None:
@@ -295,10 +344,11 @@ class JobRepository:
                         max_repair_rounds, console_output, skip_mineru,
                         pdf_markdown_path, execution_status, evaluation_status,
                         quality_status, version, created_at, updated_at,
+                        cost_budget_policy, cost_budget_currency, cost_budget_amount,
                         reproduce_provider, reproduce_model, evaluation_provider,
                         evaluation_model, evaluation_fallback_models_json,
                         provider_registry_version, provider_contract_fingerprint
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         job_id,
@@ -320,6 +370,9 @@ class JobRepository:
                         1,
                         now,
                         now,
+                        normalized["cost_budget_policy"],
+                        normalized["cost_budget_currency"],
+                        normalized["cost_budget_amount"],
                         snapshot["reproduce_provider"],
                         snapshot["reproduce_model"],
                         snapshot["evaluation_provider"],
@@ -2063,6 +2116,11 @@ class JobRepository:
             except Exception:
                 connection.rollback()
                 raise
+
+    def cost_summary(self, job_id: str) -> dict[str, Any]:
+        from codes.cost_ledger import summarize_job_costs
+
+        return summarize_job_costs(self.database_path, validate_job_id(job_id))
 
     def add_cost_entry(
         self,
