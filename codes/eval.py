@@ -13,6 +13,10 @@ from evaluation_contract import (
 from task_manifest import TaskManifestError, load_task_manifest, read_manifest_text_files
 from openai import BadRequestError, PermissionDeniedError
 from provider_registry import get_provider_registry
+try:
+    from cost_ledger import ledger_fallback_sequence
+except ModuleNotFoundError:
+    from codes.cost_ledger import ledger_fallback_sequence
 from utils import (
     num_tokens_from_messages,
     read_all_files,
@@ -330,16 +334,16 @@ def run_completion_requests_with_fallback(
                 model_name,
                 input_tokens,
             )
-        client = make_openai_client(provider_id, model_name)
-
         try:
-            request_json, completion_json, generated_n = run_completion_requests(
-                provider_id,
-                model_name,
-                msg,
-                generated_n,
-                input_tokens,
-            )
+            with ledger_fallback_sequence(model_idx):
+                client = make_openai_client(provider_id, model_name)
+                request_json, completion_json, generated_n = run_completion_requests(
+                    provider_id,
+                    model_name,
+                    msg,
+                    generated_n,
+                    input_tokens,
+                )
             fallback_info = {
                 "fallback_used": model_idx > 0,
                 "fallback_reason": fallback_reason if model_idx > 0 else "",

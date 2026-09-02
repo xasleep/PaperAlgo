@@ -1112,11 +1112,45 @@ def _contract_semaphore(contract: ModelContract) -> threading.BoundedSemaphore:
         return _semaphores.setdefault(key, threading.BoundedSemaphore(contract.max_concurrency))
 
 
+def _ledger_runtime_enabled() -> bool:
+    try:
+        return bool(_cost_ledger_module().ledger_enabled())
+    except ModuleNotFoundError:
+        return False
+
+
+def _cost_ledger_module() -> Any:
+    try:
+        from codes import cost_ledger as module
+    except ModuleNotFoundError:
+        import cost_ledger as module
+    return module
+
+
+def _transport_max_retries(contract: ModelContract) -> int:
+    return 0 if _ledger_runtime_enabled() else contract.max_retries
+
+
+def _is_retryable_provider_error(error: BaseException) -> bool:
+    status_code = getattr(error, "status_code", None)
+    if status_code in {408, 409, 429, 500, 502, 503, 504}:
+        return True
+    name = type(error).__name__.lower()
+    return any(marker in name for marker in ("timeout", "ratelimit", "connection"))
+
+
 class _RegisteredCompletions:
     def __init__(self, resolved: ResolvedModelContract, delegate: Any, registry: ProviderRegistry):
         self._resolved = resolved
         self._delegate = delegate
         self._registry = registry
+        self._request_sequence = 0
+        self._request_sequence_lock = threading.Lock()
+
+    def _next_request_sequence(self) -> int:
+        with self._request_sequence_lock:
+            self._request_sequence += 1
+            return self._request_sequence
 
     def create(self, **kwargs: Any) -> Any:
         contract = self._resolved.model
@@ -1171,9 +1205,76 @@ class _RegisteredCompletions:
                 contract.model_id,
                 "max_output_tokens",
             )
+        logical_call_id = kwargs.pop("_paper2code_logical_call_id", None)
+        fixed_attempt_id = kwargs.pop("_paper2code_attempt_id", None)
+        request_sequence = kwargs.pop("_paper2code_request_sequence", None)
+        fallback_sequence = kwargs.pop("_paper2code_fallback_sequence", None)
+        if request_sequence is None:
+            request_sequence = self._next_request_sequence()
+        if logical_call_id is None:
+            logical_call_id = _cost_ledger_module().new_logical_call_id()
+        ledger_request = dict(kwargs)
+        if input_tokens is not None:
+            ledger_request["_input_token_count"] = input_tokens
         semaphore = _contract_semaphore(contract)
         with semaphore:
-            return self._delegate.create(**kwargs)
+            if not _ledger_runtime_enabled():
+                return self._delegate.create(**kwargs)
+            cost_ledger = _cost_ledger_module()
+
+            retry_sequence = 0
+            while True:
+                if fixed_attempt_id is not None and retry_sequence == 0:
+                    attempt_id = fixed_attempt_id
+                elif fixed_attempt_id is not None:
+                    attempt_id = f"{fixed_attempt_id}-retry-{retry_sequence}"
+                else:
+                    attempt_id = cost_ledger.new_attempt_id()
+                cost_ledger.reserve_call_from_env(
+                    registry_version=self._registry.version,
+                    contract=contract,
+                    request=ledger_request,
+                    logical_call_id=logical_call_id,
+                    attempt_id=attempt_id,
+                    request_sequence=request_sequence,
+                    retry_sequence=retry_sequence,
+                    fallback_sequence=fallback_sequence,
+                )
+                try:
+                    response = self._delegate.create(**kwargs)
+                except BaseException as exc:
+                    status = cost_ledger.cancellation_status(exc)
+                    cost_ledger.record_call_status_from_env(
+                        registry_version=self._registry.version,
+                        contract=contract,
+                        logical_call_id=logical_call_id,
+                        attempt_id=attempt_id,
+                        request_sequence=request_sequence,
+                        retry_sequence=retry_sequence,
+                        status=status,
+                        error=exc,
+                        fallback_sequence=fallback_sequence,
+                    )
+                    if (
+                        status == "failed"
+                        and retry_sequence < contract.max_retries
+                        and _is_retryable_provider_error(exc)
+                    ):
+                        retry_sequence += 1
+                        continue
+                    raise
+                cost_ledger.record_call_status_from_env(
+                    registry_version=self._registry.version,
+                    contract=contract,
+                    logical_call_id=logical_call_id,
+                    attempt_id=attempt_id,
+                    request_sequence=request_sequence,
+                    retry_sequence=retry_sequence,
+                    status="completed",
+                    response=response,
+                    fallback_sequence=fallback_sequence,
+                )
+                return response
 
 
 class RegisteredOpenAIClient:
@@ -1215,6 +1316,6 @@ def create_registered_client(
         api_key=resolved.api_key,
         base_url=resolved.base_url,
         timeout=resolved.model.timeout_seconds,
-        max_retries=resolved.model.max_retries,
+        max_retries=_transport_max_retries(resolved.model),
     )
     return RegisteredOpenAIClient(resolved, delegate, registry)

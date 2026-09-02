@@ -86,8 +86,9 @@ def test_migrations_are_repeatable_and_enable_required_pragmas(tmp_path: Path) -
         "job_processes",
         "job_process_history",
         "repair_attempts",
+        "remote_call_ledger",
     }.issubset(tables)
-    assert versions == [1, 2, 3, 4, 5, 6, 7]
+    assert versions == list(range(1, 9))
     assert journal_mode.lower() == "wal"
     assert foreign_keys == 1
     assert busy_timeout == 5000
@@ -123,13 +124,7 @@ def test_concurrent_first_initialization_is_serialized(tmp_path: Path) -> None:
         }
 
     assert [(row["version"], row["count"]) for row in versions] == [
-        (1, 1),
-        (2, 1),
-        (3, 1),
-        (4, 1),
-        (5, 1),
-        (6, 1),
-        (7, 1),
+        (version, 1) for version in range(1, 9)
     ]
     assert {
         "jobs",
@@ -287,13 +282,7 @@ def test_cross_process_initialization_rereads_migrations_after_write_lock(
         foreign_keys = connection.execute("PRAGMA foreign_keys").fetchone()[0]
 
     assert [(row["version"], row["count"]) for row in versions] == [
-        (1, 1),
-        (2, 1),
-        (3, 1),
-        (4, 1),
-        (5, 1),
-        (6, 1),
-        (7, 1),
+        (version, 1) for version in range(1, 9)
     ]
     assert tuple(legacy) == ("completed", "completed", "rejected")
     assert "jobs_updated_at_idx" in indexes
@@ -342,7 +331,7 @@ def test_failed_migration_rolls_back_schema_and_can_be_retried(
             for row in connection.execute(
                 "SELECT version FROM schema_migrations"
             ).fetchall()
-        ] == [1, 2, 3, 4, 5, 6, 7]
+        ] == list(range(1, 9))
         assert connection.execute(
             "SELECT COUNT(*) FROM jobs"
         ).fetchone()[0] == 0
@@ -396,7 +385,7 @@ def test_version_2_database_upgrades_repeatably_without_trusting_legacy_lease(
         foreign_keys = connection.execute("PRAGMA foreign_keys").fetchone()[0]
         busy_timeout = connection.execute("PRAGMA busy_timeout").fetchone()[0]
 
-    assert versions == [1, 2, 3, 4, 5, 6, 7]
+    assert versions == list(range(1, 9))
     assert "owner_token" in columns
     assert legacy_row["owner_token"] is None
     assert journal_mode.lower() == "wal"
@@ -531,7 +520,7 @@ def test_version_3_database_upgrades_launch_states_without_losing_processes(
                 "WHERE job_id = 'claimed_job'"
             )
 
-    assert versions == [1, 2, 3, 4, 5, 6, 7]
+    assert versions == list(range(1, 9))
     assert states == {
         "claimed_job": ("claimed", None),
         "registered_job": ("registered", None),
@@ -586,7 +575,7 @@ def test_failed_migration_4_rolls_back_added_launch_state(
             for row in connection.execute(
                 "SELECT version FROM schema_migrations ORDER BY version"
             )
-        ] == [1, 2, 3, 4, 5, 6, 7]
+        ] == list(range(1, 9))
 
 
 def test_version_4_database_upgrades_recovery_schema_without_losing_rows(
@@ -690,7 +679,7 @@ def test_version_4_database_upgrades_recovery_schema_without_losing_rows(
                 """
             )
 
-    assert versions == [1, 2, 3, 4, 5, 6, 7]
+    assert versions == list(range(1, 9))
     assert job["recovery_count"] == 0
     assert job["recovery_status"] == "none"
     assert process["process_attempt"] == 1
@@ -747,7 +736,7 @@ def test_failed_migration_5_rolls_back_recovery_columns(
             for row in connection.execute(
                 "SELECT version FROM schema_migrations ORDER BY version"
             )
-        ] == [1, 2, 3, 4, 5, 6, 7]
+        ] == list(range(1, 9))
 
 
 def test_different_worker_ids_cannot_share_active_global_lease(tmp_path: Path) -> None:
@@ -1842,7 +1831,7 @@ def test_migration_6_adds_non_sensitive_provider_snapshot_repeatably_and_keeps_o
             "SELECT * FROM jobs WHERE job_id = 'historical_completed'"
         ).fetchone()
 
-    assert versions == [1, 2, 3, 4, 5, 6, 7]
+    assert versions == list(range(1, 9))
     assert {
         "reproduce_provider",
         "reproduce_model",
@@ -1851,9 +1840,13 @@ def test_migration_6_adds_non_sensitive_provider_snapshot_repeatably_and_keeps_o
         "evaluation_fallback_models_json",
         "provider_registry_version",
         "provider_contract_fingerprint",
+        "cost_budget_policy",
+        "cost_budget_currency",
+        "cost_budget_amount",
     }.issubset(columns)
     assert historical["execution_status"] == "completed"
     assert historical["reproduce_provider"] is None
+    assert historical["cost_budget_policy"] == "none"
 
 
 def test_repository_persists_selection_snapshot_and_idempotency_keeps_original(

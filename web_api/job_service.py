@@ -18,7 +18,14 @@ from codes.provider_registry import (
     get_provider_registry,
 )
 
-from .config import CODES_DIR, MAX_PDF_UPLOAD_BYTES, REPO_ROOT, RUNS_DIR, UPLOADS_DIR
+from .config import (
+    CODES_DIR,
+    MAX_PDF_UPLOAD_BYTES,
+    REPO_ROOT,
+    RUNS_DIR,
+    UPLOADS_DIR,
+    configured_database_path,
+)
 from .errors import (
     FileTooLargeError,
     InvalidParameterError,
@@ -488,6 +495,7 @@ def build_pipeline_env(settings: WebSettings) -> dict[str, str]:
         {
             "PYTHONIOENCODING": "utf-8",
             "PYTHONUTF8": "1",
+            "PAPER2CODE_COST_LEDGER_DB_PATH": str(configured_database_path()),
             "REPRODUCE_API_KEY": settings.reproduce.api_key,
             "EVAL_API_KEY": settings.evaluation.api_key,
         }

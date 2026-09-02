@@ -498,6 +498,132 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             """,
         ),
     ),
+    (
+        8,
+        (
+            """
+            ALTER TABLE jobs ADD COLUMN cost_budget_policy TEXT NOT NULL DEFAULT 'none'
+                CHECK(cost_budget_policy IN ('none', 'hard'))
+            """,
+            """
+            ALTER TABLE jobs ADD COLUMN cost_budget_currency TEXT
+                CHECK(cost_budget_currency IS NULL OR (
+                    typeof(cost_budget_currency) = 'text'
+                    AND length(cost_budget_currency) BETWEEN 1 AND 16
+                ))
+            """,
+            """
+            ALTER TABLE jobs ADD COLUMN cost_budget_amount TEXT
+                CHECK(cost_budget_amount IS NULL OR (
+                    typeof(cost_budget_amount) = 'text'
+                    AND length(cost_budget_amount) BETWEEN 1 AND 64
+                ))
+            """,
+            """
+            CREATE TABLE remote_call_ledger (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+                logical_call_id TEXT NOT NULL
+                    CHECK(typeof(logical_call_id) = 'text' AND length(logical_call_id) BETWEEN 1 AND 128),
+                attempt_id TEXT NOT NULL
+                    CHECK(typeof(attempt_id) = 'text' AND length(attempt_id) BETWEEN 1 AND 128),
+                stage TEXT NOT NULL
+                    CHECK(typeof(stage) = 'text' AND length(stage) BETWEEN 1 AND 128),
+                stage_attempt INTEGER NOT NULL
+                    CHECK(typeof(stage_attempt) = 'integer' AND stage_attempt >= 1),
+                repair_attempt INTEGER
+                    CHECK(repair_attempt IS NULL OR (
+                        typeof(repair_attempt) = 'integer' AND repair_attempt >= 1
+                    )),
+                recovery_attempt INTEGER NOT NULL DEFAULT 0
+                    CHECK(typeof(recovery_attempt) = 'integer' AND recovery_attempt >= 0),
+                provider_id TEXT NOT NULL
+                    CHECK(typeof(provider_id) = 'text' AND length(provider_id) BETWEEN 1 AND 128),
+                model_id TEXT NOT NULL
+                    CHECK(typeof(model_id) = 'text' AND length(model_id) BETWEEN 1 AND 128),
+                request_sequence INTEGER NOT NULL
+                    CHECK(typeof(request_sequence) = 'integer' AND request_sequence >= 1),
+                retry_sequence INTEGER NOT NULL DEFAULT 0
+                    CHECK(typeof(retry_sequence) = 'integer' AND retry_sequence >= 0),
+                fallback_sequence INTEGER NOT NULL DEFAULT 0
+                    CHECK(typeof(fallback_sequence) = 'integer' AND fallback_sequence >= 0),
+                pricing_contract_version TEXT NOT NULL
+                    CHECK(typeof(pricing_contract_version) = 'text' AND length(pricing_contract_version) BETWEEN 1 AND 64),
+                pricing_contract_fingerprint TEXT NOT NULL
+                    CHECK(
+                        typeof(pricing_contract_fingerprint) = 'text'
+                        AND length(pricing_contract_fingerprint) = 64
+                        AND pricing_contract_fingerprint NOT GLOB '*[^0-9a-f]*'
+                    ),
+                pricing_status TEXT NOT NULL
+                    CHECK(pricing_status IN ('configured', 'unknown')),
+                currency TEXT
+                    CHECK(currency IS NULL OR (
+                        typeof(currency) = 'text' AND length(currency) BETWEEN 1 AND 16
+                    )),
+                cost_status TEXT NOT NULL
+                    CHECK(cost_status IN ('actual', 'estimated', 'unknown')),
+                cost_amount TEXT
+                    CHECK(cost_amount IS NULL OR (
+                        typeof(cost_amount) = 'text' AND length(cost_amount) BETWEEN 1 AND 128
+                    )),
+                input_tokens INTEGER
+                    CHECK(input_tokens IS NULL OR (
+                        typeof(input_tokens) = 'integer' AND input_tokens >= 0
+                    )),
+                output_tokens INTEGER
+                    CHECK(output_tokens IS NULL OR (
+                        typeof(output_tokens) = 'integer' AND output_tokens >= 0
+                    )),
+                cached_input_tokens INTEGER
+                    CHECK(cached_input_tokens IS NULL OR (
+                        typeof(cached_input_tokens) = 'integer' AND cached_input_tokens >= 0
+                    )),
+                reasoning_tokens INTEGER
+                    CHECK(reasoning_tokens IS NULL OR (
+                        typeof(reasoning_tokens) = 'integer' AND reasoning_tokens >= 0
+                    )),
+                total_tokens INTEGER
+                    CHECK(total_tokens IS NULL OR (
+                        typeof(total_tokens) = 'integer' AND total_tokens >= 0
+                    )),
+                status TEXT NOT NULL
+                    CHECK(status IN ('started', 'completed', 'failed', 'cancelled')),
+                started_at TEXT NOT NULL,
+                completed_at TEXT,
+                event_time TEXT NOT NULL,
+                error_type TEXT
+                    CHECK(error_type IS NULL OR (
+                        typeof(error_type) = 'text' AND length(error_type) BETWEEN 1 AND 128
+                    )),
+                created_at TEXT NOT NULL,
+                UNIQUE(attempt_id, status)
+            )
+            """,
+            """
+            CREATE INDEX remote_call_ledger_job_idx
+            ON remote_call_ledger(job_id, id)
+            """,
+            """
+            CREATE INDEX remote_call_ledger_attempt_idx
+            ON remote_call_ledger(attempt_id, id)
+            """,
+            """
+            CREATE TRIGGER remote_call_ledger_append_only_update_guard
+            BEFORE UPDATE ON remote_call_ledger
+            BEGIN
+                SELECT RAISE(ABORT, 'remote_call_ledger is append-only');
+            END
+            """,
+            """
+            CREATE TRIGGER remote_call_ledger_append_only_delete_guard
+            BEFORE DELETE ON remote_call_ledger
+            BEGIN
+                SELECT RAISE(ABORT, 'remote_call_ledger is append-only');
+            END
+            """,
+        ),
+    ),
 )
 
 

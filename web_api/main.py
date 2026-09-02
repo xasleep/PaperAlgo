@@ -1,4 +1,5 @@
 from pathlib import Path
+from decimal import Decimal, InvalidOperation
 from threading import Lock
 
 from fastapi import APIRouter, FastAPI, File, Header, Query, Request, Response, UploadFile
@@ -254,6 +255,47 @@ def _validate_job_parameters(payload: JobCreateRequest) -> None:
             "pdf_markdown_path is required when skip_mineru is true.",
             details={"parameter": "pdf_markdown_path"},
         )
+    _validate_cost_budget_payload(payload)
+
+
+def _validate_cost_budget_payload(payload: JobCreateRequest) -> None:
+    if payload.cost_budget_policy == "none":
+        if payload.cost_budget_currency is not None or payload.cost_budget_amount is not None:
+            raise InvalidParameterError(
+                "cost_budget_currency and cost_budget_amount require a hard budget policy.",
+                details={"parameter": "cost_budget_policy"},
+            )
+        return
+    currency = payload.cost_budget_currency
+    amount = payload.cost_budget_amount
+    if (
+        not isinstance(currency, str)
+        or not currency
+        or len(currency) > 16
+        or not currency.isascii()
+        or not currency.isprintable()
+    ):
+        raise InvalidParameterError(
+            "cost_budget_currency must be a printable currency code.",
+            details={"parameter": "cost_budget_currency"},
+        )
+    if not isinstance(amount, str) or not amount:
+        raise InvalidParameterError(
+            "cost_budget_amount must be a decimal string.",
+            details={"parameter": "cost_budget_amount"},
+        )
+    try:
+        decimal_amount = Decimal(amount)
+    except (InvalidOperation, ValueError) as exc:
+        raise InvalidParameterError(
+            "cost_budget_amount must be a decimal string.",
+            details={"parameter": "cost_budget_amount"},
+        ) from exc
+    if not decimal_amount.is_finite() or decimal_amount < 0:
+        raise InvalidParameterError(
+            "cost_budget_amount must be finite and non-negative.",
+            details={"parameter": "cost_budget_amount"},
+        )
 
 
 def _job_request_dict(payload: JobCreateRequest) -> dict[str, object]:
@@ -337,6 +379,7 @@ def _sqlite_job_view(
         "repo_status": None,
         "eval_score": None,
         "run_dir": str(run_dir),
+        "cost_summary": repository.cost_summary(job_id),
     }
 
 
@@ -363,6 +406,10 @@ def _sqlite_create_response(
         evaluation_fallback_models=job.get("evaluation_fallback_models"),
         provider_registry_version=job.get("provider_registry_version"),
         provider_contract_fingerprint=job.get("provider_contract_fingerprint"),
+        cost_budget_policy=job.get("cost_budget_policy"),
+        cost_budget_currency=job.get("cost_budget_currency"),
+        cost_budget_amount=job.get("cost_budget_amount"),
+        cost_summary=view.get("cost_summary"),
     )
 
 

@@ -67,6 +67,20 @@ export type JobStatus =
   | "unknown"
   | string;
 
+export type CostBudgetPolicy = "none" | "hard";
+
+export type CostSummary = {
+  attempt_count: number;
+  status_counts: Record<string, number>;
+  actual_by_currency: Record<string, string>;
+  estimated_by_currency: Record<string, string>;
+  reserved_by_currency: Record<string, string>;
+  unknown_attempts: number;
+  budget_policy: CostBudgetPolicy;
+  budget_currency: string | null;
+  budget_amount: string | null;
+};
+
 export type ProcessState =
   | "active"
   | "finished"
@@ -95,6 +109,10 @@ export type JobListItem = {
   repo_status: string | null;
   eval_score: number | null;
   run_dir: string;
+  cost_budget_policy?: CostBudgetPolicy | null;
+  cost_budget_currency?: string | null;
+  cost_budget_amount?: string | null;
+  cost_summary?: CostSummary | null;
 };
 
 export type JobDetail = JobListItem & {
@@ -117,6 +135,10 @@ export type JobCreateResponse = {
   run_dir: string;
   status_path: string;
   summary_path: string;
+  cost_budget_policy?: CostBudgetPolicy | null;
+  cost_budget_currency?: string | null;
+  cost_budget_amount?: string | null;
+  cost_summary?: CostSummary | null;
 };
 
 export type UploadResponse = {
@@ -135,6 +157,9 @@ export type JobCreatePayload = {
   console_output: ConsoleOutput;
   skip_mineru: boolean;
   pdf_markdown_path: string;
+  cost_budget_policy?: CostBudgetPolicy;
+  cost_budget_currency?: string | null;
+  cost_budget_amount?: string | null;
 };
 
 export type CancelResponse = {
