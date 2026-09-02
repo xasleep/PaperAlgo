@@ -624,6 +624,46 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             """,
         ),
     ),
+    (
+        9,
+        (
+            """
+            ALTER TABLE job_events ADD COLUMN payload_json TEXT
+                CHECK(payload_json IS NULL OR (
+                    typeof(payload_json) = 'text' AND length(payload_json) <= 4096
+                ))
+            """,
+            """
+            ALTER TABLE job_commands ADD COLUMN request_status TEXT NOT NULL
+                DEFAULT 'accepted'
+                CHECK(request_status IN ('accepted', 'rejected'))
+            """,
+            """
+            ALTER TABLE job_commands ADD COLUMN rejection_code TEXT
+                CHECK(rejection_code IS NULL OR (
+                    typeof(rejection_code) = 'text'
+                    AND length(rejection_code) BETWEEN 1 AND 128
+                ))
+            """,
+            """
+            ALTER TABLE job_commands ADD COLUMN result_code TEXT
+                CHECK(result_code IS NULL OR (
+                    typeof(result_code) = 'text'
+                    AND length(result_code) BETWEEN 1 AND 128
+                ))
+            """,
+            "ALTER TABLE job_commands ADD COLUMN updated_at TEXT",
+            """
+            UPDATE job_commands
+            SET updated_at = COALESCE(completed_at, claimed_at, created_at)
+            WHERE updated_at IS NULL
+            """,
+            """
+            CREATE INDEX job_commands_job_idx
+            ON job_commands(job_id, id)
+            """,
+        ),
+    ),
 )
 
 

@@ -4,7 +4,7 @@ from threading import Lock
 
 from fastapi import APIRouter, FastAPI, File, Header, Query, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
 from codes.provider_registry import ProviderContractError, get_provider_registry
@@ -29,10 +29,17 @@ from .errors import (
     FeatureNotSupportedError,
     InternalApiError,
     InvalidParameterError,
+    JobCommandRejectedError,
     JobNotCancelableError,
     ProviderConfigurationError,
     SettingsNotConfiguredError,
     install_exception_handlers,
+)
+from .event_stream import (
+    DEFAULT_REPLAY_LIMIT,
+    MAX_REPLAY_LIMIT,
+    format_gap_event,
+    iter_job_event_stream,
 )
 from .job_service import (
     cancel_job,
@@ -53,6 +60,9 @@ from .schemas import (
     CancelResponse,
     JobCreateRequest,
     JobCreateResponse,
+    JobCommandRequest,
+    JobCommandResponse,
+    JobCommandsResponse,
     JobListResponse,
     JsonDict,
     LogsResponse,
@@ -76,6 +86,7 @@ from .web_security import (
     SESSION_MAX_AGE_SECONDS,
     UploadBodyLimitMiddleware,
     issue_session,
+    validate_request_origin,
 )
 
 
@@ -91,7 +102,13 @@ app.add_middleware(
     allow_origins=LOCAL_DEV_CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Accept", "Content-Type", "Idempotency-Key", "X-CSRF-Token"],
+    allow_headers=[
+        "Accept",
+        "Content-Type",
+        "Idempotency-Key",
+        "Last-Event-ID",
+        "X-CSRF-Token",
+    ],
 )
 app.add_middleware(UploadBodyLimitMiddleware)
 app.add_middleware(LocalRequestSecurityMiddleware)
@@ -413,6 +430,80 @@ def _sqlite_create_response(
     )
 
 
+def _command_response(command: dict[str, object]) -> JobCommandResponse:
+    return JobCommandResponse(
+        command_id=int(command["command_id"]),
+        job_id=str(command["job_id"]),
+        command_type=str(command["command_type"]),  # type: ignore[arg-type]
+        status=str(command["status"]),  # type: ignore[arg-type]
+        request_status=str(command["request_status"]),  # type: ignore[arg-type]
+        error_code=(
+            None if command.get("error_code") is None else str(command["error_code"])
+        ),
+        rejection_code=(
+            None
+            if command.get("rejection_code") is None
+            else str(command["rejection_code"])
+        ),
+        result_code=(
+            None if command.get("result_code") is None else str(command["result_code"])
+        ),
+        created_at=str(command["created_at"]),
+        claimed_at=(
+            None if command.get("claimed_at") is None else str(command["claimed_at"])
+        ),
+        completed_at=(
+            None
+            if command.get("completed_at") is None
+            else str(command["completed_at"])
+        ),
+        updated_at=(
+            None if command.get("updated_at") is None else str(command["updated_at"])
+        ),
+        version=int(command["version"]),
+    )
+
+
+def _raise_if_command_rejected(command: dict[str, object]) -> None:
+    if command.get("request_status") != "rejected":
+        return
+    reason = str(
+        command.get("rejection_code")
+        or command.get("error_code")
+        or "invalid_state"
+    )
+    raise JobCommandRejectedError(
+        command_id=int(command["command_id"]),
+        command_type=str(command["command_type"]),
+        reason=reason,
+    )
+
+
+def _parse_last_event_id(value: str | None) -> int:
+    if value is None or value == "":
+        return 0
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise InvalidParameterError(
+            "Last-Event-ID must be a non-negative integer.",
+            details={"header": "Last-Event-ID"},
+        ) from exc
+    if parsed < 0:
+        raise InvalidParameterError(
+            "Last-Event-ID must be a non-negative integer.",
+            details={"header": "Last-Event-ID"},
+        )
+    return parsed
+
+
+SSE_HEADERS = {
+    "Cache-Control": "no-store",
+    "X-Accel-Buffering": "no",
+    "Connection": "keep-alive",
+}
+
+
 @api.post(
     "/jobs",
     response_model=JobCreateResponse,
@@ -470,6 +561,125 @@ def create_job(
         pdf_markdown_path=payload.pdf_markdown_path,
     )
     return JobCreateResponse(**job)
+
+
+@api.get("/jobs/{job_id}/events")
+def job_events(
+    request: Request,
+    job_id: str,
+    last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
+    replay_limit: int = Query(default=DEFAULT_REPLAY_LIMIT, ge=1, le=MAX_REPLAY_LIMIT),
+    follow: bool = Query(default=True),
+):
+    origin_error = validate_request_origin(request)
+    if origin_error is not None:
+        return origin_error
+    if configured_job_runtime() != "sqlite":
+        raise FeatureNotSupportedError(
+            "Job event streaming is available only for the SQLite runtime."
+        )
+    validated_job_id = validate_job_id(job_id)
+    parsed_last_event_id = _parse_last_event_id(last_event_id)
+    repository = _sqlite_repository()
+    replay = repository.list_job_events_after(
+        validated_job_id,
+        parsed_last_event_id,
+        limit=replay_limit,
+    )
+    if replay.gap_detected:
+        return StreamingResponse(
+            iter(
+                [
+                    format_gap_event(
+                        job_id=validated_job_id,
+                        last_event_id=parsed_last_event_id,
+                        replay_limit=replay_limit,
+                        available_event_count=replay.available_event_count,
+                        latest_event_id=replay.latest_event_id,
+                    )
+                ]
+            ),
+            status_code=409,
+            media_type="text/event-stream",
+            headers=SSE_HEADERS,
+        )
+    return StreamingResponse(
+        iter_job_event_stream(
+            request,
+            repository=repository,
+            job_id=validated_job_id,
+            last_event_id=parsed_last_event_id,
+            replay_limit=replay_limit,
+            follow=follow,
+        ),
+        media_type="text/event-stream",
+        headers=SSE_HEADERS,
+    )
+
+
+@api.post(
+    "/jobs/{job_id}/commands",
+    response_model=JobCommandResponse,
+    response_model_exclude_none=True,
+)
+def create_job_command(
+    job_id: str,
+    payload: JobCommandRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> JobCommandResponse:
+    if configured_job_runtime() != "sqlite":
+        raise FeatureNotSupportedError(
+            "Persisted job commands are available only for the SQLite runtime."
+        )
+    repository = _sqlite_repository()
+    command = repository.request_job_command(
+        validate_job_id(job_id),
+        command_type=payload.command_type,
+        idempotency_key=idempotency_key,
+    )
+    _raise_if_command_rejected(command)
+    return _command_response(command)
+
+
+@api.get(
+    "/jobs/{job_id}/commands",
+    response_model=JobCommandsResponse,
+    response_model_exclude_none=True,
+)
+def job_commands(
+    job_id: str,
+    limit: int = Query(default=50, ge=1, le=200),
+) -> JobCommandsResponse:
+    if configured_job_runtime() != "sqlite":
+        raise FeatureNotSupportedError(
+            "Persisted job commands are available only for the SQLite runtime."
+        )
+    repository = _sqlite_repository()
+    return JobCommandsResponse(
+        commands=[
+            _command_response(command)
+            for command in repository.list_job_commands(
+                validate_job_id(job_id),
+                limit=limit,
+            )
+        ]
+    )
+
+
+@api.get(
+    "/jobs/{job_id}/commands/{command_id}",
+    response_model=JobCommandResponse,
+    response_model_exclude_none=True,
+)
+def job_command(job_id: str, command_id: int) -> JobCommandResponse:
+    if configured_job_runtime() != "sqlite":
+        raise FeatureNotSupportedError(
+            "Persisted job commands are available only for the SQLite runtime."
+        )
+    repository = _sqlite_repository()
+    return _command_response(
+        repository.get_job_command(validate_job_id(job_id), command_id)
+    )
 
 
 @api.get(

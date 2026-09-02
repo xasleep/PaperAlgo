@@ -884,6 +884,32 @@ class PipelineWorker:
                 launch_token=managed.launch_token,
             )
 
+    def _apply_control_commands(self) -> None:
+        while True:
+            command_type = self.repository.next_control_command_type(
+                worker_id=self.worker_id,
+                instance_token=self.instance_token,
+            )
+            if command_type is None:
+                return
+            if command_type == "approve":
+                self.repository.apply_next_approve_command(
+                    worker_id=self.worker_id,
+                    instance_token=self.instance_token,
+                )
+            elif command_type == "repair":
+                self.repository.apply_next_repair_command(
+                    worker_id=self.worker_id,
+                    instance_token=self.instance_token,
+                )
+            elif command_type == "retry":
+                self.repository.apply_next_retry_command(
+                    worker_id=self.worker_id,
+                    instance_token=self.instance_token,
+                )
+            else:
+                raise RuntimeError(f"Unsupported persisted command: {command_type}")
+
     def run_once(self) -> bool:
         lease_owned = self.repository.acquire_worker_lease(
             self.worker_id,
@@ -911,6 +937,15 @@ class PipelineWorker:
         ):
             pass
         self._monitor_managed()
+        if not self._managed:
+            self._apply_control_commands()
+            while (
+                self.repository.cancel_next_queued_job(
+                    self.worker_id, self.instance_token
+                )
+                is not None
+            ):
+                pass
         if len(self._managed) < self.max_concurrency:
             launch_token = uuid.uuid4().hex
             job = self.repository.claim_next_queued_job(

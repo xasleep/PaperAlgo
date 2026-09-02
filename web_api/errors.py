@@ -181,6 +181,32 @@ class JobNotCancelableError(ContractError):
         self.reason = reason
 
 
+class JobCommandRejectedError(ContractError):
+    status_code = 409
+    code = "job_command_rejected"
+    default_message = "Job command was rejected."
+
+    def __init__(
+        self,
+        *,
+        command_id: int,
+        command_type: str,
+        reason: str,
+        message: str | None = None,
+    ) -> None:
+        super().__init__(
+            message or self.default_message,
+            details={
+                "command_id": command_id,
+                "command_type": command_type,
+                "reason": reason,
+            },
+        )
+        self.command_id = command_id
+        self.command_type = command_type
+        self.reason = reason
+
+
 class ArtifactNotAvailableError(ContractError, FileNotFoundError):
     status_code = 404
     code = "artifact_not_available"

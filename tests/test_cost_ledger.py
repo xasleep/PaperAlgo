@@ -1006,7 +1006,7 @@ def test_migration_8_reruns_from_pr06a_database(
             "SELECT * FROM jobs WHERE job_id = 'historical_pr06a'"
         ).fetchone()
 
-    assert versions == list(range(1, 9))
+    assert versions == list(range(1, 10))
     assert "remote_call_ledger" in tables
     assert {
         "cost_budget_policy",

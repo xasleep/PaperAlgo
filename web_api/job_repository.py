@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+import re
 import sqlite3
 from collections.abc import Mapping
 from contextlib import closing
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -51,6 +54,40 @@ EVENT_SOURCES = frozenset({"control_plane", "pipeline_adapter", "recovery", "wor
 GLOBAL_WORKER_LEASE = "pipeline-worker"
 CANCEL_DEDUPE_HASH = hashlib.sha256(b"cancel:v1").hexdigest()
 DEFAULT_MAX_RECOVERIES = 1
+EVENT_PAYLOAD_MAX_BYTES = 4096
+EVENT_TYPE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+LOCAL_PATH_RE = re.compile(r"(?:[A-Za-z]:[\\/]|\\\\|/(?:Users|home|tmp|var|mnt|opt)/)")
+EXECUTION_STATUSES = frozenset({"queued", "running", "completed", "failed", "canceled"})
+EVALUATION_STATUSES = frozenset({"pending", "running", "completed", "failed", "skipped"})
+QUALITY_STATUSES = frozenset({"pending", "assessing", "accepted", "rejected", "skipped"})
+JOB_COMMAND_TYPES = frozenset({"approve", "cancel", "retry", "repair"})
+COMMAND_STATUSES = frozenset({"pending", "claimed", "completed", "failed", "rejected"})
+COMMAND_REQUEST_STATUSES = frozenset({"accepted", "rejected"})
+SENSITIVE_EVENT_KEYS = frozenset(
+    {
+        "api_key",
+        "apikey",
+        "authorization",
+        "base_url",
+        "command",
+        "command_summary",
+        "credential",
+        "env",
+        "environment",
+        "full_response",
+        "instance_token",
+        "launch_token",
+        "model_response",
+        "pid",
+        "process_create_time",
+        "process_group_id",
+        "prompt",
+        "response",
+        "response_body",
+        "secret",
+        "token",
+    }
+)
 PROVIDER_SNAPSHOT_FIELDS = frozenset(
     {
         "reproduce_provider",
@@ -62,6 +99,14 @@ PROVIDER_SNAPSHOT_FIELDS = frozenset(
         "provider_contract_fingerprint",
     }
 )
+
+
+@dataclass(frozen=True)
+class JobEventReplay:
+    events: list[dict[str, Any]]
+    gap_detected: bool
+    available_event_count: int
+    latest_event_id: int | None
 
 
 def _future_utc(seconds: float) -> str:
@@ -227,6 +272,129 @@ def _idempotency_hash(value: str | None) -> str | None:
     return hashlib.sha256(value.encode("ascii")).hexdigest()
 
 
+def _required_idempotency_hash(value: str | None) -> str:
+    key_hash = _idempotency_hash(value)
+    if key_hash is None:
+        raise InvalidParameterError(
+            "Idempotency-Key is required for job commands.",
+            details={"header": "Idempotency-Key"},
+        )
+    return key_hash
+
+
+def _bounded_event_type(value: str) -> str:
+    if not isinstance(value, str) or EVENT_TYPE_RE.fullmatch(value) is None:
+        raise ValueError("event_type must be a printable event token.")
+    return value
+
+
+def _bounded_status(
+    value: str | None,
+    allowed: frozenset[str],
+    field: str,
+) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or value not in allowed:
+        raise ValueError(f"{field} is not allowed.")
+    return value
+
+
+def _command_type(value: str) -> str:
+    if not isinstance(value, str) or value not in JOB_COMMAND_TYPES:
+        raise InvalidParameterError(
+            "command_type is not allowed.",
+            details={"parameter": "command_type"},
+        )
+    return value
+
+
+def _positive_command_id(value: int) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise InvalidParameterError(
+            "command_id must be a positive integer.",
+            details={"parameter": "command_id"},
+        )
+    return value
+
+
+def _safe_event_payload_value(value: object, *, path: str = "payload") -> object:
+    if value is None or isinstance(value, (str, bool, int)):
+        if isinstance(value, str) and LOCAL_PATH_RE.search(value):
+            raise ValueError("event payload must not contain a local path.")
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("event payload numbers must be finite.")
+        return value
+    if isinstance(value, list):
+        if len(value) > 128:
+            raise ValueError("event payload list is too large.")
+        return [
+            _safe_event_payload_value(item, path=f"{path}[]")
+            for item in value
+        ]
+    if isinstance(value, dict):
+        if len(value) > 128:
+            raise ValueError("event payload object is too large.")
+        sanitized: dict[str, object] = {}
+        for raw_key, raw_item in value.items():
+            if (
+                not isinstance(raw_key, str)
+                or not raw_key
+                or len(raw_key) > 128
+                or not raw_key.isascii()
+                or not raw_key.isprintable()
+            ):
+                raise ValueError("event payload keys must be printable ASCII.")
+            key = raw_key.lower()
+            if (
+                key in SENSITIVE_EVENT_KEYS
+                or key.endswith("_path")
+                or key.endswith("_token")
+                or key.startswith("prompt")
+            ):
+                raise ValueError("event payload contains sensitive metadata.")
+            sanitized[raw_key] = _safe_event_payload_value(
+                raw_item,
+                path=f"{path}.{raw_key}",
+            )
+        return sanitized
+    raise ValueError("event payload contains an unsupported value.")
+
+
+def _event_payload_json(payload: Mapping[str, object] | None) -> str | None:
+    if payload is None:
+        return None
+    sanitized = _safe_event_payload_value(dict(payload))
+    encoded = json.dumps(
+        sanitized,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    if len(encoded.encode("utf-8")) > EVENT_PAYLOAD_MAX_BYTES:
+        raise ValueError("event payload is too large.")
+    return encoded
+
+
+def _command_event_payload(
+    *,
+    command_id: int,
+    command_type: str,
+    command_status: str,
+    reason: str | None = None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "command_id": command_id,
+        "command_type": command_type,
+        "command_status": command_status,
+    }
+    if reason:
+        payload["reason"] = reason
+    return payload
+
+
 def _normalize_provider_snapshot(
     snapshot: Mapping[str, object] | None,
 ) -> dict[str, object | None]:
@@ -289,6 +457,13 @@ def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         result["evaluation_fallback_models"] = (
             None if encoded_fallbacks is None else json.loads(encoded_fallbacks)
         )
+    return result
+
+
+def _command_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    result = dict(row)
+    result.pop("dedupe_key_hash", None)
+    result["command_id"] = int(result["id"])
     return result
 
 
@@ -439,6 +614,169 @@ class JobRepository:
                 (bounded_limit,),
             ).fetchall()
         return [_row_to_dict(row) for row in rows]
+
+    @staticmethod
+    def _insert_job_event(
+        connection: sqlite3.Connection,
+        *,
+        job_id: str,
+        event_type: str,
+        source: str,
+        job_version: int,
+        execution_status: str | None = None,
+        evaluation_status: str | None = None,
+        quality_status: str | None = None,
+        payload: Mapping[str, object] | None = None,
+        created_at: str | None = None,
+    ) -> int:
+        event_type = _bounded_event_type(event_type)
+        if source not in EVENT_SOURCES:
+            raise ValueError("source is not an allowed job event source.")
+        if (
+            not isinstance(job_version, int)
+            or isinstance(job_version, bool)
+            or job_version < 1
+        ):
+            raise ValueError("job_version must be a positive integer.")
+        execution_status = _bounded_status(
+            execution_status,
+            EXECUTION_STATUSES,
+            "execution_status",
+        )
+        evaluation_status = _bounded_status(
+            evaluation_status,
+            EVALUATION_STATUSES,
+            "evaluation_status",
+        )
+        quality_status = _bounded_status(
+            quality_status,
+            QUALITY_STATUSES,
+            "quality_status",
+        )
+        cursor = connection.execute(
+            """
+            INSERT INTO job_events (
+                job_id, event_type, source, job_version,
+                execution_status, evaluation_status, quality_status,
+                created_at, payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                job_id,
+                event_type,
+                source,
+                job_version,
+                execution_status,
+                evaluation_status,
+                quality_status,
+                created_at or utc_now(),
+                _event_payload_json(payload),
+            ),
+        )
+        return int(cursor.lastrowid)
+
+    def record_job_event(
+        self,
+        job_id: str,
+        *,
+        event_type: str,
+        source: str,
+        job_version: int,
+        execution_status: str | None = None,
+        evaluation_status: str | None = None,
+        quality_status: str | None = None,
+        payload: Mapping[str, object] | None = None,
+    ) -> dict[str, Any]:
+        job_id = validate_job_id(job_id)
+        now = utc_now()
+        with closing(connect_database(self.database_path)) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                job = connection.execute(
+                    "SELECT 1 FROM jobs WHERE job_id = ?",
+                    (job_id,),
+                ).fetchone()
+                if job is None:
+                    raise JobNotFoundError()
+                event_id = self._insert_job_event(
+                    connection,
+                    job_id=job_id,
+                    event_type=event_type,
+                    source=source,
+                    job_version=job_version,
+                    execution_status=execution_status,
+                    evaluation_status=evaluation_status,
+                    quality_status=quality_status,
+                    payload=payload,
+                    created_at=now,
+                )
+                row = connection.execute(
+                    "SELECT * FROM job_events WHERE id = ?",
+                    (event_id,),
+                ).fetchone()
+                connection.commit()
+                return dict(row)
+            except Exception:
+                connection.rollback()
+                raise
+
+    def list_job_events_after(
+        self,
+        job_id: str,
+        last_event_id: int,
+        *,
+        limit: int,
+    ) -> JobEventReplay:
+        job_id = validate_job_id(job_id)
+        if (
+            not isinstance(last_event_id, int)
+            or isinstance(last_event_id, bool)
+            or last_event_id < 0
+        ):
+            raise ValueError("last_event_id must be a non-negative integer.")
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+            raise ValueError("limit must be a positive integer.")
+        bounded_limit = min(limit, 500)
+        with closing(connect_database(self.database_path)) as connection:
+            job = connection.execute(
+                "SELECT 1 FROM jobs WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            if job is None:
+                raise JobNotFoundError()
+            summary = connection.execute(
+                """
+                SELECT COUNT(*) AS count, MAX(id) AS latest_event_id
+                FROM job_events
+                WHERE job_id = ? AND id > ?
+                """,
+                (job_id, last_event_id),
+            ).fetchone()
+            available = int(summary["count"])
+            latest = summary["latest_event_id"]
+            if available > bounded_limit:
+                return JobEventReplay(
+                    events=[],
+                    gap_detected=True,
+                    available_event_count=available,
+                    latest_event_id=None if latest is None else int(latest),
+                )
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM job_events
+                WHERE job_id = ? AND id > ?
+                ORDER BY id ASC
+                LIMIT ?
+                """,
+                (job_id, last_event_id, bounded_limit),
+            ).fetchall()
+        return JobEventReplay(
+            events=[dict(row) for row in rows],
+            gap_detected=False,
+            available_event_count=available,
+            latest_event_id=None if latest is None else int(latest),
+        )
 
     def acquire_worker_lease(
         self,
@@ -622,71 +960,194 @@ class JobRepository:
                 connection.rollback()
                 raise
 
-    def request_cancel(self, job_id: str) -> dict[str, Any]:
+    @staticmethod
+    def _is_identity_unresolved(
+        connection: sqlite3.Connection,
+        job_id: str,
+        execution_status: str,
+    ) -> bool:
+        if execution_status != "running":
+            return False
+        process = connection.execute(
+            "SELECT launch_state FROM job_processes WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+        return bool(
+            process is not None
+            and process["launch_state"] == "identity_unresolved"
+        )
+
+    @classmethod
+    def _command_rejection_reason(
+        cls,
+        connection: sqlite3.Connection,
+        job: sqlite3.Row,
+        command_type: str,
+    ) -> str | None:
+        execution_status = str(job["execution_status"])
+        if cls._is_identity_unresolved(
+            connection,
+            str(job["job_id"]),
+            execution_status,
+        ):
+            return "process_identity_unresolved"
+        if command_type == "cancel":
+            if execution_status in {"completed", "failed", "canceled"}:
+                return "already_finished"
+            if execution_status not in {"queued", "running"}:
+                return "invalid_state"
+            return None
+        if command_type == "retry":
+            return None if execution_status in {"failed", "canceled"} else "invalid_state"
+        if command_type in {"approve", "repair"}:
+            allowed = (
+                execution_status == "completed"
+                and job["evaluation_status"] == "completed"
+                and job["quality_status"] == "rejected"
+            )
+            return None if allowed else "invalid_state"
+        return "invalid_command"
+
+    def _request_job_command_with_hash(
+        self,
+        job_id: str,
+        *,
+        command_type: str,
+        dedupe_key_hash: str,
+    ) -> dict[str, Any]:
         job_id = validate_job_id(job_id)
+        command_type = _command_type(command_type)
+        if (
+            not isinstance(dedupe_key_hash, str)
+            or len(dedupe_key_hash) != 64
+            or any(character not in "0123456789abcdef" for character in dedupe_key_hash)
+        ):
+            raise InvalidParameterError(
+                "Idempotency-Key is invalid.",
+                details={"header": "Idempotency-Key"},
+            )
         now = utc_now()
         with closing(connect_database(self.database_path)) as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 job = connection.execute(
-                    "SELECT * FROM jobs WHERE job_id = ?", (job_id,)
+                    "SELECT * FROM jobs WHERE job_id = ?",
+                    (job_id,),
                 ).fetchone()
                 if job is None:
                     raise JobNotFoundError()
-                if job["execution_status"] in {"completed", "failed"}:
-                    raise JobNotCancelableError(
-                        "already_finished",
-                        "Job is already finished and cannot be canceled.",
-                    )
-                if job["execution_status"] == "running":
-                    process = connection.execute(
-                        "SELECT launch_state FROM job_processes WHERE job_id = ?",
-                        (job_id,),
-                    ).fetchone()
-                    if (
-                        process is not None
-                        and process["launch_state"] == "identity_unresolved"
-                    ):
-                        raise JobNotCancelableError(
-                            "process_identity_unresolved",
-                            "Pipeline process identity is unresolved and cannot be canceled safely.",
-                        )
-                command = connection.execute(
+                existing = connection.execute(
                     """
                     SELECT * FROM job_commands
-                    WHERE job_id = ? AND command_type = 'cancel'
-                    ORDER BY id DESC LIMIT 1
+                    WHERE job_id = ? AND dedupe_key_hash = ?
                     """,
-                    (job_id,),
+                    (job_id, dedupe_key_hash),
                 ).fetchone()
-                if command is None and job["execution_status"] != "canceled":
-                    connection.execute(
-                        """
-                        INSERT INTO job_commands (
-                            job_id, command_type, status, dedupe_key_hash,
-                            version, created_at
-                        ) VALUES (?, 'cancel', 'pending', ?, 1, ?)
-                        """,
-                        (job_id, CANCEL_DEDUPE_HASH, now),
-                    )
-                    command = connection.execute(
-                        """
-                        SELECT * FROM job_commands
-                        WHERE job_id = ? AND command_type = 'cancel'
-                        """,
-                        (job_id,),
-                    ).fetchone()
+                if existing is not None:
+                    if existing["command_type"] != command_type:
+                        raise IdempotencyConflictError(
+                            details={"header": "Idempotency-Key"}
+                        )
+                    connection.commit()
+                    return _command_row_to_dict(existing)
+
+                reason = self._command_rejection_reason(
+                    connection,
+                    job,
+                    command_type,
+                )
+                request_status = "rejected" if reason else "accepted"
+                status = "rejected" if reason else "pending"
+                connection.execute(
+                    """
+                    INSERT INTO job_commands (
+                        job_id, command_type, status, dedupe_key_hash,
+                        version, created_at, completed_at, error_code,
+                        request_status, rejection_code, result_code, updated_at
+                    ) VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        job_id,
+                        command_type,
+                        status,
+                        dedupe_key_hash,
+                        now,
+                        now if reason else None,
+                        reason,
+                        request_status,
+                        reason,
+                        reason,
+                        now,
+                    ),
+                )
+                command_id = int(connection.execute("SELECT last_insert_rowid()").fetchone()[0])
+                self._insert_job_event(
+                    connection,
+                    job_id=job_id,
+                    event_type=(
+                        "job.command_rejected"
+                        if reason
+                        else "job.command_requested"
+                    ),
+                    source="control_plane",
+                    job_version=int(job["version"]),
+                    execution_status=job["execution_status"],
+                    evaluation_status=job["evaluation_status"],
+                    quality_status=job["quality_status"],
+                    payload=_command_event_payload(
+                        command_id=command_id,
+                        command_type=command_type,
+                        command_status=status,
+                        reason=reason,
+                    ),
+                    created_at=now,
+                )
+                command = connection.execute(
+                    "SELECT * FROM job_commands WHERE id = ?",
+                    (command_id,),
+                ).fetchone()
                 connection.commit()
-                if command is None:
-                    return {
-                        "job_id": job_id,
-                        "command_type": "cancel",
-                        "status": "completed",
-                    }
-                return dict(command)
+                return _command_row_to_dict(command)
             except Exception:
                 connection.rollback()
                 raise
+
+    def request_job_command(
+        self,
+        job_id: str,
+        *,
+        command_type: str,
+        idempotency_key: str | None,
+    ) -> dict[str, Any]:
+        return self._request_job_command_with_hash(
+            job_id,
+            command_type=command_type,
+            dedupe_key_hash=_required_idempotency_hash(idempotency_key),
+        )
+
+    def request_cancel(self, job_id: str) -> dict[str, Any]:
+        command = self._request_job_command_with_hash(
+            job_id,
+            command_type="cancel",
+            dedupe_key_hash=CANCEL_DEDUPE_HASH,
+        )
+        if command["status"] in {"rejected", "failed"}:
+            reason = str(
+                command.get("rejection_code")
+                or command.get("error_code")
+                or "invalid_state"
+            )
+            raise JobNotCancelableError(
+                reason,
+                (
+                    "Pipeline process identity is unresolved and cannot be canceled safely."
+                    if reason == "process_identity_unresolved"
+                    else "Job is already finished and cannot be canceled."
+                    if reason == "already_finished"
+                    else "Job cannot be canceled."
+                ),
+            )
+        return command
 
     def get_cancel_command(self, job_id: str) -> dict[str, Any] | None:
         job_id = validate_job_id(job_id)
@@ -699,7 +1160,66 @@ class JobRepository:
                 """,
                 (job_id,),
             ).fetchone()
-        return dict(row) if row is not None else None
+        return _command_row_to_dict(row) if row is not None else None
+
+    def get_job_command(self, job_id: str, command_id: int) -> dict[str, Any]:
+        job_id = validate_job_id(job_id)
+        command_id = _positive_command_id(command_id)
+        with closing(connect_database(self.database_path)) as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM job_commands
+                WHERE job_id = ? AND id = ?
+                """,
+                (job_id, command_id),
+            ).fetchone()
+        if row is None:
+            raise JobNotFoundError()
+        return _command_row_to_dict(row)
+
+    def list_job_commands(self, job_id: str, limit: int = 50) -> list[dict[str, Any]]:
+        job_id = validate_job_id(job_id)
+        bounded_limit = max(1, min(int(limit), 200))
+        with closing(connect_database(self.database_path)) as connection:
+            job = connection.execute(
+                "SELECT 1 FROM jobs WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            if job is None:
+                raise JobNotFoundError()
+            rows = connection.execute(
+                """
+                SELECT * FROM job_commands
+                WHERE job_id = ?
+                ORDER BY id ASC
+                LIMIT ?
+                """,
+                (job_id, bounded_limit),
+            ).fetchall()
+        return [_command_row_to_dict(row) for row in rows]
+
+    def next_control_command_type(
+        self,
+        *,
+        worker_id: str,
+        instance_token: str,
+    ) -> str | None:
+        worker_id = _runtime_identifier(worker_id, "worker_id")
+        instance_token = _runtime_identifier(instance_token, "instance_token")
+        now = utc_now()
+        with closing(connect_database(self.database_path)) as connection:
+            self._assert_current_lease(connection, worker_id, instance_token, now)
+            row = connection.execute(
+                """
+                SELECT command_type
+                FROM job_commands
+                WHERE command_type IN ('approve', 'repair', 'retry')
+                  AND status IN ('pending', 'claimed')
+                ORDER BY id ASC
+                LIMIT 1
+                """
+            ).fetchone()
+        return None if row is None else str(row["command_type"])
 
     def cancel_next_queued_job(
         self,
@@ -744,10 +1264,11 @@ class JobRepository:
                     UPDATE job_commands
                     SET status = 'completed', claimed_by_worker_id = ?,
                         claimed_at = COALESCE(claimed_at, ?), completed_at = ?,
+                        result_code = 'canceled', updated_at = ?,
                         version = version + 1
                     WHERE id = ?
                     """,
-                    (worker_id, now, now, row["command_id"]),
+                    (worker_id, now, now, now, row["command_id"]),
                 )
                 connection.execute(
                     """
@@ -806,19 +1327,387 @@ class JobRepository:
                         """
                         UPDATE job_commands
                         SET status = 'claimed', claimed_by_worker_id = ?,
-                            claimed_at = COALESCE(claimed_at, ?), version = version + 1
+                            claimed_at = COALESCE(claimed_at, ?),
+                            updated_at = ?, version = version + 1
                         WHERE id = ?
                         """,
-                        (worker_id, now, command["id"]),
+                        (worker_id, now, now, command["id"]),
                     )
                     command = connection.execute(
                         "SELECT * FROM job_commands WHERE id = ?", (command["id"],)
                     ).fetchone()
                 connection.commit()
-                return dict(command)
+                return _command_row_to_dict(command)
             except Exception:
                 connection.rollback()
                 raise
+
+    def _mark_command_failed_locked(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        command_id: int,
+        job_id: str,
+        command_type: str,
+        job_version: int,
+        execution_status: str,
+        evaluation_status: str,
+        quality_status: str,
+        error_code: str,
+        now: str,
+    ) -> None:
+        connection.execute(
+            """
+            UPDATE job_commands
+            SET status = 'failed', error_code = ?, result_code = ?,
+                completed_at = ?, updated_at = ?, version = version + 1
+            WHERE id = ? AND status IN ('pending', 'claimed')
+            """,
+            (error_code, error_code, now, now, command_id),
+        )
+        self._insert_job_event(
+            connection,
+            job_id=job_id,
+            event_type="job.command_failed",
+            source="worker",
+            job_version=job_version,
+            execution_status=execution_status,
+            evaluation_status=evaluation_status,
+            quality_status=quality_status,
+            payload=_command_event_payload(
+                command_id=command_id,
+                command_type=command_type,
+                command_status="failed",
+                reason=error_code,
+            ),
+            created_at=now,
+        )
+
+    def apply_next_retry_command(
+        self,
+        *,
+        worker_id: str,
+        instance_token: str,
+    ) -> dict[str, Any] | None:
+        worker_id = _runtime_identifier(worker_id, "worker_id")
+        instance_token = _runtime_identifier(instance_token, "instance_token")
+        now = utc_now()
+        with closing(connect_database(self.database_path)) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                self._assert_current_lease(
+                    connection, worker_id, instance_token, now
+                )
+                row = connection.execute(
+                    """
+                    SELECT c.id AS command_id, c.version AS command_version,
+                           c.command_type, j.*
+                    FROM job_commands AS c
+                    JOIN jobs AS j ON j.job_id = c.job_id
+                    WHERE c.command_type = 'retry'
+                      AND c.status IN ('pending', 'claimed')
+                    ORDER BY c.id ASC
+                    LIMIT 1
+                    """
+                ).fetchone()
+                if row is None:
+                    connection.commit()
+                    return None
+                connection.execute(
+                    """
+                    UPDATE job_commands
+                    SET status = 'claimed', claimed_by_worker_id = ?,
+                        claimed_at = COALESCE(claimed_at, ?),
+                        updated_at = ?, version = version + 1
+                    WHERE id = ? AND status IN ('pending', 'claimed')
+                    """,
+                    (worker_id, now, now, row["command_id"]),
+                )
+                process = connection.execute(
+                    "SELECT * FROM job_processes WHERE job_id = ?",
+                    (row["job_id"],),
+                ).fetchone()
+                if row["execution_status"] not in {"failed", "canceled"} or (
+                    process is not None and process["launch_state"] != "exited"
+                ):
+                    self._mark_command_failed_locked(
+                        connection,
+                        command_id=int(row["command_id"]),
+                        job_id=row["job_id"],
+                        command_type="retry",
+                        job_version=int(row["version"]),
+                        execution_status=row["execution_status"],
+                        evaluation_status=row["evaluation_status"],
+                        quality_status=row["quality_status"],
+                        error_code="state_changed",
+                        now=now,
+                    )
+                    connection.commit()
+                    return None
+                if process is not None:
+                    connection.execute(
+                        "DELETE FROM job_processes WHERE job_id = ?",
+                        (row["job_id"],),
+                    )
+                next_version = int(row["version"]) + 1
+                connection.execute(
+                    """
+                    UPDATE jobs
+                    SET execution_status = 'queued',
+                        evaluation_status = 'pending',
+                        quality_status = 'pending',
+                        failure_code = NULL,
+                        recovery_count = 0,
+                        recovery_status = 'none',
+                        recovery_error_code = NULL,
+                        current_stage = NULL,
+                        current_stage_attempt = NULL,
+                        last_checkpoint_stage = NULL,
+                        version = ?, updated_at = ?
+                    WHERE job_id = ? AND version = ?
+                    """,
+                    (next_version, now, row["job_id"], row["version"]),
+                )
+                connection.execute(
+                    """
+                    UPDATE job_commands
+                    SET status = 'completed', result_code = 'retry_queued',
+                        completed_at = ?, updated_at = ?, version = version + 1
+                    WHERE id = ?
+                    """,
+                    (now, now, row["command_id"]),
+                )
+                self._insert_job_event(
+                    connection,
+                    job_id=row["job_id"],
+                    event_type="job.retry_queued",
+                    source="worker",
+                    job_version=next_version,
+                    execution_status="queued",
+                    evaluation_status="pending",
+                    quality_status="pending",
+                    payload=_command_event_payload(
+                        command_id=int(row["command_id"]),
+                        command_type="retry",
+                        command_status="completed",
+                    ),
+                    created_at=now,
+                )
+                command = connection.execute(
+                    "SELECT * FROM job_commands WHERE id = ?",
+                    (row["command_id"],),
+                ).fetchone()
+                connection.commit()
+                return _command_row_to_dict(command)
+            except Exception:
+                connection.rollback()
+                raise
+
+    def apply_next_approve_command(
+        self,
+        *,
+        worker_id: str,
+        instance_token: str,
+    ) -> dict[str, Any] | None:
+        worker_id = _runtime_identifier(worker_id, "worker_id")
+        instance_token = _runtime_identifier(instance_token, "instance_token")
+        now = utc_now()
+        with closing(connect_database(self.database_path)) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                self._assert_current_lease(
+                    connection, worker_id, instance_token, now
+                )
+                row = connection.execute(
+                    """
+                    SELECT c.id AS command_id, j.*
+                    FROM job_commands AS c
+                    JOIN jobs AS j ON j.job_id = c.job_id
+                    WHERE c.command_type = 'approve'
+                      AND c.status IN ('pending', 'claimed')
+                    ORDER BY c.id ASC
+                    LIMIT 1
+                    """
+                ).fetchone()
+                if row is None:
+                    connection.commit()
+                    return None
+                connection.execute(
+                    """
+                    UPDATE job_commands
+                    SET status = 'claimed', claimed_by_worker_id = ?,
+                        claimed_at = COALESCE(claimed_at, ?),
+                        updated_at = ?, version = version + 1
+                    WHERE id = ?
+                    """,
+                    (worker_id, now, now, row["command_id"]),
+                )
+                if (
+                    row["execution_status"] != "completed"
+                    or row["evaluation_status"] != "completed"
+                    or row["quality_status"] != "rejected"
+                ):
+                    self._mark_command_failed_locked(
+                        connection,
+                        command_id=int(row["command_id"]),
+                        job_id=row["job_id"],
+                        command_type="approve",
+                        job_version=int(row["version"]),
+                        execution_status=row["execution_status"],
+                        evaluation_status=row["evaluation_status"],
+                        quality_status=row["quality_status"],
+                        error_code="state_changed",
+                        now=now,
+                    )
+                    connection.commit()
+                    return None
+                next_version = int(row["version"]) + 1
+                connection.execute(
+                    """
+                    UPDATE jobs
+                    SET quality_status = 'accepted', version = ?, updated_at = ?
+                    WHERE job_id = ? AND version = ?
+                    """,
+                    (next_version, now, row["job_id"], row["version"]),
+                )
+                connection.execute(
+                    """
+                    UPDATE job_commands
+                    SET status = 'completed', result_code = 'approved',
+                        completed_at = ?, updated_at = ?, version = version + 1
+                    WHERE id = ?
+                    """,
+                    (now, now, row["command_id"]),
+                )
+                self._insert_job_event(
+                    connection,
+                    job_id=row["job_id"],
+                    event_type="job.approved",
+                    source="worker",
+                    job_version=next_version,
+                    execution_status="completed",
+                    evaluation_status="completed",
+                    quality_status="accepted",
+                    payload=_command_event_payload(
+                        command_id=int(row["command_id"]),
+                        command_type="approve",
+                        command_status="completed",
+                    ),
+                    created_at=now,
+                )
+                command = connection.execute(
+                    "SELECT * FROM job_commands WHERE id = ?",
+                    (row["command_id"],),
+                ).fetchone()
+                connection.commit()
+                return _command_row_to_dict(command)
+            except Exception:
+                connection.rollback()
+                raise
+
+    def apply_next_repair_command(
+        self,
+        *,
+        worker_id: str,
+        instance_token: str,
+    ) -> dict[str, Any] | None:
+        worker_id = _runtime_identifier(worker_id, "worker_id")
+        instance_token = _runtime_identifier(instance_token, "instance_token")
+        now = utc_now()
+        with closing(connect_database(self.database_path)) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                self._assert_current_lease(
+                    connection, worker_id, instance_token, now
+                )
+                row = connection.execute(
+                    """
+                    SELECT c.id AS command_id, c.command_type, j.*
+                    FROM job_commands AS c
+                    JOIN jobs AS j ON j.job_id = c.job_id
+                    WHERE c.command_type = 'repair'
+                      AND c.status IN ('pending', 'claimed')
+                    ORDER BY c.id ASC
+                    LIMIT 1
+                    """
+                ).fetchone()
+                if row is None:
+                    connection.commit()
+                    return None
+                connection.execute(
+                    """
+                    UPDATE job_commands
+                    SET status = 'claimed', claimed_by_worker_id = ?,
+                        claimed_at = COALESCE(claimed_at, ?),
+                        updated_at = ?, version = version + 1
+                    WHERE id = ?
+                    """,
+                    (worker_id, now, now, row["command_id"]),
+                )
+                if (
+                    row["execution_status"] != "completed"
+                    or row["evaluation_status"] != "completed"
+                    or row["quality_status"] != "rejected"
+                ):
+                    self._mark_command_failed_locked(
+                        connection,
+                        command_id=int(row["command_id"]),
+                        job_id=row["job_id"],
+                        command_type="repair",
+                        job_version=int(row["version"]),
+                        execution_status=row["execution_status"],
+                        evaluation_status=row["evaluation_status"],
+                        quality_status=row["quality_status"],
+                        error_code="state_changed",
+                        now=now,
+                    )
+                    connection.commit()
+                    return None
+                connection.execute(
+                    """
+                    UPDATE job_commands
+                    SET status = 'completed', result_code = 'repair_requested',
+                        completed_at = ?, updated_at = ?, version = version + 1
+                    WHERE id = ?
+                    """,
+                    (now, now, row["command_id"]),
+                )
+                self._insert_job_event(
+                    connection,
+                    job_id=row["job_id"],
+                    event_type="job.repair_requested",
+                    source="worker",
+                    job_version=int(row["version"]),
+                    execution_status=row["execution_status"],
+                    evaluation_status=row["evaluation_status"],
+                    quality_status=row["quality_status"],
+                    payload=_command_event_payload(
+                        command_id=int(row["command_id"]),
+                        command_type="repair",
+                        command_status="completed",
+                    ),
+                    created_at=now,
+                )
+                command = connection.execute(
+                    "SELECT * FROM job_commands WHERE id = ?",
+                    (row["command_id"],),
+                ).fetchone()
+                connection.commit()
+                return _command_row_to_dict(command)
+            except Exception:
+                connection.rollback()
+                raise
+
+    def claim_next_repair_command(
+        self,
+        *,
+        worker_id: str,
+        instance_token: str,
+    ) -> dict[str, Any] | None:
+        return self.apply_next_repair_command(
+            worker_id=worker_id,
+            instance_token=instance_token,
+        )
 
     def record_process_started(
         self,
@@ -991,11 +1880,13 @@ class JobRepository:
                     UPDATE job_commands
                     SET status = 'failed',
                         error_code = 'process_identity_unresolved',
-                        completed_at = ?, version = version + 1
+                        result_code = 'process_identity_unresolved',
+                        completed_at = ?, updated_at = ?,
+                        version = version + 1
                     WHERE job_id = ? AND command_type = 'cancel'
                       AND status IN ('pending', 'claimed')
                     """,
-                    (now, job_id),
+                    (now, now, job_id),
                 )
                 connection.execute(
                     """
@@ -1883,6 +2774,8 @@ class JobRepository:
                         """
                         UPDATE job_commands
                         SET status = ?, error_code = ?, completed_at = ?,
+                            result_code = ?,
+                            updated_at = ?,
                             version = version + 1
                         WHERE job_id = ? AND command_type = 'cancel'
                           AND status IN ('pending', 'claimed')
@@ -1895,6 +2788,12 @@ class JobRepository:
                                 else None
                             ),
                             now,
+                            (
+                                cancel_command_error_code
+                                if cancel_command_status == "failed"
+                                else "canceled"
+                            ),
+                            now,
                             job_id,
                         ),
                     )
@@ -1903,11 +2802,13 @@ class JobRepository:
                         """
                         UPDATE job_commands
                         SET status = 'failed', error_code = 'already_finished',
-                            completed_at = ?, version = version + 1
+                            result_code = 'already_finished',
+                            completed_at = ?, updated_at = ?,
+                            version = version + 1
                         WHERE job_id = ? AND command_type = 'cancel'
                           AND status IN ('pending', 'claimed')
                         """,
-                        (now, job_id),
+                        (now, now, job_id),
                     )
                 connection.execute(
                     """
