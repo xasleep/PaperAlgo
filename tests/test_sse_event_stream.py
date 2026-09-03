@@ -201,7 +201,7 @@ def test_sse_heartbeat_has_no_persisted_event_id(
             last_event_id=1,
             replay_limit=10,
             poll_seconds=0.001,
-            heartbeat_seconds=0.001,
+            heartbeat_seconds=0.0,
         )
         return await anext(stream)
 
