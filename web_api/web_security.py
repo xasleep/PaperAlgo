@@ -261,6 +261,9 @@ class LocalRequestSecurityMiddleware(BaseHTTPMiddleware):
             if (
                 response.status_code >= 400
                 and "application/json" not in response.headers.get("content-type", "")
+                and not response.headers.get("content-type", "").startswith(
+                    "text/event-stream"
+                )
             ):
                 return _api_error(
                     response.status_code,

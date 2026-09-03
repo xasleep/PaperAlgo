@@ -8,6 +8,9 @@ DomainName = Literal["general", "statistics"]
 EvalType = Literal["ref_free", "ref_based"]
 ConsoleOutput = Literal["progress", "full", "quiet"]
 CostBudgetPolicy = Literal["none", "hard"]
+JobCommandType = Literal["approve", "cancel", "retry", "repair"]
+JobCommandStatus = Literal["pending", "claimed", "completed", "failed", "rejected"]
+JobCommandRequestStatus = Literal["accepted", "rejected"]
 
 
 class ProviderSettings(BaseModel):
@@ -139,6 +142,30 @@ class CancelResponse(BaseModel):
     job_id: str
     canceled: bool
     message: str
+
+
+class JobCommandRequest(BaseModel):
+    command_type: JobCommandType
+
+
+class JobCommandResponse(BaseModel):
+    command_id: int
+    job_id: str
+    command_type: JobCommandType
+    status: JobCommandStatus
+    request_status: JobCommandRequestStatus
+    error_code: str | None = None
+    rejection_code: str | None = None
+    result_code: str | None = None
+    created_at: str
+    claimed_at: str | None = None
+    completed_at: str | None = None
+    updated_at: str | None = None
+    version: int
+
+
+class JobCommandsResponse(BaseModel):
+    commands: list[JobCommandResponse] = Field(default_factory=list)
 
 
 class LogsResponse(BaseModel):

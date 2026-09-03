@@ -257,7 +257,7 @@ def test_sqlite_cancel_is_idempotent_command_without_legacy_side_effects(
         assert connection.execute(
             "SELECT COUNT(*) FROM job_events WHERE job_id = ?",
             (created["job_id"],),
-        ).fetchone()[0] == events_before
+        ).fetchone()[0] == events_before + 1
         command = connection.execute(
             "SELECT command_type, status FROM job_commands WHERE job_id = ?",
             (created["job_id"],),
@@ -342,7 +342,10 @@ def test_sqlite_unresolved_launch_is_detached_redacted_and_not_cancelable(
         "reason": "process_identity_unresolved"
     }
     assert repository.get_job("unresolved_job")["execution_status"] == "running"
-    assert repository.get_cancel_command("unresolved_job") is None
+    command = repository.get_cancel_command("unresolved_job")
+    assert command["status"] == "rejected"
+    assert command["request_status"] == "rejected"
+    assert command["error_code"] == "process_identity_unresolved"
     assert legacy_calls == []
 
 

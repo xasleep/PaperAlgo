@@ -771,6 +771,6 @@ def test_migration_7_preserves_legacy_jobs_and_adds_repair_attempts_table(
             )
         }
 
-    assert versions == list(range(1, 9))
+    assert versions == list(range(1, 10))
     assert tuple(legacy) == ("completed", "completed", "rejected")
     assert "repair_attempts" in tables
