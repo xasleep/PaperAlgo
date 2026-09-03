@@ -38,8 +38,6 @@ jobs:
       PYTHONDONTWRITEBYTECODE: "1"
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
       PIP_NO_INPUT: "1"
-      PIP_CACHE_DIR: ${{ runner.temp }}\pip-cache
-      NPM_CONFIG_CACHE: ${{ runner.temp }}\npm-cache
 
     steps:
       - name: Checkout repository
@@ -57,12 +55,14 @@ jobs:
       - name: Cache Python dependencies
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
-          path: ${{ env.PIP_CACHE_DIR }}
+          path: ${{ runner.temp }}\pip-cache
           key: pip-${{ runner.os }}-${{ hashFiles('requirements-runtime.txt', 'requirements-dev.txt', 'constraints.txt') }}
           restore-keys: |
             pip-${{ runner.os }}-
 
       - name: Install Python CI dependencies
+        env:
+          PIP_CACHE_DIR: ${{ runner.temp }}\pip-cache
         run: |
           python -m pip install -r requirements-dev.txt
           python -m pip check
@@ -83,13 +83,15 @@ jobs:
       - name: Cache npm downloads
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
-          path: ${{ env.NPM_CONFIG_CACHE }}
+          path: ${{ runner.temp }}\npm-cache
           key: npm-${{ runner.os }}-${{ hashFiles('web_ui/package-lock.json') }}
           restore-keys: |
             npm-${{ runner.os }}-
 
       - name: Install WebUI dependencies
         working-directory: web_ui
+        env:
+          NPM_CONFIG_CACHE: ${{ runner.temp }}\npm-cache
         run: npm.cmd ci
 
       - name: Typecheck WebUI
