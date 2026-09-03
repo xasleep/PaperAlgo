@@ -31,22 +31,28 @@
 
 ## Windows PowerShell 安装
 
-以下命令都从仓库根目录执行。建议 Python 3.11 和当前 LTS 版 Node.js/npm。
+以下命令都从仓库根目录执行。本项目正式支持 Windows 本地单用户安装；CI 使用 Python 3.11 与 Node.js 22.17.1，Windows 本地开发也可使用已验证的 Python 3.12。依赖不为“更新”而升级：Python 依赖由分层 requirements 文件声明，并由 `constraints.txt` 固定可复现约束；前端依赖由 `web_ui/package-lock.json` 固定。
 
 ```powershell
 py -3.11 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install --upgrade pip
-.\.venv\Scripts\python.exe -m pip install openai fastapi "uvicorn[standard]" python-multipart pytest transformers tiktoken
+.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
 
 Set-Location .\web_ui
 npm ci
 Set-Location ..
 ```
 
-`requirements.txt` 还包含面向上游本地模型路径的 `vllm`。OpenAI-compatible API + Web 控制面的 Windows 开发不需要 vLLM；只有在兼容的独立环境中确实要运行本地模型时，才使用完整依赖安装：
+依赖文件分工如下：
+
+- `requirements-runtime.txt`：运行 Web API、sqlite Worker 与 OpenAI-compatible 远程 Provider 所需的最小 runtime。
+- `requirements-dev.txt`：runtime 加 pytest/httpx 等本地测试依赖，是 CI 和日常验证入口。
+- `requirements-optional-heavy.txt`：可选重型 Provider 集成依赖，例如 Transformers 和非 Windows 环境下的 vLLM；Windows 本地 Web/API 不安装 vLLM。
+- `requirements.txt`：向后兼容入口，包含 runtime 与 optional-heavy。日常 Windows 安装优先使用 `requirements-dev.txt`。
+
+只有在兼容的独立环境中确实要运行本地模型或重型 Provider integration 时，才安装可选重型依赖：
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m pip install -r requirements-optional-heavy.txt
 ```
 
 ## 启动开发环境
@@ -77,10 +83,12 @@ Set-Location ..
 
 随后打开 `http://127.0.0.1:8000`。`web_ui/dist/` 是生成物，不进入版本管理。
 
-SQLite 过渡模式可在启动前显式启用；数据库路径可通过 `PAPER2CODE_DB_PATH` 覆盖：
+SQLite 过渡模式可在启动前显式启用。默认本地状态写入 `.local/` 和 `runs/`；干净 checkout 验证或隔离运行时可通过环境变量重定向本地状态、数据库和 runs 目录：
 
 ```powershell
 $env:JOB_RUNTIME="sqlite"
+$env:PAPER2CODE_LOCAL_DIR=Join-Path (Get-Location) ".local"
+$env:PAPER2CODE_RUNS_DIR=Join-Path (Get-Location) "runs"
 $env:PAPER2CODE_DB_PATH=Join-Path (Get-Location) ".local\paper2code.db"
 ```
 
@@ -88,6 +96,8 @@ $env:PAPER2CODE_DB_PATH=Join-Path (Get-Location) ".local\paper2code.db"
 
 ```powershell
 $env:JOB_RUNTIME="sqlite"
+$env:PAPER2CODE_LOCAL_DIR=Join-Path (Get-Location) ".local"
+$env:PAPER2CODE_RUNS_DIR=Join-Path (Get-Location) "runs"
 $env:PAPER2CODE_DB_PATH=Join-Path (Get-Location) ".local\paper2code.db"
 .\.venv\Scripts\python.exe -m web_api.worker
 ```
@@ -97,6 +107,37 @@ $env:PAPER2CODE_DB_PATH=Join-Path (Get-Location) ".local\paper2code.db"
 PR-07A 起, sqlite runtime 的任务控制命令使用 `POST /api/v1/jobs/{job_id}/commands`, 支持 `approve`, `cancel`, `retry`, `repair`, 且要求 `Idempotency-Key`。命令记录有独立 ID, request status, rejection code 和 result code；重复提交返回同一命令, 不重复执行。PR-07B 起, WebUI 只在当前 job 状态合法时启用对应按钮, 提交后显示 pending/applied/rejected 并禁止重复点击。命令只在当前 job 状态允许时接受, `identity_unresolved` 会稳定拒绝, 不猜测、kill 未知进程或启动冲突操作。旧的 `POST /api/v1/jobs/{job_id}/cancel` 保持兼容, 仍写入同一类持久化 cancel command。
 
 sqlite runtime 还提供 `GET /api/v1/jobs/{job_id}/events` SSE 流。事件 ID 来自 SQLite `job_events.id`, 单调持久化, 支持 `Last-Event-ID` 和 API 重启后的 replay。replay 有服务器上限, 超出时返回 `stream.gap` 并要求客户端通过 REST 状态重新同步。浏览器 `EventSource` 无法手动设置 `Last-Event-ID` header, 因此 endpoint 也接受同源 `last_event_id` query cursor；`eventsource=1` 时 gap 使用 HTTP 200 承载 `stream.gap`, 让浏览器能够读取 resync 指令。SSE 只传递脱敏、有限大小的增量事件；REST job status 仍是权威状态源。
+
+## 升级、迁移、备份与回滚
+
+升级前先停止 FastAPI 和 Worker，避免 SQLite WAL/SHM 或 runs 目录处于写入中。备份本地数据库、settings 和 runs：
+
+```powershell
+$stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+$backupRoot = Join-Path (Get-Location) ".local\backups\$stamp"
+New-Item -ItemType Directory -Force $backupRoot | Out-Null
+Copy-Item .local\paper2code.db* $backupRoot -Force -ErrorAction SilentlyContinue
+Copy-Item .local\web_settings.json $backupRoot -Force -ErrorAction SilentlyContinue
+Copy-Item runs (Join-Path $backupRoot "runs") -Recurse -Force -ErrorAction SilentlyContinue
+```
+
+升级 checkout 后重新安装当前版本声明的依赖并构建前端：
+
+```powershell
+git fetch origin --prune
+git switch PaperAlgo
+git pull --ff-only origin PaperAlgo
+.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+
+Set-Location .\web_ui
+npm ci
+npm run build
+Set-Location ..
+```
+
+SQLite schema 迁移由 `web_api.database.initialize_database()` 在 API/Worker 首次打开数据库时幂等执行；不会通过独立迁移命令要求用户手工编辑数据库。迁移前的备份目录保留数据库主文件以及 WAL/SHM 旁路文件，便于回滚。
+
+回滚时同样先停止 FastAPI 和 Worker，然后切回已知可用的提交或分支，按该 checkout 的依赖文件重新安装，并还原同一时间点的 `.local` 与 `runs` 备份。若新版本已经启动过 sqlite runtime，优先使用升级前备份回滚数据库，避免旧代码读取新 schema 或新状态语义。
 
 Worker 监控本地 `Popen` 时先读取真实退出码，再处理晚到的取消命令：exit 0 直接 completed 且不恢复；非零退出在没有取消时先同步已原子落盘的 checkpoint，并与 Worker 重启后确认 registered 进程死亡的场景使用同一恢复资格判断；晚到 cancel 不能把自然退出改写为 canceled，也不能触发恢复，而会原子失败为 `already_finished`。只有续租成功、取消命令仍有效、进程身份匹配且完整进程树已确认退出时才写入 `canceled`。Windows 强制终止使用同一已验证进程句柄校验 create time、终止并有界等待，不依赖无界 `taskkill /T /F`；POSIX 在发送进程组信号前也会重新校验根进程身份和 group id。
 
@@ -157,22 +198,27 @@ MinerU 是可选的外部 PDF 解析依赖，不在本仓库中安装、封装�
 Python 测试使用 fake provider、fake pipeline 和临时目录，不需要真实 API key：
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest tests -q
+$pytestBase = Join-Path (Get-Location) (".pytest_tmp_" + [guid]::NewGuid().ToString("N"))
+.\.venv\Scripts\python.exe -m pytest tests -q -rs -p no:cacheprovider --basetemp $pytestBase
 ```
 
-前端检查：
+前端检查和 fake-provider Playwright E2E：
 
 ```powershell
 Set-Location .\web_ui
+npm ci
 npm run typecheck
 npm run build
 npm run verify:same-origin
 npm run smoke
 npm run smoke:prod
+npm run e2e:fake
 Set-Location ..
 ```
 
-`smoke:prod` 需要先完成 `npm run build`。测试和构建基线详见 [docs/engineering/baseline.md](docs/engineering/baseline.md)。
+`smoke:prod` 与 `e2e:fake` 需要先完成 `npm run build`。`e2e:fake` 会启动 127.0.0.1 上的临时 FastAPI、fake Provider Registry、临时 SQLite、临时 `.local` 和临时 runs，覆盖 settings 脱敏、Provider/Model discovery、创建任务、SSE/reconnect、artifacts、cancel/retry/repair、cost/budget、浏览器刷新和 REST resync。测试和 CI 不运行真实付费 Provider、MinerU、vLLM 或完整耗时 Pipeline。
+
+GitHub Actions 的正式门禁是 Windows `ci-windows`。workflow 使用 `pull_request` 和 `push`，不使用 `pull_request_target` 执行不可信代码；权限为 `contents: read`；Python/cache key 绑定 `requirements-runtime.txt`、`requirements-dev.txt` 和 `constraints.txt`，npm/cache key 绑定 `web_ui/package-lock.json`。当前没有声明 Linux 完整支持。
 
 ## 本地单用户安全边界
 
