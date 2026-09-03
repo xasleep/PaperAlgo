@@ -110,6 +110,7 @@ def test_github_actions_release_ci_is_least_privilege_and_reproducible() -> None
     assert "pip install -r requirements-dev.txt" in workflow
     assert "pip install `\n            \"openai==" not in workflow
     assert "upload-artifact" not in workflow
+    assert workflow.index("npm.cmd run build") < workflow.index("python -m pytest tests -q -rs")
 
 
 def test_gitignore_excludes_release_outputs_databases_and_credentials() -> None:

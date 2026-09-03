@@ -195,28 +195,30 @@ MinerU 是可选的外部 PDF 解析依赖，不在本仓库中安装、封装�
 
 ## 测试与构建
 
-Python 测试使用 fake provider、fake pipeline 和临时目录，不需要真实 API key：
+完整本地门禁按 CI 顺序执行。全量 pytest 包含静态 WebUI 安全测试，因此需要先生成 `web_ui/dist/`：
 
 ```powershell
-$pytestBase = Join-Path (Get-Location) (".pytest_tmp_" + [guid]::NewGuid().ToString("N"))
-.\.venv\Scripts\python.exe -m pytest tests -q -rs -p no:cacheprovider --basetemp $pytestBase
-```
+.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+.\.venv\Scripts\python.exe -m pip check
 
-前端检查和 fake-provider Playwright E2E：
-
-```powershell
 Set-Location .\web_ui
 npm ci
 npm run typecheck
 npm run build
 npm run verify:same-origin
+Set-Location ..
+
+$pytestBase = Join-Path (Get-Location) (".pytest_tmp_" + [guid]::NewGuid().ToString("N"))
+.\.venv\Scripts\python.exe -m pytest tests -q -rs -p no:cacheprovider --basetemp $pytestBase
+
+Set-Location .\web_ui
 npm run smoke
 npm run smoke:prod
 npm run e2e:fake
 Set-Location ..
 ```
 
-`smoke:prod` 与 `e2e:fake` 需要先完成 `npm run build`。`e2e:fake` 会启动 127.0.0.1 上的临时 FastAPI、fake Provider Registry、临时 SQLite、临时 `.local` 和临时 runs，覆盖 settings 脱敏、Provider/Model discovery、创建任务、SSE/reconnect、artifacts、cancel/retry/repair、cost/budget、浏览器刷新和 REST resync。测试和 CI 不运行真实付费 Provider、MinerU、vLLM 或完整耗时 Pipeline。
+Python 测试使用 fake provider、fake pipeline 和临时目录，不需要真实 API key。`smoke:prod` 与 `e2e:fake` 需要先完成 `npm run build`。`e2e:fake` 会启动 127.0.0.1 上的临时 FastAPI、fake Provider Registry、临时 SQLite、临时 `.local` 和临时 runs，覆盖 settings 脱敏、Provider/Model discovery、创建任务、SSE/reconnect、artifacts、cancel/retry/repair、cost/budget、浏览器刷新和 REST resync。测试和 CI 不运行真实付费 Provider、MinerU、vLLM 或完整耗时 Pipeline。
 
 GitHub Actions 的正式门禁是 Windows `ci-windows`。workflow 使用 `pull_request` 和 `push`，不使用 `pull_request_target` 执行不可信代码；权限为 `contents: read`；Python/cache key 绑定 `requirements-runtime.txt`、`requirements-dev.txt` 和 `constraints.txt`，npm/cache key 绑定 `web_ui/package-lock.json`。当前没有声明 Linux 完整支持。
 

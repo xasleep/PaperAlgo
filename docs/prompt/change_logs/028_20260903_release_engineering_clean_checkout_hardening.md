@@ -33,7 +33,7 @@ Windows 本地用户默认按 `requirements-dev.txt` 和 `npm ci` 安装即可�
 - failure-first release hardening 定向测试：修改前 4 failed。
 - `python -m compileall -q codes web_api tests`：通过。
 - `python -m pytest tests/test_release_hardening.py -q -rs`：4 passed。
-- `python -m pytest tests -q -rs`：638 passed, 1 warning。
+- `python -m pytest tests -q -rs`：638 passed, 1 warning；该全量测试在 `web_ui/dist/` 构建后执行。
 - `pip install -r requirements-dev.txt` 与 `pip check`：exit 0。
 - `npm ci`、`npm audit --omit=dev`、`npm audit`：全部 exit 0，0 vulnerabilities。
 - `npm run typecheck`、`npm run build`、`npm run verify:same-origin`、`npm run smoke`、`npm run smoke:prod`、`npm run e2e:fake`：全部 exit 0。

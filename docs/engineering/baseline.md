@@ -22,24 +22,23 @@ PR-04B checkpoint 采用固定 schema、64 KiB 上限、原子替换、连续 st
 
 ## 验证命令
 
-从仓库根目录执行 Python 测试：
+从仓库根目录按 CI 顺序执行完整本地门禁。全量 pytest 包含静态 WebUI 安全测试，因此需要先生成 `web_ui/dist/`：
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
 .\.venv\Scripts\python.exe -m pip check
 
-$pytestBase = Join-Path (Get-Location) (".pytest_tmp_" + [guid]::NewGuid().ToString("N"))
-.\.venv\Scripts\python.exe -m pytest tests -q -rs -p no:cacheprovider --basetemp $pytestBase
-```
-
-执行前端类型检查和构建：
-
-```powershell
 Set-Location .\web_ui
 npm ci
 npm run typecheck
 npm run build
 npm run verify:same-origin
+Set-Location ..
+
+$pytestBase = Join-Path (Get-Location) (".pytest_tmp_" + [guid]::NewGuid().ToString("N"))
+.\.venv\Scripts\python.exe -m pytest tests -q -rs -p no:cacheprovider --basetemp $pytestBase
+
+Set-Location .\web_ui
 npm run smoke
 npm run smoke:prod
 npm run e2e:fake
