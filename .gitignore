@@ -13,6 +13,13 @@ htmlcov/
 *.py[cod]
 *.egg-info/
 build/
+*.db
+*.sqlite
+*.sqlite3
+*.db-wal
+*.db-shm
+*.sqlite-wal
+*.sqlite-shm
 
 mineru_outputs/
 outputs/
@@ -34,13 +41,16 @@ api.txt
 # Frontend dependency and build output.
 node_modules/
 dist/
+web_ui/dist/
 *.tsbuildinfo
 
 # Browser automation and test artifacts.
+.playwright/
 .playwright-mcp/
 playwright-report/
 test-results/
 coverage/
+web_ui/coverage/
 
 # Editor, OS, and local scratch files.
 .idea/

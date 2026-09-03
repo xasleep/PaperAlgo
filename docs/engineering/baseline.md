@@ -8,6 +8,8 @@
 
 当前提供标准库 SQLite 持久化控制面，但默认 `JOB_RUNTIME=legacy` 仍保持既有子进程行为；`JOB_RUNTIME=sqlite` 由 `python -m web_api.worker` 启动独立单并发 Worker，并提供 PID/create-time 进程级 reconciliation、固定阶段 checkpoint、默认最多 1 次的受限恢复、持久化 job commands 和可重放 SSE job event stream。checkpoint adapter、command application 和 replayable SSE 只由 SQLite runtime 启用，legacy runtime 不获得阶段恢复或 SSE。当前没有任意语句级 checkpoint、exactly-once、WebSocket、Celery、Redis、PostgreSQL、Kubernetes 或 LangGraph。WebUI 任务详情页使用 REST 权威快照 + 同源 EventSource；只有 SSE 不可用时才进入明确的低频 REST fallback。FastAPI 只支持单实例。
 
+PR-08 起，Python 依赖拆分为最小 runtime、dev/test 和 optional-heavy 三层，并由 `constraints.txt` 固定复现约束；前端依赖仍由 `web_ui/package-lock.json` 固定。Windows 是正式支持平台。GitHub Actions 使用 least-privilege `contents: read`、`pull_request`/`push` 触发和 lock/constraint 绑定缓存，不使用 `pull_request_target` 执行不可信代码。`PAPER2CODE_LOCAL_DIR`、`PAPER2CODE_RUNS_DIR` 和 `PAPER2CODE_DB_PATH` 可把 settings、SQLite 和 runs 重定向到临时目录，供 clean-checkout 和 fake E2E 使用。
+
 PR-05 的 Provider Registry v1 是封闭且深度不可变的显式契约；未知 schema 字段、非法 request options、非有限/越界数字和不可信 fallback 直接以脱敏错误拒绝。`GET /api/v1/providers` 从当前 Registry 动态生成 WebUI 可选项，只返回非敏感 ID/能力并使用 `no-store`；`settings/status` 仍只返回布尔状态。SQLite queued job 固定 Provider/Model/fallback、Registry version 和 Contract SHA-256，不保存 key 或 base URL。Worker 只允许同一选择下轮换凭据，不匹配或缺少快照时在 `Popen` 前以 `provider_settings_changed` fail closed；legacy runtime 不变。API key 仍是本地明文 settings 与临时子进程环境数据，不是加密存储。PR-06B 已实现 SQLite append-only remote-call cost ledger 和 hard budget 预调用 enforcement；PR-07A 已实现后端 SSE event stream 和 persisted job commands。
 
 PR-06A 的 Evaluation Contract 将 execution、evaluation、quality verdict 和 repair policy 分离。Evaluator timeout、Provider protocol error、malformed response、unavailable 和 quorum 不足不会被写成质量不合格；只有 evaluator completed 且 quality rejected 才能触发 repair。`files_to_fix=[]` 表示不修改任何文件，非空 repair 目标必须重新通过 TaskManifest 和 repo 路径验证。Evaluation result、feedback、repo status、SQLite events 和 summaries 不保存 prompt、完整模型响应或凭据。PR-06B 的成本账本独立于 Evaluation Contract，仅返回 job 级 summary；PR-07A 的 SSE 只传递脱敏增量事件, REST 状态仍是权威来源。PR-07B 的 WebUI 将 execution、evaluation/quality、repair/recovery 和 cost/budget 分开展示, 并通过 REST resync 保持刷新、后退和重连后一致。
@@ -20,25 +22,30 @@ PR-04B checkpoint 采用固定 schema、64 KiB 上限、原子替换、连续 st
 
 ## 验证命令
 
-从仓库根目录执行 Python 测试：
+从仓库根目录按 CI 顺序执行完整本地门禁。全量 pytest 包含静态 WebUI 安全测试，因此需要先生成 `web_ui/dist/`：
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest tests -q
-```
+.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+.\.venv\Scripts\python.exe -m pip check
 
-执行前端类型检查和构建：
-
-```powershell
 Set-Location .\web_ui
+npm ci
 npm run typecheck
 npm run build
 npm run verify:same-origin
+Set-Location ..
+
+$pytestBase = Join-Path (Get-Location) (".pytest_tmp_" + [guid]::NewGuid().ToString("N"))
+.\.venv\Scripts\python.exe -m pytest tests -q -rs -p no:cacheprovider --basetemp $pytestBase
+
+Set-Location .\web_ui
 npm run smoke
 npm run smoke:prod
+npm run e2e:fake
 Set-Location ..
 ```
 
-`npm run build` 生成 `web_ui/dist/`；`npm run smoke:prod` 必须在构建后运行。`node_modules/`、`dist/` 和 `*.tsbuildinfo` 不进入版本管理，`package-lock.json` 必须进入版本管理。
+`npm run build` 生成 `web_ui/dist/`；`npm run smoke:prod` 和 `npm run e2e:fake` 必须在构建后运行。`node_modules/`、`dist/`、`web_ui/dist/`、coverage、Playwright 报告和 `*.tsbuildinfo` 不进入版本管理，`package-lock.json` 必须进入版本管理。
 
 ## 2026-07-22 PR-04A 重新验收快照
 
@@ -81,11 +88,26 @@ Set-Location ..
 
 该快照验证的是后端 replayable SSE、持久化 job command、idempotency、gap/resync、origin/CSRF 边界、Worker lease fencing 与 PR-04 至 PR-06 回归, 不代表 WebUI EventSource 接入、WebSocket、多用户或分布式队列。
 
+## 2026-09-03 PR-08 当前 checkout 验收快照
+
+- failure-first release hardening 定向测试: 修改前 4 failed, 覆盖本地状态目录重定向、依赖分层、CI cache/权限/E2E 和 `.gitignore` 规则。
+- python -m compileall -q codes web_api tests: 通过。
+- python -m pytest tests/test_release_hardening.py: 4 passed。
+- python -m pytest tests -q -rs: 638 passed, 1 warning。
+- pip install -r requirements-dev.txt: exit 0；pip check: exit 0。
+- npm ci: exit 0, 0 vulnerabilities。
+- npm audit --omit=dev: exit 0, 0 vulnerabilities；npm audit: exit 0, 0 vulnerabilities。
+- WebUI typecheck、build、verify:same-origin、smoke、smoke:prod: 全部 exit 0。
+- npm run e2e:fake: exit 0, 覆盖 settings 脱敏、Provider/Model discovery、create job、SSE/reload、REST refresh、artifacts、cancel、retry、repair 和 cost/budget。
+
+该快照验证的是 PR-08 的 release engineering、可复现依赖入口、Windows CI workflow 静态合同、本地状态目录可重定向和 fake-provider 浏览器 E2E。测试使用 fake Provider、fake pipeline、临时 SQLite 和临时 runs；未运行真实付费 LLM、MinerU、vLLM、公共部署、多用户认证、tag 或 GitHub Release。
+
 ## 测试政策
 
 - 自动化测试只使用 fake provider、fake pipeline、mock/monkeypatch 和临时目录。
 - 测试不得调用真实付费 LLM、MinerU、vLLM 或完整耗时 Pipeline。
 - 测试不得依赖开发者机器的绝对路径、真实 API key 或既有运行目录。
+- fake-provider Playwright E2E 必须使用 fake Registry、临时 settings、临时 SQLite、临时 runs 和本地 loopback FastAPI；浏览器可见文本、CI 日志和测试输出不得包含 API key、settings 原文、Prompt 或本机路径。
 - 涉及输入、路径、导出、环境变量或敏感数据的新安全逻辑，先增加失败/攻击测试，再实现修复。
 - 不允许通过捕获所有异常、返回空结果或强制成功退出掩盖错误。
 
@@ -111,12 +133,14 @@ PR-05 本地验收快照（2026-08-06）：定向 Provider Registry 验收 `199 
 - `tests/` 中的 Python 测试；
 - 根 `README.md`、`docs/` 下的说明、ADR 和 change logs；
 - `web_ui/package.json`、`web_ui/package-lock.json`、TypeScript/Vite 配置和 `web_ui/index.html`；
-- `.gitignore`、`requirements.txt`、启动脚本、经确认可分发且有意长期维护的示例输入及上游 `LICENSE`。
+- `.gitignore`、`requirements.txt`、`requirements-runtime.txt`、`requirements-dev.txt`、`requirements-optional-heavy.txt`、`constraints.txt`、启动脚本、经确认可分发且有意长期维护的示例输入及上游 `LICENSE`。
 
 必须保持忽略：
 
 - Python/Node 环境和缓存：`.venv/`、`__pycache__/`、`.pytest_cache/`、`node_modules/`、`*.pyc`、`*.tsbuildinfo`；
-- 构建与运行产物：`dist/`、`.local/`、`runs/`、`outputs/`、`results/`、`mineru_outputs/`、`*.log`；
+- 构建与运行产物：`dist/`、`web_ui/dist/`、`.local/`、`runs/`、`outputs/`、`results/`、`mineru_outputs/`、`*.log`；
+- 数据库和旁路文件：`*.db`、`*.sqlite`、`*.sqlite3`、`*.db-wal`、`*.db-shm`、`*.sqlite-wal`、`*.sqlite-shm`；
+- 测试和浏览器产物：`.pytest_tmp*/`、`coverage/`、`web_ui/coverage/`、`playwright-report/`、`test-results/`、`.playwright/`、`.playwright-mcp/`；
 - secrets：`.env`、`.env.*`（保留可提交的 `.env.example`）、`api.txt`、私钥和证书文件。
 
 ## 已知限制

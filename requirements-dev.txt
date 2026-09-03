@@ -1,0 +1,7 @@
+# Developer and CI test dependencies. This intentionally excludes MinerU,
+# vLLM, browser downloads, real providers, and long-running model pipelines.
+-c constraints.txt
+-r requirements-runtime.txt
+
+pytest>=8.0.0
+httpx>=0.28.0

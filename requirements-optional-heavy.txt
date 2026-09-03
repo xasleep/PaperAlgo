@@ -1,0 +1,6 @@
+# Optional heavyweight local-model dependencies for legacy vLLM scripts.
+# These are not part of the Windows-supported CI or fake-provider E2E gates.
+-c constraints.txt
+
+transformers>=4.46.3
+vllm>=0.6.4.post1; platform_system != "Windows"
