@@ -65,8 +65,10 @@ def test_pr_04a_architecture_docs_match_runtime_contract() -> None:
     assert "Worker 重启" in repository_guide
 
     assert "/api/v1" in webui_readme
-    assert "2 seconds" in webui_readme
-    assert "SSE" in webui_readme
+    assert "same-origin `EventSource`" in webui_readme
+    assert "REST resync" in webui_readme
+    assert "15 second REST fallback" in webui_readme
+    assert "old infinite 2 second polling loop" in webui_readme
     assert "asynchronous" in webui_readme
     assert "does not return API key" in webui_readme
 

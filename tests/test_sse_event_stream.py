@@ -147,6 +147,38 @@ def test_sse_replay_limit_reports_gap_without_silently_skipping_events(
     assert "job.status_changed" not in response.text
 
 
+def test_eventsource_gap_mode_uses_200_so_browser_can_receive_resync_event(
+    sse_client: tuple[TestClient, JobRepository, Path],
+) -> None:
+    client, repository, _ = sse_client
+    repository.transition_job("sse_job", expected_version=1, execution_status="running")
+    repository.record_job_event(
+        "sse_job",
+        event_type="job.synthetic_progress",
+        source="worker",
+        job_version=2,
+        execution_status="running",
+        evaluation_status="pending",
+        quality_status="pending",
+    )
+
+    response = client.get(
+        f"{API_PREFIX}/jobs/sse_job/events",
+        headers={"Origin": LOCAL_ORIGIN},
+        params={
+            "follow": "false",
+            "replay_limit": "1",
+            "last_event_id": "0",
+            "eventsource": "1",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert "event: stream.gap" in response.text
+    assert '"resync_required":true' in response.text
+
+
 def test_sse_heartbeat_has_no_persisted_event_id(
     sse_client: tuple[TestClient, JobRepository, Path],
 ) -> None:
@@ -169,7 +201,7 @@ def test_sse_heartbeat_has_no_persisted_event_id(
             last_event_id=1,
             replay_limit=10,
             poll_seconds=0.001,
-            heartbeat_seconds=0.001,
+            heartbeat_seconds=0.0,
         )
         return await anext(stream)
 

@@ -69,6 +69,10 @@ export type JobStatus =
 
 export type CostBudgetPolicy = "none" | "hard";
 
+export type JobCommandType = "approve" | "cancel" | "retry" | "repair";
+export type JobCommandStatus = "pending" | "claimed" | "completed" | "failed" | "rejected";
+export type JobCommandRequestStatus = "accepted" | "rejected";
+
 export type CostSummary = {
   attempt_count: number;
   status_counts: Record<string, number>;
@@ -109,6 +113,18 @@ export type JobListItem = {
   repo_status: string | null;
   eval_score: number | null;
   run_dir: string;
+  execution_status?: string | null;
+  evaluation_status?: string | null;
+  quality_status?: string | null;
+  failure_code?: string | null;
+  version?: number | null;
+  reproduce_provider?: string | null;
+  reproduce_model?: string | null;
+  evaluation_provider?: string | null;
+  evaluation_model?: string | null;
+  evaluation_fallback_models?: string[] | null;
+  provider_registry_version?: number | null;
+  provider_contract_fingerprint?: string | null;
   cost_budget_policy?: CostBudgetPolicy | null;
   cost_budget_currency?: string | null;
   cost_budget_amount?: string | null;
@@ -166,6 +182,26 @@ export type CancelResponse = {
   job_id: string;
   canceled: boolean;
   message: string;
+};
+
+export type JobCommand = {
+  command_id: number;
+  job_id: string;
+  command_type: JobCommandType;
+  status: JobCommandStatus;
+  request_status: JobCommandRequestStatus;
+  error_code: string | null;
+  rejection_code: string | null;
+  result_code: string | null;
+  created_at: string;
+  claimed_at: string | null;
+  completed_at: string | null;
+  updated_at: string | null;
+  version: number;
+};
+
+export type JobCommandsResponse = {
+  commands: JobCommand[];
 };
 
 export type LogsResponse = {

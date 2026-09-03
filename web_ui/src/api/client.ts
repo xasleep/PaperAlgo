@@ -4,6 +4,9 @@ import type {
   CancelResponse,
   JobCreateResponse,
   JobCreatePayload,
+  JobCommand,
+  JobCommandType,
+  JobCommandsResponse,
   JobDetail,
   JobListItem,
   LogsResponse,
@@ -26,6 +29,13 @@ let csrfToken: string | null = null;
 
 function apiUrl(path: string): string {
   return `${API_BASE_URL}${API_PREFIX}${path}`;
+}
+
+function idempotencyKey(): string {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+    return crypto.randomUUID();
+  }
+  return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
 type ErrorEnvelope = {
@@ -172,6 +182,16 @@ export const api = {
     requestJson<CancelResponse>(`/jobs/${encodeURIComponent(jobId)}/cancel`, {
       method: "POST",
     }),
+
+  createJobCommand: (jobId: string, commandType: JobCommandType, key = idempotencyKey()) =>
+    requestJson<JobCommand>(`/jobs/${encodeURIComponent(jobId)}/commands`, {
+      method: "POST",
+      headers: { "Idempotency-Key": key },
+      body: JSON.stringify({ command_type: commandType }),
+    }),
+
+  listJobCommands: (jobId: string) =>
+    requestJson<JobCommandsResponse>(`/jobs/${encodeURIComponent(jobId)}/commands`),
 
   getArtifacts: (jobId: string) =>
     requestJson<ArtifactSummary>(`/jobs/${encodeURIComponent(jobId)}/artifacts`),

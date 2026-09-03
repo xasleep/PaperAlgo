@@ -24,7 +24,7 @@
 - `web_api/` 是轻量控制面，负责输入校验、本地 settings、任务元数据和 artifacts。legacy runtime 由 FastAPI 启动子进程；sqlite runtime 由独立 Worker 启动子进程。两者都调用 `codes/run_pipeline.py`，不替代执行内核。
 - `codes/run_pipeline.py` 负责 MinerU、规划、分析、编码、评测和可选自动修复的阶段编排。
 - 默认 `JOB_RUNTIME=legacy` 继续使用 `runs/` 下的 JSON/文件状态并由 FastAPI 直接启动 Pipeline；`JOB_RUNTIME=sqlite` 使用 `.local/paper2code.db` 和独立的单并发 Worker 消费 queued job。
-- 当前 WebUI 对运行中任务每 2 秒轮询；sqlite runtime 同时提供后端 `GET /api/v1/jobs/{job_id}/events` SSE 事件流用于后续 WebUI 接入。本 checkout 没有 WebSocket。
+- 当前 WebUI 在任务详情页先读取 REST 权威快照, 再通过同源 `EventSource` 消费 sqlite runtime 的 `GET /api/v1/jobs/{job_id}/events` SSE 事件流；发现 replay gap 时重新读取 REST 快照后继续跟流。SSE 不可用时才进入明确的低频 REST fallback, 不再与 SSE 同时进行无限 2 秒轮询。本 checkout 没有 WebSocket。
 - legacy runtime 的活跃进程句柄仍保存在 FastAPI 内存中，FastAPI 重启后不能接管原进程；sqlite runtime 由独立 Worker 保存 launch state、PID、进程 create time、launch token 和 heartbeat，并可在 API 或 Worker 重启后进行进程级 reconciliation。
 
 更细的模块说明见 [docs/info/全仓目录结构与模块说明.md](docs/info/全仓目录结构与模块说明.md)，工程决策见 [docs/adr/](docs/adr/)。
@@ -94,9 +94,9 @@ $env:PAPER2CODE_DB_PATH=Join-Path (Get-Location) ".local\paper2code.db"
 
 该模式的 `POST /api/v1/jobs` 支持 `Idempotency-Key`，只写入 queued 记录，由持有全局 lease 的 Worker 使用 `BEGIN IMMEDIATE` 原子领取。`worker_id` 仅用于诊断；lease 与所有 Worker 状态写入都由 `worker_id + instance_token` 共同 fencing，同名的旧 Worker 不能继续续租、完成任务或释放新实例的 lease。queued 任务的取消命令由 Worker 直接消费且不会启动 Pipeline；running 任务的取消也是异步幂等命令，不由 FastAPI 直接 kill。Worker 验证 PID 与 create time 后先优雅终止、最多等待 10 秒，再强制终止完整进程树，确认退出后才写入 `canceled`。
 
-PR-07A 起, sqlite runtime 的任务控制命令使用 `POST /api/v1/jobs/{job_id}/commands`, 支持 `approve`, `cancel`, `retry`, `repair`, 且要求 `Idempotency-Key`。命令记录有独立 ID, request status, rejection code 和 result code；重复提交返回同一命令, 不重复执行。命令只在当前 job 状态允许时接受, `identity_unresolved` 会稳定拒绝, 不猜测、kill 未知进程或启动冲突操作。旧的 `POST /api/v1/jobs/{job_id}/cancel` 保持兼容, 仍写入同一类持久化 cancel command。
+PR-07A 起, sqlite runtime 的任务控制命令使用 `POST /api/v1/jobs/{job_id}/commands`, 支持 `approve`, `cancel`, `retry`, `repair`, 且要求 `Idempotency-Key`。命令记录有独立 ID, request status, rejection code 和 result code；重复提交返回同一命令, 不重复执行。PR-07B 起, WebUI 只在当前 job 状态合法时启用对应按钮, 提交后显示 pending/applied/rejected 并禁止重复点击。命令只在当前 job 状态允许时接受, `identity_unresolved` 会稳定拒绝, 不猜测、kill 未知进程或启动冲突操作。旧的 `POST /api/v1/jobs/{job_id}/cancel` 保持兼容, 仍写入同一类持久化 cancel command。
 
-sqlite runtime 还提供 `GET /api/v1/jobs/{job_id}/events` SSE 流。事件 ID 来自 SQLite `job_events.id`, 单调持久化, 支持 `Last-Event-ID` 和 API 重启后的 replay。replay 有服务器上限, 超出时返回 `stream.gap` 并要求客户端通过 REST 状态重新同步。SSE 只传递脱敏、有限大小的增量事件；REST job status 仍是权威状态源。WebUI `EventSource` 接入留给 PR-07B。
+sqlite runtime 还提供 `GET /api/v1/jobs/{job_id}/events` SSE 流。事件 ID 来自 SQLite `job_events.id`, 单调持久化, 支持 `Last-Event-ID` 和 API 重启后的 replay。replay 有服务器上限, 超出时返回 `stream.gap` 并要求客户端通过 REST 状态重新同步。浏览器 `EventSource` 无法手动设置 `Last-Event-ID` header, 因此 endpoint 也接受同源 `last_event_id` query cursor；`eventsource=1` 时 gap 使用 HTTP 200 承载 `stream.gap`, 让浏览器能够读取 resync 指令。SSE 只传递脱敏、有限大小的增量事件；REST job status 仍是权威状态源。
 
 Worker 监控本地 `Popen` 时先读取真实退出码，再处理晚到的取消命令：exit 0 直接 completed 且不恢复；非零退出在没有取消时先同步已原子落盘的 checkpoint，并与 Worker 重启后确认 registered 进程死亡的场景使用同一恢复资格判断；晚到 cancel 不能把自然退出改写为 canceled，也不能触发恢复，而会原子失败为 `already_finished`。只有续租成功、取消命令仍有效、进程身份匹配且完整进程树已确认退出时才写入 `canceled`。Windows 强制终止使用同一已验证进程句柄校验 create time、终止并有界等待，不依赖无界 `taskkill /T /F`；POSIX 在发送进程组信号前也会重新校验根进程身份和 group id。
 
@@ -132,7 +132,7 @@ PR-06B 起，SQLite runtime 为经过 Provider Registry 的真实远程 LLM atte
 
 成本计算只使用 Registry 中已验证的价格和 provider 返回的 usage。未返回 usage 保持 unknown，不记为 0；未验证价格保持 unknown，不猜测；不同 currency 按币种分别汇总，不做汇率合并。失败、取消、timeout 和 provider error 后如果 provider 暴露 partial usage，账本保留已知部分成本并标记为 actual 或 estimated。创建 SQLite job 可选择 `cost_budget_policy="hard"` 并提供 `cost_budget_currency` 与 Decimal 字符串 `cost_budget_amount`；默认 policy 为 `none`。hard budget 在远程调用前用 SQLite `BEGIN IMMEDIATE` 原子检查和预占上界；若价格、输入 token、输出 token 上界或币种无法确定，则按文档化策略 fail closed，不发起远程调用。
 
-当前边界仍是 Windows、本地单用户、`127.0.0.1`、单 FastAPI 与单 Worker；`.local/web_settings.json` 和子进程环境中的 API key 不是加密凭据存储。PR-07A 不实现 WebUI `EventSource` 接入、WebSocket、多用户、公共互联网、分布式队列、汇率服务或真实付费测试调用。
+当前边界仍是 Windows、本地单用户、`127.0.0.1`、单 FastAPI 与单 Worker；`.local/web_settings.json` 和子进程环境中的 API key 不是加密凭据存储。PR-07B 不实现 WebSocket、多用户、公共互联网、分布式队列、汇率服务、正式 Playwright E2E 框架或真实付费测试调用。
 
 ## Evaluation 与 Repair 契约
 
