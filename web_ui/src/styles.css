@@ -32,6 +32,12 @@ button:disabled {
   opacity: 0.55;
 }
 
+button:focus-visible,
+a:focus-visible {
+  outline: 2px solid rgba(63, 127, 115, 0.45);
+  outline-offset: 2px;
+}
+
 a {
   color: inherit;
 }
@@ -418,6 +424,84 @@ td {
   padding: 16px;
 }
 
+.live-panel,
+.cost-panel,
+.command-panel {
+  display: grid;
+  gap: 12px;
+  padding: 16px;
+}
+
+.live-panel {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.cost-panel {
+  grid-template-columns: minmax(0, 1fr) minmax(260px, 0.45fr);
+}
+
+.cost-section {
+  min-width: 0;
+}
+
+.cost-lines {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.cost-lines span,
+.command-state {
+  display: inline-flex;
+  align-items: center;
+  min-height: 26px;
+  padding: 4px 8px;
+  border: 1px solid #d6dbe1;
+  border-radius: 999px;
+  background: #f6f7f9;
+  color: #3f4853;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.command-panel {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.command-button {
+  justify-content: flex-start;
+  min-width: 0;
+}
+
+.command-button span:not(.command-state) {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.command-state {
+  margin-left: auto;
+  white-space: normal;
+}
+
+.command-state-pending {
+  border-color: #b9cee8;
+  background: #eef5ff;
+  color: #285c91;
+}
+
+.command-state-applied {
+  border-color: #bad5c5;
+  background: #eff8f1;
+  color: #28613e;
+}
+
+.command-state-rejected {
+  border-color: #edc5c5;
+  background: #fff5f5;
+  color: #9e2e2e;
+}
+
 .metric {
   min-width: 0;
 }
@@ -565,6 +649,9 @@ td {
   .form-grid.single,
   .detail-grid,
   .artifact-grid,
+  .live-panel,
+  .cost-panel,
+  .command-panel,
   .log-viewer,
   .repo-browser {
     grid-template-columns: 1fr;
@@ -572,5 +659,14 @@ td {
 
   .download-button {
     margin-left: 0;
+  }
+}
+
+@media (min-width: 821px) and (max-width: 1180px) {
+  .detail-grid,
+  .artifact-grid,
+  .live-panel,
+  .command-panel {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }

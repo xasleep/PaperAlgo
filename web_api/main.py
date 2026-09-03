@@ -568,8 +568,10 @@ def job_events(
     request: Request,
     job_id: str,
     last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
+    last_event_id_query: int | None = Query(default=None, ge=0, alias="last_event_id"),
     replay_limit: int = Query(default=DEFAULT_REPLAY_LIMIT, ge=1, le=MAX_REPLAY_LIMIT),
     follow: bool = Query(default=True),
+    eventsource: bool = Query(default=False),
 ):
     origin_error = validate_request_origin(request)
     if origin_error is not None:
@@ -579,7 +581,11 @@ def job_events(
             "Job event streaming is available only for the SQLite runtime."
         )
     validated_job_id = validate_job_id(job_id)
-    parsed_last_event_id = _parse_last_event_id(last_event_id)
+    parsed_last_event_id = (
+        last_event_id_query
+        if last_event_id_query is not None and (last_event_id is None or last_event_id == "")
+        else _parse_last_event_id(last_event_id)
+    )
     repository = _sqlite_repository()
     replay = repository.list_job_events_after(
         validated_job_id,
@@ -599,7 +605,7 @@ def job_events(
                     )
                 ]
             ),
-            status_code=409,
+            status_code=200 if eventsource else 409,
             media_type="text/event-stream",
             headers=SSE_HEADERS,
         )

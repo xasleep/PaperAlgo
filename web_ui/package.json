@@ -7,6 +7,7 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "typecheck": "tsc -b",
+    "test:live-status": "node scripts/test-live-status.mjs",
     "smoke": "node scripts/smoke-webui.mjs",
     "smoke:prod": "node scripts/smoke-prod-webui.mjs",
     "verify:same-origin": "node scripts/verify-same-origin.mjs",

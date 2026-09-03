@@ -79,12 +79,19 @@ session cookie uses `SameSite=Strict`.
 
 ## Current Runtime Semantics
 
-The job detail UI polls active jobs every 2 seconds. SSE and WebSocket event streams
-are not implemented. In SQLite runtime, cancellation is asynchronous: the API creates one
-idempotent cancel command and the independent Worker performs verified process-
-tree termination. The response acknowledges the request; it does not mean the
-job is already canceled. Legacy cancellation remains owned by the FastAPI
-process that launched the Pipeline.
+The job detail UI loads an authoritative REST snapshot first, then follows the
+SQLite runtime job stream with same-origin `EventSource`. Replay gaps trigger a
+REST resync before the stream reconnects from the latest safe cursor. If SSE is
+unavailable after bounded reconnect attempts, the page switches to an explicit
+15 second REST fallback. It does not run the old infinite 2 second polling loop
+at the same time as SSE.
+
+In SQLite runtime, approve, cancel, retry, and repair are persisted asynchronous
+job commands with an `Idempotency-Key`. The UI enables each button only in legal
+states and shows pending, applied, or rejected from the persisted command record. Legacy
+cancellation remains owned by the FastAPI process that launched the Pipeline;
+if the command API is unavailable, the cancel button falls back to the legacy
+cancel endpoint while approve, retry, and repair stay disabled.
 
 Settings status returns only boolean configuration flags and does not return API key
 values. Keys are stored locally in `.local/web_settings.json` as plaintext JSON;
@@ -102,14 +109,17 @@ In SQLite runtime, a queued job keeps a non-sensitive selection snapshot. A
 later settings change cannot silently rebind it: the Worker accepts rotated
 credentials for the same selection, but fails before process creation when the
 selection, Registry version, or contract fingerprint differs. Legacy runtime
-behavior is unchanged. The current product remains Windows/local single-user,
-loopback-only, one FastAPI process and one Worker; PR-06 cost ledger and PR-07
-SSE are not implemented.
+behavior is unchanged. Cost display preserves unknown attempts and lists amounts
+by currency without exchange-rate conversion. The current product remains
+Windows/local single-user, loopback-only, one FastAPI process and one Worker;
+there is no WebSocket, multi-user auth, distributed queue, formal Playwright E2E
+framework, or real-provider smoke call.
 
 ## Checks
 
 ```powershell
 npm run typecheck
+npm run test:live-status
 npm run build
 npm run verify:same-origin
 npm run smoke
