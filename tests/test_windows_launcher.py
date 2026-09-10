@@ -33,7 +33,12 @@ def _ps_quote(path: Path) -> str:
     return "'" + str(path).replace("'", "''") + "'"
 
 
-def _run_ps_file(script: Path, *args: str, timeout: int = 60) -> subprocess.CompletedProcess[str]:
+def _run_ps_file(
+    script: Path,
+    *args: str,
+    timeout: int = 60,
+    capture_output: bool = False,
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [
             PS,
@@ -43,8 +48,8 @@ def _run_ps_file(script: Path, *args: str, timeout: int = 60) -> subprocess.Comp
             *args,
         ],
         cwd=REPO_ROOT,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdout=subprocess.PIPE if capture_output else subprocess.DEVNULL,
+        stderr=subprocess.PIPE if capture_output else subprocess.DEVNULL,
         text=True,
         timeout=timeout,
     )
@@ -205,8 +210,9 @@ def test_install_script_creates_valid_shortcuts_in_temp_directory(tmp_path: Path
         "-SkipBuild",
         "-Quiet",
         timeout=30,
+        capture_output=True,
     )
-    assert completed.returncode == 0
+    assert completed.returncode == 0, completed.stdout + completed.stderr
 
     start_link = shortcut_dir / "启动 PaperAlgo.lnk"
     stop_link = shortcut_dir / "停止 PaperAlgo.lnk"
