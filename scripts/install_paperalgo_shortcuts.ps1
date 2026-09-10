@@ -91,12 +91,14 @@ try {
 
     $shell = New-Object -ComObject WScript.Shell
     $shortcutPath = Join-Path $desktop $startShortcutName
-    $shortcut = $shell.CreateShortcut($shortcutPath)
+    $temporaryShortcutPath = Join-Path $desktop ("PaperAlgo-start-{0}.lnk" -f ([guid]::NewGuid().ToString("N")))
+    $shortcut = $shell.CreateShortcut($temporaryShortcutPath)
     $shortcut.TargetPath = $pythonwPath
     $shortcut.Arguments = Quote-ShortcutArgument -Value $startScriptPath
     $shortcut.WorkingDirectory = $repoRoot
     $shortcut.IconLocation = $pythonwPath
     $shortcut.Save()
+    Move-Item -LiteralPath $temporaryShortcutPath -Destination $shortcutPath -Force
     if (-not $Quiet) {
         Show-InstallMessage -Title "PaperAlgo shortcut installed" -Message ("PaperAlgo shortcut is installed in: {0}" -f $desktop)
     }
