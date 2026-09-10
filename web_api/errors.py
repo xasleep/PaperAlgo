@@ -207,6 +207,12 @@ class JobCommandRejectedError(ContractError):
         self.reason = reason
 
 
+class SystemStopBlockedError(ContractError):
+    status_code = 409
+    code = "system_stop_blocked"
+    default_message = "PaperAlgo cannot stop while jobs are active or recovering."
+
+
 class ArtifactNotAvailableError(ContractError, FileNotFoundError):
     status_code = 404
     code = "artifact_not_available"

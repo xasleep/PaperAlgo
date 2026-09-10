@@ -83,6 +83,38 @@ Set-Location ..
 
 随后打开 `http://127.0.0.1:8000`。`web_ui/dist/` 是生成物，不进入版本管理。
 
+## Windows 一键启动
+
+一次性前置条件仍是已创建 Python 虚拟环境, 已安装 Python 依赖, 并且 `web_ui\node_modules\` 中已有本仓库锁定的 npm 依赖。一键安装不会自动执行 `pip install`, `npm install` 或 `npm ci`。
+
+从仓库根目录执行一次安装脚本:
+
+```powershell
+.\scripts\install_paperalgo_shortcuts.ps1
+```
+
+安装脚本会先执行 `npm run build` 和 `npm run verify:same-origin`, 生成生产 WebUI, 然后在当前用户桌面创建或更新唯一的“启动 PaperAlgo”快捷方式, 并移除旧版独立停止快捷方式。仓库移动后需要重新运行该安装脚本, 因为桌面快捷方式会保存安装当时的脚本绝对路径。
+
+日常使用只需要双击“启动 PaperAlgo”, 不需要打开三个 PowerShell 窗口。启动器会在后台运行两个进程: FastAPI 和 SQLite Worker。FastAPI 固定监听 `http://127.0.0.1:8000`, 并同源托管已经构建好的 WebUI; Vite 的 `5173` 开发服务器不参与日常运行。重复双击“启动 PaperAlgo”不会创建重复的 FastAPI 或 Worker, 只会重新检查健康状态并打开浏览器。
+
+如需停止, 点击 WebUI 顶部的 Stop 按钮并确认。停止前会读取本地任务列表; 如果存在 `queued`, `starting`, `running`, `identity_unresolved`, recovery prepared/running 或任何未知、非终态任务状态, 会拒绝停止并提示先在 WebUI 中取消任务或等待结束。停止脚本不会替用户调用取消接口, 不会关闭浏览器, 也不会查杀 Pipeline 子进程。Windows 空闲停止不等于 Worker 信号级优雅退出; 立即重启时, 旧 Worker lease 可能需要正常过期, 默认配置下可能接近 30 秒。
+
+启动器状态和日志保存在:
+
+```text
+.local\launcher\
+.local\launcher\logs\
+```
+
+SQLite 数据库和任务目录仍是:
+
+```text
+.local\paper2code.db
+runs\
+```
+
+一键启动本身不会调用模型, 但如果 SQLite 数据库中已有 queued job, Worker 启动后可能继续执行既有任务。真实论文任务仍可能调用付费 Provider 和本地 MinerU; 需要无费用验证时使用 fake provider 或隔离 smoke 测试。
+
 SQLite 过渡模式可在启动前显式启用。默认本地状态写入 `.local/` 和 `runs/`；干净 checkout 验证或隔离运行时可通过环境变量重定向本地状态、数据库和 runs 目录：
 
 ```powershell

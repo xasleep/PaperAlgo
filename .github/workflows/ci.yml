@@ -67,6 +67,12 @@ jobs:
           python -m pip install -r requirements-dev.txt
           python -m pip check
 
+      - name: Create launcher virtual environment
+        run: |
+          python -m venv .venv
+          .venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+          .venv\Scripts\python.exe -m pip check
+
       - name: Compile Python sources
         run: |
           $env:PYTHONPYCACHEPREFIX = Join-Path `

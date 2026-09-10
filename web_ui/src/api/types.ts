@@ -184,6 +184,11 @@ export type CancelResponse = {
   message: string;
 };
 
+export type SystemStopResponse = {
+  status: "stopping";
+  message: string;
+};
+
 export type JobCommand = {
   command_id: number;
   job_id: string;

@@ -1,13 +1,32 @@
-import { Briefcase, PlusCircle, Settings } from "lucide-react";
+import { Briefcase, PlusCircle, Power, Settings } from "lucide-react";
 import type { ReactNode } from "react";
+import { useState } from "react";
 import { NavLink } from "react-router-dom";
-import { API_BASE_URL } from "../api/client";
+import { API_BASE_URL, api, toApiError } from "../api/client";
 
 type AppShellProps = {
   children: ReactNode;
 };
 
 export default function AppShell({ children }: AppShellProps) {
+  const [isStopping, setIsStopping] = useState(false);
+
+  async function handleStop() {
+    if (
+      isStopping ||
+      !window.confirm("Stop the local PaperAlgo API and SQLite Worker?")
+    ) {
+      return;
+    }
+    setIsStopping(true);
+    try {
+      await api.stopSystem();
+    } catch (error) {
+      setIsStopping(false);
+      window.alert(toApiError(error).message);
+    }
+  }
+
   return (
     <div className="app-shell">
       <header className="topbar">
@@ -31,6 +50,15 @@ export default function AppShell({ children }: AppShellProps) {
             <Briefcase size={16} />
             <span>Jobs</span>
           </NavLink>
+          <button
+            type="button"
+            className="danger-button stop-system-button"
+            onClick={handleStop}
+            disabled={isStopping}
+          >
+            <Power size={16} />
+            <span>{isStopping ? "Stopping…" : "Stop"}</span>
+          </button>
         </nav>
       </header>
       <main className="main-content">{children}</main>
