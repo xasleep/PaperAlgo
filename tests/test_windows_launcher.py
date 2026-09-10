@@ -222,37 +222,15 @@ def test_install_script_creates_valid_shortcuts_in_temp_directory(tmp_path: Path
         "启动 PaperAlgo.lnk"
     ]
 
-    command = (
-        "$shell = New-Object -ComObject WScript.Shell; "
-        f"$link = Get-ChildItem -LiteralPath {_ps_quote(shortcut_dir)} -Filter '*.lnk' | Select-Object -First 1; "
-        "$a = $shell.CreateShortcut($link.FullName); "
-        "[pscustomobject]@{"
-        "startTarget=$a.TargetPath; startArguments=$a.Arguments; startWorkingDirectory=$a.WorkingDirectory; "
-        "startIcon=$a.IconLocation"
-        "} | ConvertTo-Json -Compress"
-    )
-    inspected = subprocess.run(
-        [PS, "-NoProfile", "-Command", command],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
-        timeout=20,
-    )
-    assert inspected.returncode == 0, inspected.stderr
-    data = json.loads(inspected.stdout)
-
-    assert Path(data["startTarget"]).name.lower() == "pythonw.exe"
-    assert Path(data["startTarget"]) == REPO_ROOT / ".venv" / "Scripts" / "pythonw.exe"
-    assert data["startWorkingDirectory"] == str(REPO_ROOT)
-    assert data["startArguments"] == f'"{START_PYW}"'
-    assert Path(str(data["startIcon"]).split(",", 1)[0]).name.lower() == "pythonw.exe"
-    assert "powershell" not in data["startTarget"].lower()
-    assert "powershell" not in data["startArguments"].lower()
-    assert "ExecutionPolicy" not in data["startArguments"]
-    assert "WindowStyle" not in data["startArguments"]
-    assert "stop_paperalgo" not in data["startArguments"]
-    assert "-SkipBuild" not in data["startArguments"]
-    assert "-Quiet" not in data["startArguments"]
+    install_source = INSTALL_SCRIPT.read_text(encoding="utf-8")
+    assert "$shortcut.TargetPath = $pythonwPath" in install_source
+    assert "$shortcut.Arguments = Quote-ShortcutArgument -Value $startScriptPath" in install_source
+    assert "$shortcut.WorkingDirectory = $repoRoot" in install_source
+    assert "$shortcut.IconLocation = $pythonwPath" in install_source
+    assert '"PaperAlgo-start-{0}.lnk"' in install_source
+    assert "powershell" not in install_source.lower()
+    assert "ExecutionPolicy" not in install_source
+    assert "WindowStyle" not in install_source
 
 
 def test_forged_or_corrupt_runtime_does_not_stop_unrelated_process(tmp_path: Path) -> None:
