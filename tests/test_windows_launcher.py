@@ -43,7 +43,8 @@ def _run_ps_file(script: Path, *args: str, timeout: int = 60) -> subprocess.Comp
             *args,
         ],
         cwd=REPO_ROOT,
-        capture_output=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
         text=True,
         timeout=timeout,
     )
@@ -53,7 +54,8 @@ def _run_ps_command(command: str, timeout: int = 60) -> subprocess.CompletedProc
     return subprocess.run(
         [PS, "-NoProfile", "-Command", command],
         cwd=REPO_ROOT,
-        capture_output=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
         text=True,
         timeout=timeout,
     )
@@ -204,7 +206,7 @@ def test_install_script_creates_valid_shortcuts_in_temp_directory(tmp_path: Path
         "-Quiet",
         timeout=30,
     )
-    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert completed.returncode == 0
 
     start_link = shortcut_dir / "启动 PaperAlgo.lnk"
     stop_link = shortcut_dir / "停止 PaperAlgo.lnk"
@@ -384,7 +386,7 @@ def test_stop_refuses_when_api_reports_queued_job(tmp_path: Path) -> None:
     )
     try:
         launched = _run_ps_command(launch_command, timeout=30)
-        assert launched.returncode == 0, launched.stdout + launched.stderr
+        assert launched.returncode == 0
         _wait_health(port)
 
         stopped = _run_ps_file(
@@ -415,7 +417,7 @@ def test_isolated_launcher_smoke_repeat_start_and_idle_stop(tmp_path: Path) -> N
             "-Quiet",
             timeout=70,
         )
-        assert first.returncode == 0, first.stdout + first.stderr
+        assert first.returncode == 0
         runtime_path = tmp_path / "launcher state" / "runtime.json"
         runtime = json.loads(runtime_path.read_text(encoding="utf-8-sig"))
         records = {record["role"]: record for record in runtime["processes"]}
@@ -432,7 +434,7 @@ def test_isolated_launcher_smoke_repeat_start_and_idle_stop(tmp_path: Path) -> N
             "-Quiet",
             timeout=70,
         )
-        assert second.returncode == 0, second.stdout + second.stderr
+        assert second.returncode == 0
         repeated = json.loads(runtime_path.read_text(encoding="utf-8-sig"))
         repeated_records = {record["role"]: record for record in repeated["processes"]}
         assert repeated_records["api"]["processId"] == records["api"]["processId"]
