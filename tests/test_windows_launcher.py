@@ -224,7 +224,8 @@ def test_install_script_creates_valid_shortcuts_in_temp_directory(tmp_path: Path
 
     command = (
         "$shell = New-Object -ComObject WScript.Shell; "
-        f"$a = $shell.CreateShortcut({_ps_quote(start_link)}); "
+        f"$link = Get-ChildItem -LiteralPath {_ps_quote(shortcut_dir)} -Filter '*.lnk' | Select-Object -First 1; "
+        "$a = $shell.CreateShortcut($link.FullName); "
         "[pscustomobject]@{"
         "startTarget=$a.TargetPath; startArguments=$a.Arguments; startWorkingDirectory=$a.WorkingDirectory; "
         "startIcon=$a.IconLocation"
