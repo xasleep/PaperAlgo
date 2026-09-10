@@ -112,6 +112,11 @@ a {
   text-decoration: none;
 }
 
+.nav-links button {
+  min-height: 36px;
+  padding: 8px 11px;
+}
+
 .nav-links a.active {
   border-color: #c8d2cf;
   background: #edf3f1;

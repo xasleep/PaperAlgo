@@ -582,8 +582,34 @@ async function main() {
     await waitForBodyText(page, "applied");
     await assertBodyDoesNotLeak(page);
 
+    let stopRequestMethod = "";
+    await page.route("**/api/v1/system/stop", async (route) => {
+      stopRequestMethod = route.request().method();
+      await route.fulfill({
+        status: 202,
+        contentType: "application/json",
+        body: JSON.stringify({
+          status: "stopping",
+          message: "PaperAlgo is stopping.",
+        }),
+      });
+    });
+    page.once("dialog", async (dialog) => {
+      assert(dialog.type() === "confirm", "Stop should ask for confirmation");
+      await dialog.accept();
+    });
+    const stopButton = page.getByRole("button", { name: /^Stop$/i });
+    await stopButton.click();
+    await page.waitForFunction(() => {
+      const buttons = [...document.querySelectorAll("button")];
+      return buttons.some(
+        (button) => button.innerText.includes("Stopping…") && button.disabled,
+      );
+    });
+    assert(stopRequestMethod === "POST", "Stop did not call POST /api/v1/system/stop");
+
     console.log(
-      "Fake-provider Playwright E2E passed: settings, discovery, create job, SSE/reload, REST refresh, artifacts, cancel, retry, repair, cost/budget.",
+      "Fake-provider Playwright E2E passed: settings, discovery, create job, SSE/reload, REST refresh, artifacts, cancel, retry, repair, cost/budget, Stop UI.",
     );
   } catch (error) {
     const combined = `${error instanceof Error ? error.message : String(error)}\n${serverOutput}`;

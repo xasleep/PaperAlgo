@@ -144,6 +144,11 @@ class CancelResponse(BaseModel):
     message: str
 
 
+class SystemStopResponse(BaseModel):
+    status: Literal["stopping"]
+    message: str
+
+
 class JobCommandRequest(BaseModel):
     command_type: JobCommandType
 

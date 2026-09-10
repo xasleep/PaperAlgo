@@ -615,6 +615,19 @@ class JobRepository:
             ).fetchall()
         return [_row_to_dict(row) for row in rows]
 
+    def list_shutdown_blockers(self) -> list[dict[str, Any]]:
+        with closing(connect_database(self.database_path)) as connection:
+            rows = connection.execute(
+                """
+                SELECT job_id, execution_status, recovery_status, updated_at
+                FROM jobs
+                WHERE execution_status NOT IN ('completed', 'failed', 'canceled')
+                   OR recovery_status IN ('prepared', 'running')
+                ORDER BY updated_at DESC, job_id DESC
+                """
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     @staticmethod
     def _insert_job_event(
         connection: sqlite3.Connection,

@@ -2,7 +2,7 @@ from pathlib import Path
 from decimal import Decimal, InvalidOperation
 from threading import Lock
 
-from fastapi import APIRouter, FastAPI, File, Header, Query, Request, Response, UploadFile
+from fastapi import APIRouter, BackgroundTasks, FastAPI, File, Header, Query, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
@@ -33,6 +33,7 @@ from .errors import (
     JobNotCancelableError,
     ProviderConfigurationError,
     SettingsNotConfiguredError,
+    SystemStopBlockedError,
     install_exception_handlers,
 )
 from .event_stream import (
@@ -73,12 +74,14 @@ from .schemas import (
     RepoTreeResponse,
     SessionResponse,
     SettingsStatus,
+    SystemStopResponse,
     UploadResponse,
     WebSettings,
 )
 from .settings_store import get_settings_status, load_settings, save_settings
 from .static_ui import install_static_ui
 from .storage_security import LocalStorageSecurityError
+from .system_control import launch_stop_script
 from .web_security import (
     LocalRequestSecurityMiddleware,
     LocalTrustedHostMiddleware,
@@ -178,6 +181,33 @@ def update_settings(settings: WebSettings) -> SettingsStatus:
 @api.get("/settings/status", response_model=SettingsStatus)
 def settings_status() -> SettingsStatus:
     return get_settings_status()
+
+
+@api.post("/system/stop", response_model=SystemStopResponse, status_code=202)
+def stop_system(background_tasks: BackgroundTasks) -> SystemStopResponse:
+    if configured_job_runtime() != "sqlite":
+        raise FeatureNotSupportedError(
+            "System stop is available only for the local SQLite runtime."
+        )
+    blockers = _sqlite_repository().list_shutdown_blockers()
+    if blockers:
+        raise SystemStopBlockedError(
+            details={
+                "jobs": [
+                    {
+                        "job_id": str(blocker["job_id"]),
+                        "execution_status": str(blocker["execution_status"]),
+                        "recovery_status": str(blocker.get("recovery_status") or "none"),
+                    }
+                    for blocker in blockers
+                ]
+            }
+        )
+    background_tasks.add_task(launch_stop_script)
+    return SystemStopResponse(
+        status="stopping",
+        message="PaperAlgo is stopping.",
+    )
 
 
 @api.get("/providers", response_model=ProviderRegistryResponse)

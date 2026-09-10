@@ -14,6 +14,7 @@ import type {
   RepoFileResponse,
   RepoTreeResponse,
   SettingsStatus,
+  SystemStopResponse,
   UploadResponse,
   WebSettingsPayload,
 } from "./types";
@@ -180,6 +181,11 @@ export const api = {
 
   cancelJob: (jobId: string) =>
     requestJson<CancelResponse>(`/jobs/${encodeURIComponent(jobId)}/cancel`, {
+      method: "POST",
+    }),
+
+  stopSystem: () =>
+    requestJson<SystemStopResponse>("/system/stop", {
       method: "POST",
     }),
 
