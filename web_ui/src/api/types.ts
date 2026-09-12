@@ -22,6 +22,22 @@ export type SettingsStatus = {
   evaluation: EvaluationSettingsStatus;
 };
 
+export type ProviderSettingsView = ProviderSettingsStatus & {
+  provider: ProviderName;
+  model: string;
+  base_url: string;
+};
+
+export type EvaluationSettingsView = ProviderSettingsView & {
+  fallback_models: string[];
+};
+
+export type SettingsView = {
+  configured: boolean;
+  reproduce: ProviderSettingsView;
+  evaluation: EvaluationSettingsView;
+};
+
 export type ProviderModelDiscovery = {
   model_id: string;
   max_n: number;

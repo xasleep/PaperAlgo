@@ -244,11 +244,30 @@ def test_settings_endpoints_still_do_not_echo_api_keys(
     payload = _settings_payload()
 
     post_response = client.post(f"{API_PREFIX}/settings", json=payload)
+    view_response = client.get(f"{API_PREFIX}/settings")
     status_response = client.get(f"{API_PREFIX}/settings/status")
 
     assert post_response.status_code == 200
+    assert view_response.status_code == 200
     assert status_response.status_code == 200
-    for response in [post_response, status_response]:
+    assert view_response.headers["cache-control"] == "no-store"
+    assert view_response.json() == {
+        "configured": True,
+        "reproduce": {
+            "provider": "deepseek",
+            "model": "deepseek-v4-pro",
+            "base_url": "https://reproduce.invalid/v1",
+            "has_api_key": True,
+        },
+        "evaluation": {
+            "provider": "qwen",
+            "model": "qwen3.7-max",
+            "base_url": "https://evaluation.invalid/v1",
+            "fallback_models": [],
+            "has_api_key": True,
+        },
+    }
+    for response in [post_response, view_response, status_response]:
         response_text = response.text
         assert "super-secret-reproduce" not in response_text
         assert "super-secret-eval" not in response_text
@@ -257,3 +276,30 @@ def test_settings_endpoints_still_do_not_echo_api_keys(
         assert body["reproduce"]["has_api_key"] is True
         assert body["evaluation"]["has_api_key"] is True
         assert not _contains_key(body, "api_key")
+
+
+def test_unconfigured_settings_view_is_safe_and_empty(
+    settings_client: tuple[TestClient, Path],
+) -> None:
+    client, _ = settings_client
+
+    response = client.get(f"{API_PREFIX}/settings")
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    assert response.json() == {
+        "configured": False,
+        "reproduce": {
+            "provider": "",
+            "model": "",
+            "base_url": "",
+            "has_api_key": False,
+        },
+        "evaluation": {
+            "provider": "",
+            "model": "",
+            "base_url": "",
+            "fallback_models": [],
+            "has_api_key": False,
+        },
+    }

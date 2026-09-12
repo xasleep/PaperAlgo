@@ -73,10 +73,16 @@ from .schemas import (
     RepoTreeResponse,
     SessionResponse,
     SettingsStatus,
+    SettingsView,
     UploadResponse,
     WebSettings,
 )
-from .settings_store import get_settings_status, load_settings, save_settings
+from .settings_store import (
+    get_settings_status,
+    get_settings_view,
+    load_settings,
+    save_settings,
+)
 from .static_ui import install_static_ui
 from .storage_security import LocalStorageSecurityError
 from .web_security import (
@@ -173,6 +179,12 @@ def update_settings(settings: WebSettings) -> SettingsStatus:
     except LocalStorageSecurityError as exc:
         raise InternalApiError("Failed to secure local settings storage.") from exc
     return get_settings_status()
+
+
+@api.get("/settings", response_model=SettingsView)
+def settings_view(response: Response) -> SettingsView:
+    response.headers["Cache-Control"] = "no-store"
+    return get_settings_view()
 
 
 @api.get("/settings/status", response_model=SettingsStatus)

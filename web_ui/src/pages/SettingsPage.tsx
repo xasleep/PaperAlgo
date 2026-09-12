@@ -5,6 +5,7 @@ import type {
   ApiError,
   ProviderName,
   ProviderRegistryResponse,
+  SettingsView,
   SettingsStatus,
   WebSettingsPayload,
 } from "../api/types";
@@ -34,6 +35,34 @@ const emptyForm: SettingsForm = {
   evaluationFallbackModels: "",
 };
 
+function registeredModels(
+  registry: ProviderRegistryResponse,
+  providerId: ProviderName,
+): string[] {
+  return (
+    registry.providers.find((provider) => provider.provider_id === providerId)?.models.map(
+      (model) => model.model_id,
+    ) ?? []
+  );
+}
+
+function resolveSelection(
+  registry: ProviderRegistryResponse,
+  settings: SettingsView,
+  section: "reproduce" | "evaluation",
+): { provider: ProviderName; model: string } {
+  const saved = settings[section];
+  const firstProvider = registry.providers[0];
+  const provider = registry.providers.some((item) => item.provider_id === saved.provider)
+    ? saved.provider
+    : (firstProvider?.provider_id ?? "");
+  const models = registeredModels(registry, provider);
+  return {
+    provider,
+    model: models.includes(saved.model) ? saved.model : (models[0] ?? ""),
+  };
+}
+
 export default function SettingsPage() {
   const [status, setStatus] = useState<SettingsStatus | null>(null);
   const [registry, setRegistry] = useState<ProviderRegistryResponse | null>(null);
@@ -45,20 +74,29 @@ export default function SettingsPage() {
 
   useEffect(() => {
     let ignore = false;
-    Promise.all([api.getSettingsStatus(), api.getProviders()])
-      .then(([nextStatus, nextRegistry]) => {
+    Promise.all([api.getSettings(), api.getProviders()])
+      .then(([nextSettings, nextRegistry]) => {
         if (ignore) return;
-        setStatus(nextStatus);
+        setStatus(nextSettings);
         setRegistry(nextRegistry);
-        const firstProvider = nextRegistry.providers[0];
-        const firstModel = firstProvider?.models[0]?.model_id ?? "";
-        setForm((current) => ({
-          ...current,
-          reproduceProvider: firstProvider?.provider_id ?? "",
-          reproduceModel: firstModel,
-          evaluationProvider: firstProvider?.provider_id ?? "",
-          evaluationModel: firstModel,
-        }));
+        const reproduce = resolveSelection(nextRegistry, nextSettings, "reproduce");
+        const evaluation = resolveSelection(nextRegistry, nextSettings, "evaluation");
+        const evaluationModels = registeredModels(nextRegistry, evaluation.provider);
+        setForm({
+          reproduceProvider: reproduce.provider,
+          reproduceModel: reproduce.model,
+          reproduceApiKey: "",
+          reproduceBaseUrl: nextSettings.configured ? nextSettings.reproduce.base_url : "",
+          evaluationProvider: evaluation.provider,
+          evaluationModel: evaluation.model,
+          evaluationApiKey: "",
+          evaluationBaseUrl: nextSettings.configured ? nextSettings.evaluation.base_url : "",
+          evaluationFallbackModels: nextSettings.configured
+            ? nextSettings.evaluation.fallback_models
+                .filter((model) => evaluationModels.includes(model))
+                .join(",")
+            : "",
+        });
       })
       .catch((err) => setError(toApiError(err)))
       .finally(() => {
@@ -70,11 +108,7 @@ export default function SettingsPage() {
   }, []);
 
   function modelsFor(providerId: ProviderName): string[] {
-    return (
-      registry?.providers.find((provider) => provider.provider_id === providerId)?.models.map(
-        (model) => model.model_id,
-      ) ?? []
-    );
+    return registry ? registeredModels(registry, providerId) : [];
   }
 
   function invalidSelectionError(message: string): ApiError {

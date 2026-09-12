@@ -41,6 +41,14 @@
     },
     "deepseek": {
       "models": {
+        "deepseek-flash": {
+          "base_url": null, "base_url_env": "DEEPSEEK_BASE_URL", "api_key_env": "DEEPSEEK_API_KEY",
+          "max_n": 1, "context_window": null, "max_output_tokens": null,
+          "json_schema_support": null, "usage_support": null, "cache_token_support": null,
+          "timeout_seconds": 120, "max_retries": 2, "max_concurrency": 2,
+          "pricing": {"status": "unknown", "currency": null, "input_per_million": null, "cached_input_per_million": null, "output_per_million": null, "effective_date": null},
+          "request_options": {"temperature": 1, "frequency_penalty": 0, "presence_penalty": 0}, "fallback_model_ids": []
+        },
         "deepseek-v4-flash": {
           "base_url": null, "base_url_env": "DEEPSEEK_BASE_URL", "api_key_env": "DEEPSEEK_API_KEY",
           "max_n": 1, "context_window": null, "max_output_tokens": null,
