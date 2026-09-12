@@ -302,3 +302,191 @@ def test_fake_pipeline_resumes_at_previous_completed_boundary_without_rerunning(
     assert sequences == sorted(sequences)
     assert checkpoints[-1][0]["stage_name"] == "completed"
     assert checkpoints[-1][0]["status"] == "completed"
+
+
+def test_auto_refine_uses_extracted_repo_status_for_repair_decision(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from codes.evaluation_contract import build_quality_result
+
+    runs_dir = tmp_path / "runs"
+    source_dir = runs_dir / "source"
+    source_dir.mkdir(parents=True)
+    markdown = source_dir / "paper.md"
+    markdown.write_text("# paper", encoding="utf-8")
+    pdf = tmp_path / "paper.pdf"
+    pdf.write_bytes(b"%PDF-fake")
+    monkeypatch.setenv("REPRODUCE_API_KEY", "fake")
+    monkeypatch.setenv("REPRODUCE_BASE_URL", "https://reproduce.invalid/v1")
+    monkeypatch.setenv("EVAL_API_KEY", "fake")
+    monkeypatch.setenv("EVAL_BASE_URL", "https://evaluation.invalid/v1")
+    calls: list[str] = []
+
+    def option(command: list[str], name: str) -> Path:
+        return Path(command[command.index(name) + 1])
+
+    def extended_status(result: dict[str, object], status: str) -> dict[str, object]:
+        return {
+            **result,
+            "status": status,
+            "updated_at": "20260912_203110",
+            "files_to_repair": result["files_to_fix"],
+            "eval_score": result["quality_score"],
+            "feedback_file": "output/eval_feedback.json",
+            "eval_result_file": "results/paper_eval_ref_free_fake.json",
+        }
+
+    def write_eval_artifacts(output_dir: Path, payload: dict[str, object]) -> None:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "repo_status.json").write_text(
+            json.dumps(payload, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        (output_dir / "eval_feedback.json").write_text(
+            json.dumps(payload, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+    def fake_run_command(label, command, *args, **kwargs):
+        del args, kwargs
+        calls.append(label)
+        output_dir = option(command, "--output_dir")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        if label == "planning":
+            (output_dir / "task_manifest.json").write_text(
+                '{"version":1,"files":[{"path":"main.py"},{"path":"helpers.py"}]}',
+                encoding="utf-8",
+            )
+            (output_dir / "planning_response.json").write_text("{}", encoding="utf-8")
+            (output_dir / "planning_trajectories.json").write_text(
+                "[]", encoding="utf-8"
+            )
+        elif label == "extract_config":
+            (output_dir / "planning_config.yaml").write_text(
+                "seed: 1\n", encoding="utf-8"
+            )
+        elif label == "analyzing":
+            artifacts = output_dir / "analyzing_artifacts"
+            artifacts.mkdir(exist_ok=True)
+            (artifacts / "main_analysis.txt").write_text("analysis", encoding="utf-8")
+            (output_dir / "main_simple_analysis_response.json").write_text(
+                "{}", encoding="utf-8"
+            )
+        elif label == "coding":
+            repo_dir = option(command, "--output_repo_dir")
+            repo_dir.mkdir(parents=True, exist_ok=True)
+            (repo_dir / "main.py").write_text(
+                "print('needs repair')\n", encoding="utf-8"
+            )
+            (repo_dir / "helpers.py").write_text("print('helper')\n", encoding="utf-8")
+            (output_dir / "repo_status.json").write_text(
+                json.dumps({"status": "待测评", "repair_round": 0}),
+                encoding="utf-8",
+            )
+        elif label == "evaluation_round_0":
+            result = build_quality_result(
+                paper_name="paper",
+                target_repo_dir=str(option(command, "--target_repo_dir")),
+                eval_type="ref_free",
+                requested_eval_model="gpt-4.1-mini",
+                eval_model="gpt-4.1-mini",
+                provider_id="openai",
+                generated_n=1,
+                scores=[2],
+                findings=[
+                    {
+                        "file_name": "main.py",
+                        "severity_level": "medium",
+                        "critique": "missing a required experiment",
+                    },
+                    {
+                        "file_name": "helpers.py",
+                        "severity_level": "low",
+                        "critique": "helper output needs cleanup",
+                    },
+                ],
+                files_to_fix=["main.py", "helpers.py"],
+                repair_round=0,
+                max_repair_rounds=2,
+            )
+            write_eval_artifacts(output_dir, extended_status(result, "测评但未通过"))
+        elif label == "repair_round_1":
+            assert "--repair_from_eval" in command
+            (output_dir / "repo_status.json").write_text(
+                json.dumps(
+                    {
+                        "status": "待测评",
+                        "repair_round": 1,
+                        "files_to_fix": ["main.py", "helpers.py"],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+        elif label == "evaluation_round_1":
+            result = build_quality_result(
+                paper_name="paper",
+                target_repo_dir=str(option(command, "--target_repo_dir")),
+                eval_type="ref_free",
+                requested_eval_model="gpt-4.1-mini",
+                eval_model="gpt-4.1-mini",
+                provider_id="openai",
+                generated_n=1,
+                scores=[5],
+                findings=[],
+                files_to_fix=[],
+                repair_round=1,
+                max_repair_rounds=2,
+            )
+            write_eval_artifacts(output_dir, extended_status(result, "测评且通过"))
+
+    monkeypatch.setattr(run_pipeline, "run_command", fake_run_command)
+    values = {
+        "paper_pdf_path": str(pdf),
+        "skip_mineru": True,
+        "pdf_markdown_path": str(markdown),
+        "paper_name": "paper",
+        "domain": "statistics",
+        "reproduce_provider": "openai",
+        "reproduce_gpt_version": "gpt-4.1-mini",
+        "eval_provider": "openai",
+        "eval_gpt_version": "gpt-4.1-mini",
+        "eval_fallback_gpt_versions": "",
+        "runs_dir": str(runs_dir),
+        "job_id": "repair_job",
+        "checkpoint_mode": "sqlite",
+        "resume_from_stage": "",
+        "resume_stage_sequence": 0,
+        "resume_stage_attempt": 0,
+        "checkpoint_recovery_count": 0,
+        "mineru_executable": "",
+        "mineru_backend": "pipeline",
+        "mineru_formula": True,
+        "mineru_table": True,
+        "data_dir": "../data",
+        "eval_type": "ref_free",
+        "generated_n": 1,
+        "auto_refine": True,
+        "max_repair_rounds": 2,
+        "console_output": "quiet",
+    }
+
+    run_pipeline.main(SimpleNamespace(**values))
+
+    assert calls == [
+        "planning",
+        "extract_config",
+        "analyzing",
+        "coding",
+        "evaluation_round_0",
+        "repair_round_1",
+        "evaluation_round_1",
+    ]
+    final_status = json.loads(
+        (runs_dir / "repair_job" / "output" / "repo_status.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert final_status["status"] == "测评且通过"
+    assert final_status["repair_round"] == 1
