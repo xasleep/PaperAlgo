@@ -83,6 +83,8 @@ def test_settings_ui_uses_registry_discovery_without_provider_or_model_allowlist
 
     assert "const PROVIDERS" not in settings_source
     assert "getProviders" in settings_source
+    assert "getSettings" in settings_source
+    assert "getSettings" in client_source
     assert "getProviders" in client_source
     assert "ProviderRegistryResponse" in types_source
     assert "ProviderName = string" in types_source

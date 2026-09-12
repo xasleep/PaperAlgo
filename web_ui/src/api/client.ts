@@ -14,6 +14,7 @@ import type {
   RepoFileResponse,
   RepoTreeResponse,
   SettingsStatus,
+  SettingsView,
   UploadResponse,
   WebSettingsPayload,
 } from "./types";
@@ -150,6 +151,8 @@ export const api = {
   health: () => requestJson<{ status: string }>("/health"),
 
   getSettingsStatus: () => requestJson<SettingsStatus>("/settings/status"),
+
+  getSettings: () => requestJson<SettingsView>("/settings"),
 
   getProviders: () => requestJson<ProviderRegistryResponse>("/providers"),
 

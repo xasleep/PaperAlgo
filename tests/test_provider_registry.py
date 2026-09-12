@@ -279,6 +279,7 @@ def test_bundled_registry_model_allowlist_matches_curated_supported_ids():
         "gpt-4o-mini",
     )
     assert registry.model_ids("deepseek") == (
+        "deepseek-flash",
         "deepseek-v4-flash",
         "deepseek-v4-pro",
     )

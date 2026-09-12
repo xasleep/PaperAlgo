@@ -6,8 +6,11 @@ from .config import LOCAL_DIR, SETTINGS_PATH
 from .json_io import read_json_file, write_json_file_atomic
 from .schemas import (
     EvaluationSettingsStatus,
+    EvaluationSettingsView,
     ProviderSettingsStatus,
+    ProviderSettingsView,
     SettingsStatus,
+    SettingsView,
     WebSettings,
 )
 from .storage_security import LocalStorageSecurityError, harden_local_storage
@@ -57,6 +60,29 @@ def get_settings_status() -> SettingsStatus:
             has_api_key=bool(settings.reproduce.api_key),
         ),
         evaluation=EvaluationSettingsStatus(
+            has_api_key=bool(settings.evaluation.api_key),
+        ),
+    )
+
+
+def get_settings_view() -> SettingsView:
+    settings = load_settings()
+    if settings is None:
+        return SettingsView(configured=False)
+
+    return SettingsView(
+        configured=True,
+        reproduce=ProviderSettingsView(
+            provider=settings.reproduce.provider,
+            model=settings.reproduce.model,
+            base_url=settings.reproduce.base_url,
+            has_api_key=bool(settings.reproduce.api_key),
+        ),
+        evaluation=EvaluationSettingsView(
+            provider=settings.evaluation.provider,
+            model=settings.evaluation.model,
+            base_url=settings.evaluation.base_url,
+            fallback_models=settings.evaluation.fallback_models,
             has_api_key=bool(settings.evaluation.api_key),
         ),
     )

@@ -47,6 +47,23 @@ class SettingsStatus(BaseModel):
     )
 
 
+class ProviderSettingsView(ProviderSettingsStatus):
+    has_api_key: bool = False
+    provider: ProviderName = ""
+    model: str = ""
+    base_url: str = ""
+
+
+class EvaluationSettingsView(ProviderSettingsView):
+    fallback_models: list[str] = Field(default_factory=list)
+
+
+class SettingsView(BaseModel):
+    configured: bool
+    reproduce: ProviderSettingsView = Field(default_factory=ProviderSettingsView)
+    evaluation: EvaluationSettingsView = Field(default_factory=EvaluationSettingsView)
+
+
 class ProviderModelDiscovery(BaseModel):
     model_id: str
     max_n: int
