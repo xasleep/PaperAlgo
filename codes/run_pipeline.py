@@ -18,7 +18,7 @@ try:
         running_checkpoint,
         write_checkpoint,
     )
-    from evaluation_contract import decide_repair_action
+    from evaluation_contract import decide_repair_action, extract_evaluation_result
     from provider_registry import REGISTRY_PATH_ENV, get_provider_registry
     from task_manifest import (
         load_task_manifest,
@@ -44,7 +44,7 @@ except ModuleNotFoundError:
         running_checkpoint,
         write_checkpoint,
     )
-    from codes.evaluation_contract import decide_repair_action
+    from codes.evaluation_contract import decide_repair_action, extract_evaluation_result
     from codes.provider_registry import REGISTRY_PATH_ENV, get_provider_registry
     from codes.task_manifest import (
         load_task_manifest,
@@ -1136,7 +1136,8 @@ def main(args):
                 )
                 repo_status = load_json_file(repo_status_path(output_dir), default={}) or {}
                 remember_fallback_eval_model(args, repo_status, status_path)
-                repair_decision = decide_repair_action(repo_status)
+                evaluation_result = extract_evaluation_result(repo_status)
+                repair_decision = decide_repair_action(evaluation_result)
                 if repo_status.get("status") == STATUS_EVAL_PASSED:
                     evaluation_next["stage"] = "completed"
                 elif (

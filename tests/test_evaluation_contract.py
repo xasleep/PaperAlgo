@@ -257,6 +257,55 @@ def test_schema_rejects_unknown_fields_raw_payloads_and_leaky_errors() -> None:
         )
 
 
+def test_extended_repo_status_extracts_for_repair_decision_but_stays_strict() -> None:
+    from codes.evaluation_contract import (
+        EvaluationContractError,
+        decide_repair_action,
+        extract_evaluation_result,
+        validate_evaluation_result,
+    )
+
+    result = _quality_result(
+        scores=[2, 3, 3],
+        findings=[
+            {
+                "file_name": "main.py",
+                "severity_level": "medium",
+                "critique": "missing a required experiment",
+            },
+            {
+                "file_name": "helpers.py",
+                "severity_level": "low",
+                "critique": "helper output needs cleanup",
+            },
+        ],
+        files_to_fix=["main.py", "helpers.py"],
+        repair_round=1,
+        max_repair_rounds=3,
+    )
+    repo_status = {
+        **result,
+        "status": "测评但未通过",
+        "updated_at": "20260912_203110",
+        "files_to_repair": ["main.py", "helpers.py"],
+        "eval_score": result["quality_score"],
+        "feedback_file": "output/eval_feedback.json",
+        "eval_result_file": "results/paper_eval_ref_free_fake.json",
+    }
+
+    with pytest.raises(EvaluationContractError):
+        validate_evaluation_result(repo_status)
+
+    assert extract_evaluation_result(repo_status) == result
+    assert decide_repair_action(extract_evaluation_result(repo_status)) == {
+        "status": "ready",
+        "reason": "quality_rejected",
+        "attempt": 2,
+        "max_attempts": 3,
+        "files_to_fix": ["main.py", "helpers.py"],
+    }
+
+
 @pytest.mark.parametrize(
     "error_code",
     [
